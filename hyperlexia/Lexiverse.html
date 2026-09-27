@@ -164,8 +164,8 @@ input.field:focus, textarea.field:focus { border-color: var(--cyan); box-shadow:
 .modal-back { position: fixed; inset: 0; z-index: 100; background: rgba(2,4,12,.72); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 16px; animation: fadein .2s; }
 .modal { width: min(720px, 100%); max-height: 88vh; overflow: auto; background: linear-gradient(180deg, #16204a, #0d1430); border: 1px solid rgba(255,255,255,.18); border-radius: 22px; padding: 22px; box-shadow: var(--shadow); }
 .modal h2 { margin: 0 0 10px; }
-.toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 120; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
-.toast { background: rgba(14,21,48,.95); border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: 10px 16px; box-shadow: var(--shadow); font-weight: 650; animation: toast 3s forwards; display: flex; gap: 10px; align-items: center; }
+.toasts { position: fixed; bottom: 18px; left: 0; right: 0; z-index: 120; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; padding: 0 12px; }
+.toast { background: rgba(14,21,48,.95); border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: 10px 16px; box-shadow: var(--shadow); font-weight: 650; animation: toast 3s forwards; display: flex; gap: 10px; align-items: center; max-width: min(560px, 100%); }
 @keyframes toast { 0% { opacity: 0; transform: translateY(10px); } 8%,85% { opacity: 1; transform: none; } 100% { opacity: 0; transform: translateY(-6px); } }
 .floaty { position: fixed; z-index: 95; pointer-events: none; font-weight: 900; font-family: var(--mono); animation: floaty 1s ease-out forwards; text-shadow: 0 2px 8px rgba(0,0,0,.6); }
 @keyframes floaty { to { transform: translateY(-50px); opacity: 0; } }
@@ -203,6 +203,29 @@ table.simple td, table.simple th { padding: 6px 8px; border-bottom: 1px solid va
   .kb button.wide { min-width: 48px; }
   .hide-sm { display: none !important; }
 }
+@media (max-width: 600px) {
+  .brand span { display: none; }
+  .topbar { gap: 6px; padding: 8px 10px; }
+  .seg button { padding: 5px 8px; font-size: 13px; }
+  .btn.icon { width: 36px; height: 36px; font-size: 16px; }
+  .xpbar { display: none; }
+  .player { padding: 3px; }
+  .hero { padding: 0 12px; margin-top: 14px; }
+  .hero-main { padding: 20px; border-radius: 22px; }
+  .grid, .filters, .footer { padding-left: 12px; padding-right: 12px; }
+  .gbar { gap: 6px; padding: 8px; }
+  .hud .h { font-size: 12px; padding: 3px 7px; }
+  .gtitle { font-size: 22px; }
+  .menu .mhead svg { width: 72px; height: 72px; }
+  .result .big { font-size: 42px; }
+}
+.gbar .hud { min-width: 0; }
+.trio { grid-column: span 2; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.trio .tg { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 12px; color: var(--ink2); background: none; border: 0; padding: 0; position: relative; max-width: 90px; text-align: center; }
+.trio .tg svg { width: 58px; height: 58px; }
+.trio .tg .ck { position: absolute; top: -4px; right: 8px; background: var(--good); color: #04220f; border-radius: 50%; width: 22px; height: 22px; display: grid; place-items: center; font-weight: 900; font-size: 13px; }
+.ticker span { display: inline-block; padding-left: 100%; animation: marquee 38s linear infinite; }
+@keyframes marquee { to { transform: translateX(-100%); } }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
 
 </style>
@@ -1860,8 +1883,6 @@ function h(tag, attrs, ...kids) {
   return e;
 }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const lerp = (a, b, t) => a + (b - a) * t;
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 function hashStr(s) { let h1 = 1779033703; for (let i = 0; i < s.length; i++) { h1 = Math.imul(h1 ^ s.charCodeAt(i), 3432918353); h1 = h1 << 13 | h1 >>> 19; } return h1 >>> 0; }
 const todayKey = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
@@ -2235,6 +2256,12 @@ const Progress = {
     const gs = Store.game(id); gs.plays++; Store.s.plays++;
     Store.s.langsUsed[Store.s.lang] = 1; Store.save();
     this.touchStreak(); this.badge('first');
+    const trio = App.trio(), tk = todayKey();
+    if (!Store.s.today || Store.s.today.date !== tk) Store.s.today = { date: tk, done: {} };
+    if (trio.some(g => g.id === id) && !Store.s.today.done[id]) {
+      Store.s.today.done[id] = 1; Store.save();
+      if (trio.every(g => Store.s.today.done[g.id])) setTimeout(() => { Sound.sfx('level'); FX.confetti(160); FX.toast(isFR() ? 'Mission du jour accomplie ! +50 XP' : 'Daily mission complete! +50 XP', '🎯'); this.addXP(50); }, 800);
+    }
     const tried = Object.values(Store.s.games).filter(x => x.plays > 0).length;
     if (tried >= 10) this.badge('explorer'); if (tried >= GAMES.length) this.badge('completionist');
     if (Object.keys(Store.s.langsUsed).length >= 2) this.badge('polyglot');
@@ -2348,7 +2375,7 @@ const App = {
     else if (!g && this.cur) this.closeGame(true);
   },
   setLang(l) {
-    Store.s.lang = l; Store.save(); Lex._c = Lex._c; document.documentElement.lang = l === 'fr' ? 'fr-CA' : 'en';
+    Store.s.lang = l; Store.save(); document.documentElement.lang = l === 'fr' ? 'fr-CA' : 'en';
     if (this.cur) { const id = this.cur.id; this.closeGame(true); this.render(); this.openGame(id, true); } else this.render();
   },
   topbar() {
@@ -2366,6 +2393,11 @@ const App = {
         h('div', { class: 'hide-sm' }, h('div', { style: { fontWeight: 800, fontSize: '14px', lineHeight: 1.1 } }, Store.s.name || '—'),
           h('div', { style: { fontSize: '11px', color: 'var(--ink3)' } }, `${t('level')} ${lv} · ${levelTitle(lv)}`)),
         h('div', { class: 'xpbar' }, h('i', { id: 'xpfill', style: { width: `${clamp((Store.s.xp - cur) / (nxt - cur) * 100, 0, 100)}%` } }))));
+  },
+  trio() {
+    const r = rngFor('trio-' + todayKey());
+    const cats = shuffle(CATS, r).slice(0, 3);
+    return cats.map(c => pick(GAMES.filter(g => g.cat === c), r));
   },
   refreshPlayer() { const tb = $('.topbar'); if (tb) tb.replaceWith(this.topbar()); },
   render() {
@@ -2385,12 +2417,15 @@ const App = {
         h('div', { class: 'row' },
           h('button', { class: 'btn primary lg', onclick: () => { const pool = GAMES.filter(g => this.filter === 'all' || g.cat === this.filter); this.openGame(pick(pool, Math.random).id); } }, '🎲 ' + (isFR() ? 'Surprends-moi' : 'Surprise me')),
           h('button', { class: 'btn lg', onclick: () => this.parents() }, '🧠 ' + t('parents'))),
-        h('div', { class: 'ticker' }, bigNums.join('  ·  '))),
+        h('div', { class: 'ticker' }, h('span', null, bigNums.join('  ·  ')))),
       h('div', { class: 'hero-stats' },
         h('div', { class: 'stat' }, h('div', { class: 'v' }, lv), h('div', { class: 'l' }, `${t('level')} · ${levelTitle(lv)}`)),
         h('div', { class: 'stat' }, h('div', { class: 'v' }, fmt(Store.s.xp)), h('div', { class: 'l' }, 'XP')),
         h('div', { class: 'stat' }, h('div', { class: 'v' }, `🔥 ${Store.s.streak.count || 0}`), h('div', { class: 'l' }, isFR() ? 'Jours de suite' : 'Day streak')),
-        h('div', { class: 'stat', style: { cursor: 'pointer' }, onclick: () => this.profile() }, h('div', { class: 'v' }, `${nb}/${BADGES.length}`), h('div', { class: 'l' }, `${t('badges')} · ${tried}/${GAMES.length} ${isFR() ? 'jeux essayés' : 'games tried'}`)))));
+        h('div', { class: 'stat', style: { cursor: 'pointer' }, onclick: () => this.profile() }, h('div', { class: 'v' }, `${nb}/${BADGES.length}`), h('div', { class: 'l' }, `${t('badges')} · ${tried}/${GAMES.length} ${isFR() ? 'jeux essayés' : 'games tried'}`)),
+        (() => { const tk = todayKey(), done = (Store.s.today && Store.s.today.date === tk) ? Store.s.today.done : {}; const trio = this.trio(); const n = trio.filter(g => done[g.id]).length;
+          return h('div', { class: 'stat trio' }, h('div', { style: { flex: '1 1 140px' } }, h('div', { class: 'l' }, isFR() ? '🎯 Mission du jour' : '🎯 Daily mission'), h('div', { style: { fontSize: '14px', color: 'var(--ink2)', marginTop: '4px' } }, isFR() ? `Joue ces 3 jeux : +50 XP (${n}/3)` : `Play these 3 games: +50 XP (${n}/3)`)),
+            ...trio.map(g => h('button', { class: 'tg', title: L(g.name), onclick: () => this.openGame(g.id) }, h('span', { html: iconSVG(g, 58, 't') }), done[g.id] ? h('span', { class: 'ck' }, '✓') : null, L(g.name)))); })())));
     const chips = h('div', { class: 'filters' }, ['all', ...CATS].map(c => h('button', { class: 'chip' + (this.filter === c ? ' sel' : ''), onclick: () => { this.filter = c; this.render(); } }, t(c))));
     app.appendChild(chips);
     const grid = h('div', { class: 'grid' });
@@ -2417,7 +2452,7 @@ const App = {
     const g = GAMES.find(x => x.id === id); if (!g) return;
     if (this.cur) this.closeGame(true);
     Sound.init();
-    if (!fromHash && location.hash !== '#' + id) { history.pushState(null, '', '#' + id); }
+    if (!fromHash && location.hash !== '#' + id) { try { history.pushState(null, '', '#' + id); } catch (e) { /* file:// in some browsers */ } }
     const hud = h('div', { class: 'hud' });
     const body = h('div', { class: 'gbody' });
     const scr = h('div', { class: 'gscreen' },
@@ -2442,7 +2477,7 @@ const App = {
     $$('.modal-back').forEach(m => m.remove());
     this.scr.remove(); this.cur = null; this.api = null;
     document.body.style.overflow = ''; BG.paused = false;
-    if (!fromHash && location.hash) history.pushState(null, '', location.pathname + location.search);
+    if (!fromHash && location.hash) { try { history.pushState(null, '', location.pathname + location.search); } catch (e) { /* ignore */ } }
     this.render();
   },
   helpModal(g) {
@@ -2806,9 +2841,10 @@ registerGame({
         const r = h('div', { style: { display: 'flex', gap: '4px' } });
         for (const ch of ln) {
           const n = norm(ch);
-          if (ch === ' ') { r.appendChild(h('div', { style: { width: '22px' } })); continue; }
+          if (ch === ' ') { r.appendChild(h('div', { style: { width: Math.max(10, Math.min(22, Math.floor((Math.min(innerWidth, 1100) - 70) / 24))) + 'px' } })); continue; }
           const isL = /[a-z]/.test(n), shown = !isL || S.guessed.has(n) || S.solvedShow;
-          const tile = h('div', { style: { width: '38px', height: '48px', borderRadius: '6px', display: 'grid', placeItems: 'center', fontWeight: 900, fontSize: '26px', color: '#0b1020', background: shown ? '#fff' : 'linear-gradient(180deg,#f4f4f4,#cfd8d3)', boxShadow: 'inset 0 -3px 0 rgba(0,0,0,.15)', transition: 'background .3s' } }, shown ? ch : '');
+          const tw = Math.max(18, Math.min(38, Math.floor((Math.min(innerWidth, 1100) - 70) / 14) - 4));
+          const tile = h('div', { style: { width: tw + 'px', height: Math.round(tw * 1.26) + 'px', borderRadius: '6px', display: 'grid', placeItems: 'center', fontWeight: 900, fontSize: Math.round(tw * 0.68) + 'px', color: '#0b1020', background: shown ? '#fff' : 'linear-gradient(180deg,#f4f4f4,#cfd8d3)', boxShadow: 'inset 0 -3px 0 rgba(0,0,0,.15)', transition: 'background .3s' } }, shown ? ch : '');
           if (!shown) tile.style.background = '#e8f1ec';
           if (flash && n === flash) { tile.style.background = '#37e2ff'; tile.classList.add('bounce'); }
           r.appendChild(tile);
@@ -2966,7 +3002,6 @@ registerGame({
     const clean = s => norm(s.replace(/[’]/g, "'")).toUpperCase();
     const shiftCh = (c, k) => A.includes(c) ? A[(A.indexOf(c) + k + 26) % 26] : c;
     const caesar = (p, k) => p.split('').map(c => shiftCh(c, k)).join('');
-    const atbash = p => p.split('').map(c => A.includes(c) ? A[25 - A.indexOf(c)] : c).join('');
     const vig = (p, key, dir = 1) => { let j = 0; return p.split('').map(c => { if (!A.includes(c)) return c; const k = A.indexOf(key[j++ % key.length]); return shiftCh(c, dir * k); }).join(''); };
     const railEnc = (s, n) => { const rails = Array.from({ length: n }, () => []); let r = 0, d = 1; for (const c of s) { rails[r].push(c); if (n > 1) { if (r === 0) d = 1; else if (r === n - 1) d = -1; r += d; } } return rails.flat().join(''); };
     const railDec = (s, n) => { const len = s.length, pat = []; let r = 0, d = 1; for (let i = 0; i < len; i++) { pat.push(r); if (n > 1) { if (r === 0) d = 1; else if (r === n - 1) d = -1; r += d; } } const counts = Array(n).fill(0); pat.forEach(x => counts[x]++); const rails = []; let pos = 0; for (let i = 0; i < n; i++) { rails.push(s.slice(pos, pos + counts[i]).split('')); pos += counts[i]; } return pat.map(x => rails[x].shift()).join(''); };
@@ -3173,8 +3208,8 @@ registerGame({
     fr: 'Développe l’automatisme de frappe avec des mots faciles à décoder, puis les boss obligent à passer du sens au mot — le lien sémantique qui prédit la compréhension (Brown et al., 2013; Macdonald et al., 2022).',
   },
   start(api) {
-    const Wd = 960, Ht = 600;
-    let S = null;
+    const narrow = innerWidth < 700, Wd = narrow ? 480 : 960, Ht = narrow ? 640 : 600;
+    let S = null, input = null;
     const menu = () => UI.menu(api, {
       options: [
         { icon: '🚀', name: { en: 'Campaign', fr: 'Campagne' }, desc: { en: 'Waves grow faster; bosses every 4 waves', fr: 'Vagues de plus en plus rapides' }, go: () => play(1) },
@@ -3192,7 +3227,7 @@ registerGame({
     const play = (wave, bossRush, training) => {
       const root = api.clear();
       const cv = h('canvas', { class: 'game', width: Wd, height: Ht, style: { width: '100%', maxWidth: Wd + 'px', aspectRatio: `${Wd}/${Ht}` } });
-      const input = h('div', { class: 'mono center', style: { fontSize: '22px', minHeight: '32px', color: 'var(--cyan)', marginTop: '8px' } });
+      input = h('div', { class: 'mono center', style: { fontSize: '22px', minHeight: '32px', color: 'var(--cyan)', marginTop: '8px' } });
       const touch = matchMedia('(pointer:coarse)').matches;
       const kb = touch ? UI.keyboard(k => onKey(k), { enter: false }) : null;
       root.appendChild(h('div', { class: 'gwrap' }, cv, input, kb));
@@ -3274,7 +3309,7 @@ registerGame({
       hit.forEach(e => { S.lives--; boom(e.x, Ht - 60, '#ff5d73', 40); api.sfx('boom'); if (S.target === e) { S.target = null; input.textContent = ''; } S.combo = 1; });
       S.enemies = S.enemies.filter(e => e.y <= Ht - 70);
       if (S.boss) {
-        const b = S.boss; b.t += dt; b.y = Math.min(170, b.y + 40 * dt); b.x = Wd / 2 + Math.sin(b.t * 0.6) * 220; b.shake = Math.max(0, (b.shake || 0) - dt);
+        const b = S.boss; b.t += dt; b.y = Math.min(170, b.y + 40 * dt); b.x = Wd / 2 + Math.sin(b.t * 0.6) * Wd * 0.23; b.shake = Math.max(0, (b.shake || 0) - dt);
         if (b.t > (api.relaxed || S.training ? 90 : 45)) { S.lives -= 2; boom(b.x, b.y, '#ff5d73', 80); S.defCard = { w: b.g.w, d: b.g.d, t: 4, missed: true }; S.boss = null; api.sfx('lose'); }
       }
       for (const p of S.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96; p.t -= dt; }
@@ -3322,10 +3357,11 @@ registerGame({
         c.restore();
         // definition panel
         const def = b.g.d; c.font = '600 18px Segoe UI, Arial'; c.textAlign = 'center';
-        const lines = wrapText(c, '“' + def + '”', 560);
+        const PW = Math.min(600, Wd - 30);
+        const lines = wrapText(c, '“' + def + '”', PW - 40);
         const py = Math.max(10, b.y - 120);
-        c.fillStyle = 'rgba(5,8,20,.85)'; c.fillRect(Wd / 2 - 300, py - 4, 600, lines.length * 24 + 50);
-        c.strokeStyle = '#37e2ff'; c.strokeRect(Wd / 2 - 300, py - 4, 600, lines.length * 24 + 50);
+        c.fillStyle = 'rgba(5,8,20,.85)'; c.fillRect(Wd / 2 - PW / 2, py - 4, PW, lines.length * 24 + 50);
+        c.strokeStyle = '#37e2ff'; c.strokeRect(Wd / 2 - PW / 2, py - 4, PW, lines.length * 24 + 50);
         c.fillStyle = '#cdf6ff'; lines.forEach((ln, i) => c.fillText(ln, Wd / 2, py + 20 + i * 24));
         const slots = b.n.split('').map((ch, i) => i < b.buf.length ? ch.toUpperCase() : (b.miss >= 3 && i < Math.min(2, b.n.length) ? ch.toUpperCase() : '_')).join(' ');
         c.font = '900 24px ui-monospace, Menlo, monospace'; c.fillStyle = '#ffc545'; c.fillText(slots, Wd / 2, py + lines.length * 24 + 34);
@@ -3336,8 +3372,8 @@ registerGame({
       if (S.defCard) {
         c.font = '700 18px Segoe UI, Arial'; c.textAlign = 'center';
         c.fillStyle = S.defCard.missed ? 'rgba(255,93,115,.9)' : 'rgba(61,220,132,.9)';
-        c.fillRect(Wd / 2 - 320, Ht - 130, 640, 44);
-        c.fillStyle = '#04110a'; c.fillText(`📖 ${up(S.defCard.w)} — ${S.defCard.d}`.slice(0, 80), Wd / 2, Ht - 102);
+        c.fillRect(Wd / 2 - Math.min(320, Wd / 2 - 10), Ht - 130, Math.min(640, Wd - 20), 44);
+        c.fillStyle = '#04110a'; c.fillText(`📖 ${up(S.defCard.w)} — ${S.defCard.d}`.slice(0, narrow ? 44 : 80), Wd / 2, Ht - 102);
       }
       if (S.freeze > 0) { c.fillStyle = 'rgba(120,200,255,.08)'; c.fillRect(0, 0, Wd, Ht); }
       if (S.paused) { c.fillStyle = 'rgba(0,0,0,.6)'; c.fillRect(0, 0, Wd, Ht); c.fillStyle = '#fff'; c.font = '900 40px Segoe UI'; c.textAlign = 'center'; c.fillText('⏸ ' + t('pause') + ' — Esc', Wd / 2, Ht / 2); }
@@ -3947,7 +3983,7 @@ registerGame({
       const across = placed.filter(p => p.dir === 'A').sort((a, b) => a.num - b.num), down = placed.filter(p => p.dir === 'D').sort((a, b) => a.num - b.num);
       const clues = [...across, ...down];
       const val = Array.from({ length: H }, () => Array(W).fill(''));
-      let cur = { r: across[0].r, c: across[0].c, dir: 'A' }, reveals = 0, checks = 0, done = false;
+      let cur = { r: across[0].r, c: across[0].c, dir: 'A' }, reveals = 0, done = false;
       const t0 = Date.now();
       const root = api.clear();
       const cs = Math.max(26, Math.min(44, Math.floor((Math.min(innerWidth, 1100) * 0.55) / W)));
@@ -3989,7 +4025,7 @@ registerGame({
       const move = (dr, dc) => { let r = cur.r + dr, c = cur.c + dc; while (r >= 0 && c >= 0 && r < H && c < W) { if (sol[r][c]) { cur.r = r; cur.c = c; return; } r += dr; c += dc; } };
       const advance = () => { const w = wordAt(cur.r, cur.c, cur.dir); if (!w) return; const dr = cur.dir === 'D' ? 1 : 0, dc = cur.dir === 'A' ? 1 : 0; const nr = cur.r + dr, nc = cur.c + dc; if (nr < H && nc < W && sol[nr][nc] && wordAt(nr, nc, cur.dir) === w) { cur.r = nr; cur.c = nc; } };
       const nextClue = (back) => { const w = wordAt(cur.r, cur.c, cur.dir); let i = clues.indexOf(w); i = (i + (back ? -1 : 1) + clues.length) % clues.length; const p = clues[i]; cur = { r: p.r, c: p.c, dir: p.dir }; };
-      function check() { checks++; for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c]) { cells[r][c].dataset.bad = val[r][c] !== sol[r][c] ? '1' : ''; cells[r][c].dataset.ok = val[r][c] === sol[r][c] ? '1' : ''; } paint(); api.sfx('pop'); }
+      function check() { for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c]) { cells[r][c].dataset.bad = val[r][c] !== sol[r][c] ? '1' : ''; cells[r][c].dataset.ok = val[r][c] === sol[r][c] ? '1' : ''; } paint(); api.sfx('pop'); }
       function reveal() { if (done) return; reveals++; val[cur.r][cur.c] = sol[cur.r][cur.c]; cells[cur.r][cur.c].dataset.bad = ''; advance(); paint(); api.sfx('pop'); win(); }
       function win() {
         for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c] !== sol[r][c]) return;
@@ -4233,7 +4269,7 @@ registerGame({
     });
     const play = ci => {
       const M = MYSTERIES[api.lang][ci];
-      let qi = 0, score = 0, ansOK = 0, evOK = 0, phase = 'answer', chosen = null;
+      let qi = 0, score = 0, ansOK = 0, evOK = 0, phase = 'answer';
       let evSel = new Set();
       const root = api.clear();
       const textEl = h('div', { class: 'col', style: { gap: '6px' } });
@@ -4258,7 +4294,7 @@ registerGame({
       const hud = () => api.hud([[t('score'), score], ['❓', `${Math.min(qi + 1, M.q.length)}/${M.q.length}`], [t('evidence'), evOK]]);
       const showQ = () => {
         if (qi >= M.q.length) return end();
-        phase = 'answer'; evSel = new Set(); chosen = null; paintSents();
+        phase = 'answer'; evSel = new Set(); paintSents();
         const q = M.q[qi], [ic, lab, col] = WH[q.t];
         const opts = shuffle(q.o);
         qEl.innerHTML = '';
@@ -4271,7 +4307,7 @@ registerGame({
       };
       const pickAns = (o, btn, box) => {
         if (phase !== 'answer') return;
-        const q = M.q[qi]; chosen = o;
+        const q = M.q[qi];
         const ok = o === q.o[0];
         [...box.children].forEach(b => { b.disabled = true; if (b.textContent === q.o[0]) b.classList.add('right'); });
         if (ok) { ansOK++; score += 100; api.sfx('good'); } else { btn.classList.add('wrong'); api.sfx('bad'); }
@@ -5436,7 +5472,7 @@ registerGame({
       const spb = 60 / (s.bpm * tempo / 100), pxps = 190;
       const notes = s.notes.map((n, i) => ({ ...n, i, time: n.t * spb, dur: n.d * spb, hit: null }));
       const ly = s.lyr[api.lang] || s.lyr.fr || s.lyr.en || null;
-      let now = -3 * spb, score = 0, combo = 0, maxCombo = 0, perfect = 0, good = 0, miss = 0, over = false, flashes = [];
+      let now = -3 * spb, score = 0, combo = 0, maxCombo = 0, perfect = 0, good = 0, miss = 0, over = false;
       const pressed = {};
       const judgeTxt = [];
       const nextUnhit = () => notes.find(n => !n.hit);
@@ -5639,7 +5675,7 @@ registerGame({
     fr: 'Chaque manche part du sens et se termine par l’orthographe — passer de la définition au mot, la direction qui bâtit la compréhension (Macdonald et al., 2022), dans un jeu d’arcade rapide.',
   },
   start(api) {
-    const C = 22, R = 15, S = 30;
+    const narrow = innerWidth < 700, C = narrow ? 13 : 22, R = narrow ? 16 : 15, S = 30;
     const menu = () => UI.menu(api, {
       options: [
         { icon: '🐍', name: { en: 'Classic', fr: 'Classique' }, desc: { en: 'Speed rises with each word', fr: 'La vitesse augmente à chaque mot' }, go: () => play(null) },
@@ -5656,7 +5692,7 @@ registerGame({
       const dpad = h('div', { class: 'dpad' }, h('span'), h('button', { onclick: () => turn(0, -1) }, '▲'), h('span'), h('button', { onclick: () => turn(-1, 0) }, '◀'), h('button', { onclick: () => turn(0, 1) }, '▼'), h('button', { onclick: () => turn(1, 0) }, '▶'));
       root.appendChild(h('div', { class: 'gwrap', style: { maxWidth: C * S + 40 + 'px' } }, clue, slots, cv, dpad));
       const c = cv.getContext('2d');
-      let snake = [{ x: 5, y: 7 }, { x: 4, y: 7 }, { x: 3, y: 7 }], dir = { x: 1, y: 0 }, nextDir = dir, items = [], word, entry, idx = 0, score = 0, lives = 3, wrongs = 0, words = 0, tick = 0, over = false, flash = 0, parts = [];
+      let snake = [{ x: 3, y: 7 }, { x: 2, y: 7 }, { x: 1, y: 7 }], dir = { x: 1, y: 0 }, nextDir = dir, items = [], word, entry, idx = 0, score = 0, lives = 3, wrongs = 0, words = 0, tick = 0, over = false, flash = 0, parts = [], ready = 1.6;
       const period = () => Math.max(0.065, 0.16 - words * 0.008) / (api.relaxed ? 0.65 : 1);
       const free = () => { let p; do { p = { x: rand(C), y: rand(R) }; } while (snake.some(s => s.x === p.x && s.y === p.y) || items.some(i => i.x === p.x && i.y === p.y)); return p; };
       const newWord = () => {
@@ -5676,7 +5712,7 @@ registerGame({
       let sx = 0, sy = 0;
       cv.addEventListener('touchstart', e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
       cv.addEventListener('touchend', e => { const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy; if (Math.max(Math.abs(dx), Math.abs(dy)) < 20) return; if (Math.abs(dx) > Math.abs(dy)) turn(Math.sign(dx), 0); else turn(0, Math.sign(dy)); });
-      const die = () => { lives--; api.sfx('boom'); flash = 0.4; if (lives <= 0) return end(); snake = [{ x: 5, y: 7 }, { x: 4, y: 7 }, { x: 3, y: 7 }]; dir = nextDir = { x: 1, y: 0 }; };
+      const die = () => { lives--; api.sfx('boom'); flash = 0.4; if (lives <= 0) return end(); snake = [{ x: 3, y: 7 }, { x: 2, y: 7 }, { x: 1, y: 7 }]; dir = nextDir = { x: 1, y: 0 }; ready = 1.4; };
       const step = () => {
         dir = nextDir;
         let hd = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
@@ -5708,8 +5744,9 @@ registerGame({
       api.loop(dt => {
         if (over) return;
         tick += dt; flash = Math.max(0, flash - dt); parts.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.t -= dt; }); parts = parts.filter(p => p.t > 0);
-        while (tick >= period()) { tick -= period(); step(); if (over) break; }
+        if (ready > 0) { ready -= dt; tick = 0; } else while (tick >= period()) { tick -= period(); step(); if (over) break; }
         draw();
+        if (ready > 0) { c.fillStyle = 'rgba(4,17,10,.55)'; c.fillRect(0, 0, C * S, R * S); c.fillStyle = '#9dff5b'; c.font = '900 48px Segoe UI'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(api.fr ? 'PRÊT ?' : 'READY?', C * S / 2, R * S / 2); c.font = '600 18px Segoe UI'; c.fillText(api.fr ? 'Lis l’indice, puis va vers la 1re lettre' : 'Read the clue, then find letter 1', C * S / 2, R * S / 2 + 44); }
         api.hud([[t('score'), score], ['❤', lives], [api.fr ? 'Mots' : 'Words', words]]);
       });
     };

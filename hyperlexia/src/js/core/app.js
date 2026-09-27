@@ -48,6 +48,12 @@ const Progress = {
     const gs = Store.game(id); gs.plays++; Store.s.plays++;
     Store.s.langsUsed[Store.s.lang] = 1; Store.save();
     this.touchStreak(); this.badge('first');
+    const trio = App.trio(), tk = todayKey();
+    if (!Store.s.today || Store.s.today.date !== tk) Store.s.today = { date: tk, done: {} };
+    if (trio.some(g => g.id === id) && !Store.s.today.done[id]) {
+      Store.s.today.done[id] = 1; Store.save();
+      if (trio.every(g => Store.s.today.done[g.id])) setTimeout(() => { Sound.sfx('level'); FX.confetti(160); FX.toast(isFR() ? 'Mission du jour accomplie ! +50 XP' : 'Daily mission complete! +50 XP', '🎯'); this.addXP(50); }, 800);
+    }
     const tried = Object.values(Store.s.games).filter(x => x.plays > 0).length;
     if (tried >= 10) this.badge('explorer'); if (tried >= GAMES.length) this.badge('completionist');
     if (Object.keys(Store.s.langsUsed).length >= 2) this.badge('polyglot');
@@ -161,7 +167,7 @@ const App = {
     else if (!g && this.cur) this.closeGame(true);
   },
   setLang(l) {
-    Store.s.lang = l; Store.save(); Lex._c = Lex._c; document.documentElement.lang = l === 'fr' ? 'fr-CA' : 'en';
+    Store.s.lang = l; Store.save(); document.documentElement.lang = l === 'fr' ? 'fr-CA' : 'en';
     if (this.cur) { const id = this.cur.id; this.closeGame(true); this.render(); this.openGame(id, true); } else this.render();
   },
   topbar() {
@@ -179,6 +185,11 @@ const App = {
         h('div', { class: 'hide-sm' }, h('div', { style: { fontWeight: 800, fontSize: '14px', lineHeight: 1.1 } }, Store.s.name || '—'),
           h('div', { style: { fontSize: '11px', color: 'var(--ink3)' } }, `${t('level')} ${lv} · ${levelTitle(lv)}`)),
         h('div', { class: 'xpbar' }, h('i', { id: 'xpfill', style: { width: `${clamp((Store.s.xp - cur) / (nxt - cur) * 100, 0, 100)}%` } }))));
+  },
+  trio() {
+    const r = rngFor('trio-' + todayKey());
+    const cats = shuffle(CATS, r).slice(0, 3);
+    return cats.map(c => pick(GAMES.filter(g => g.cat === c), r));
   },
   refreshPlayer() { const tb = $('.topbar'); if (tb) tb.replaceWith(this.topbar()); },
   render() {
@@ -198,12 +209,15 @@ const App = {
         h('div', { class: 'row' },
           h('button', { class: 'btn primary lg', onclick: () => { const pool = GAMES.filter(g => this.filter === 'all' || g.cat === this.filter); this.openGame(pick(pool, Math.random).id); } }, '🎲 ' + (isFR() ? 'Surprends-moi' : 'Surprise me')),
           h('button', { class: 'btn lg', onclick: () => this.parents() }, '🧠 ' + t('parents'))),
-        h('div', { class: 'ticker' }, bigNums.join('  ·  '))),
+        h('div', { class: 'ticker' }, h('span', null, bigNums.join('  ·  ')))),
       h('div', { class: 'hero-stats' },
         h('div', { class: 'stat' }, h('div', { class: 'v' }, lv), h('div', { class: 'l' }, `${t('level')} · ${levelTitle(lv)}`)),
         h('div', { class: 'stat' }, h('div', { class: 'v' }, fmt(Store.s.xp)), h('div', { class: 'l' }, 'XP')),
         h('div', { class: 'stat' }, h('div', { class: 'v' }, `🔥 ${Store.s.streak.count || 0}`), h('div', { class: 'l' }, isFR() ? 'Jours de suite' : 'Day streak')),
-        h('div', { class: 'stat', style: { cursor: 'pointer' }, onclick: () => this.profile() }, h('div', { class: 'v' }, `${nb}/${BADGES.length}`), h('div', { class: 'l' }, `${t('badges')} · ${tried}/${GAMES.length} ${isFR() ? 'jeux essayés' : 'games tried'}`)))));
+        h('div', { class: 'stat', style: { cursor: 'pointer' }, onclick: () => this.profile() }, h('div', { class: 'v' }, `${nb}/${BADGES.length}`), h('div', { class: 'l' }, `${t('badges')} · ${tried}/${GAMES.length} ${isFR() ? 'jeux essayés' : 'games tried'}`)),
+        (() => { const tk = todayKey(), done = (Store.s.today && Store.s.today.date === tk) ? Store.s.today.done : {}; const trio = this.trio(); const n = trio.filter(g => done[g.id]).length;
+          return h('div', { class: 'stat trio' }, h('div', { style: { flex: '1 1 140px' } }, h('div', { class: 'l' }, isFR() ? '🎯 Mission du jour' : '🎯 Daily mission'), h('div', { style: { fontSize: '14px', color: 'var(--ink2)', marginTop: '4px' } }, isFR() ? `Joue ces 3 jeux : +50 XP (${n}/3)` : `Play these 3 games: +50 XP (${n}/3)`)),
+            ...trio.map(g => h('button', { class: 'tg', title: L(g.name), onclick: () => this.openGame(g.id) }, h('span', { html: iconSVG(g, 58, 't') }), done[g.id] ? h('span', { class: 'ck' }, '✓') : null, L(g.name)))); })())));
     const chips = h('div', { class: 'filters' }, ['all', ...CATS].map(c => h('button', { class: 'chip' + (this.filter === c ? ' sel' : ''), onclick: () => { this.filter = c; this.render(); } }, t(c))));
     app.appendChild(chips);
     const grid = h('div', { class: 'grid' });
@@ -230,7 +244,7 @@ const App = {
     const g = GAMES.find(x => x.id === id); if (!g) return;
     if (this.cur) this.closeGame(true);
     Sound.init();
-    if (!fromHash && location.hash !== '#' + id) { history.pushState(null, '', '#' + id); }
+    if (!fromHash && location.hash !== '#' + id) { try { history.pushState(null, '', '#' + id); } catch (e) { /* file:// in some browsers */ } }
     const hud = h('div', { class: 'hud' });
     const body = h('div', { class: 'gbody' });
     const scr = h('div', { class: 'gscreen' },
@@ -255,7 +269,7 @@ const App = {
     $$('.modal-back').forEach(m => m.remove());
     this.scr.remove(); this.cur = null; this.api = null;
     document.body.style.overflow = ''; BG.paused = false;
-    if (!fromHash && location.hash) history.pushState(null, '', location.pathname + location.search);
+    if (!fromHash && location.hash) { try { history.pushState(null, '', location.pathname + location.search); } catch (e) { /* ignore */ } }
     this.render();
   },
   helpModal(g) {

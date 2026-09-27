@@ -19,7 +19,6 @@ registerGame({
     const clean = s => norm(s.replace(/[’]/g, "'")).toUpperCase();
     const shiftCh = (c, k) => A.includes(c) ? A[(A.indexOf(c) + k + 26) % 26] : c;
     const caesar = (p, k) => p.split('').map(c => shiftCh(c, k)).join('');
-    const atbash = p => p.split('').map(c => A.includes(c) ? A[25 - A.indexOf(c)] : c).join('');
     const vig = (p, key, dir = 1) => { let j = 0; return p.split('').map(c => { if (!A.includes(c)) return c; const k = A.indexOf(key[j++ % key.length]); return shiftCh(c, dir * k); }).join(''); };
     const railEnc = (s, n) => { const rails = Array.from({ length: n }, () => []); let r = 0, d = 1; for (const c of s) { rails[r].push(c); if (n > 1) { if (r === 0) d = 1; else if (r === n - 1) d = -1; r += d; } } return rails.flat().join(''); };
     const railDec = (s, n) => { const len = s.length, pat = []; let r = 0, d = 1; for (let i = 0; i < len; i++) { pat.push(r); if (n > 1) { if (r === 0) d = 1; else if (r === n - 1) d = -1; r += d; } } const counts = Array(n).fill(0); pat.forEach(x => counts[x]++); const rails = []; let pos = 0; for (let i = 0; i < n; i++) { rails.push(s.slice(pos, pos + counts[i]).split('')); pos += counts[i]; } return pat.map(x => rails[x].shift()).join(''); };

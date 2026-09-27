@@ -57,7 +57,7 @@ registerGame({
       const spb = 60 / (s.bpm * tempo / 100), pxps = 190;
       const notes = s.notes.map((n, i) => ({ ...n, i, time: n.t * spb, dur: n.d * spb, hit: null }));
       const ly = s.lyr[api.lang] || s.lyr.fr || s.lyr.en || null;
-      let now = -3 * spb, score = 0, combo = 0, maxCombo = 0, perfect = 0, good = 0, miss = 0, over = false, flashes = [];
+      let now = -3 * spb, score = 0, combo = 0, maxCombo = 0, perfect = 0, good = 0, miss = 0, over = false;
       const pressed = {};
       const judgeTxt = [];
       const nextUnhit = () => notes.find(n => !n.hit);

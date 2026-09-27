@@ -71,7 +71,7 @@ registerGame({
       const across = placed.filter(p => p.dir === 'A').sort((a, b) => a.num - b.num), down = placed.filter(p => p.dir === 'D').sort((a, b) => a.num - b.num);
       const clues = [...across, ...down];
       const val = Array.from({ length: H }, () => Array(W).fill(''));
-      let cur = { r: across[0].r, c: across[0].c, dir: 'A' }, reveals = 0, checks = 0, done = false;
+      let cur = { r: across[0].r, c: across[0].c, dir: 'A' }, reveals = 0, done = false;
       const t0 = Date.now();
       const root = api.clear();
       const cs = Math.max(26, Math.min(44, Math.floor((Math.min(innerWidth, 1100) * 0.55) / W)));
@@ -113,7 +113,7 @@ registerGame({
       const move = (dr, dc) => { let r = cur.r + dr, c = cur.c + dc; while (r >= 0 && c >= 0 && r < H && c < W) { if (sol[r][c]) { cur.r = r; cur.c = c; return; } r += dr; c += dc; } };
       const advance = () => { const w = wordAt(cur.r, cur.c, cur.dir); if (!w) return; const dr = cur.dir === 'D' ? 1 : 0, dc = cur.dir === 'A' ? 1 : 0; const nr = cur.r + dr, nc = cur.c + dc; if (nr < H && nc < W && sol[nr][nc] && wordAt(nr, nc, cur.dir) === w) { cur.r = nr; cur.c = nc; } };
       const nextClue = (back) => { const w = wordAt(cur.r, cur.c, cur.dir); let i = clues.indexOf(w); i = (i + (back ? -1 : 1) + clues.length) % clues.length; const p = clues[i]; cur = { r: p.r, c: p.c, dir: p.dir }; };
-      function check() { checks++; for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c]) { cells[r][c].dataset.bad = val[r][c] !== sol[r][c] ? '1' : ''; cells[r][c].dataset.ok = val[r][c] === sol[r][c] ? '1' : ''; } paint(); api.sfx('pop'); }
+      function check() { for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c]) { cells[r][c].dataset.bad = val[r][c] !== sol[r][c] ? '1' : ''; cells[r][c].dataset.ok = val[r][c] === sol[r][c] ? '1' : ''; } paint(); api.sfx('pop'); }
       function reveal() { if (done) return; reveals++; val[cur.r][cur.c] = sol[cur.r][cur.c]; cells[cur.r][cur.c].dataset.bad = ''; advance(); paint(); api.sfx('pop'); win(); }
       function win() {
         for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (sol[r][c] && val[r][c] !== sol[r][c]) return;

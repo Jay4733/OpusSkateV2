@@ -102,9 +102,10 @@ registerGame({
         const r = h('div', { style: { display: 'flex', gap: '4px' } });
         for (const ch of ln) {
           const n = norm(ch);
-          if (ch === ' ') { r.appendChild(h('div', { style: { width: '22px' } })); continue; }
+          if (ch === ' ') { r.appendChild(h('div', { style: { width: Math.max(10, Math.min(22, Math.floor((Math.min(innerWidth, 1100) - 70) / 24))) + 'px' } })); continue; }
           const isL = /[a-z]/.test(n), shown = !isL || S.guessed.has(n) || S.solvedShow;
-          const tile = h('div', { style: { width: '38px', height: '48px', borderRadius: '6px', display: 'grid', placeItems: 'center', fontWeight: 900, fontSize: '26px', color: '#0b1020', background: shown ? '#fff' : 'linear-gradient(180deg,#f4f4f4,#cfd8d3)', boxShadow: 'inset 0 -3px 0 rgba(0,0,0,.15)', transition: 'background .3s' } }, shown ? ch : '');
+          const tw = Math.max(18, Math.min(38, Math.floor((Math.min(innerWidth, 1100) - 70) / 14) - 4));
+          const tile = h('div', { style: { width: tw + 'px', height: Math.round(tw * 1.26) + 'px', borderRadius: '6px', display: 'grid', placeItems: 'center', fontWeight: 900, fontSize: Math.round(tw * 0.68) + 'px', color: '#0b1020', background: shown ? '#fff' : 'linear-gradient(180deg,#f4f4f4,#cfd8d3)', boxShadow: 'inset 0 -3px 0 rgba(0,0,0,.15)', transition: 'background .3s' } }, shown ? ch : '');
           if (!shown) tile.style.background = '#e8f1ec';
           if (flash && n === flash) { tile.style.background = '#37e2ff'; tile.classList.add('bounce'); }
           r.appendChild(tile);

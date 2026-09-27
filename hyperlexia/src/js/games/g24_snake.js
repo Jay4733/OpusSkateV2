@@ -14,7 +14,7 @@ registerGame({
     fr: 'Chaque manche part du sens et se termine par l’orthographe — passer de la définition au mot, la direction qui bâtit la compréhension (Macdonald et al., 2022), dans un jeu d’arcade rapide.',
   },
   start(api) {
-    const C = 22, R = 15, S = 30;
+    const narrow = innerWidth < 700, C = narrow ? 13 : 22, R = narrow ? 16 : 15, S = 30;
     const menu = () => UI.menu(api, {
       options: [
         { icon: '🐍', name: { en: 'Classic', fr: 'Classique' }, desc: { en: 'Speed rises with each word', fr: 'La vitesse augmente à chaque mot' }, go: () => play(null) },
@@ -31,7 +31,7 @@ registerGame({
       const dpad = h('div', { class: 'dpad' }, h('span'), h('button', { onclick: () => turn(0, -1) }, '▲'), h('span'), h('button', { onclick: () => turn(-1, 0) }, '◀'), h('button', { onclick: () => turn(0, 1) }, '▼'), h('button', { onclick: () => turn(1, 0) }, '▶'));
       root.appendChild(h('div', { class: 'gwrap', style: { maxWidth: C * S + 40 + 'px' } }, clue, slots, cv, dpad));
       const c = cv.getContext('2d');
-      let snake = [{ x: 5, y: 7 }, { x: 4, y: 7 }, { x: 3, y: 7 }], dir = { x: 1, y: 0 }, nextDir = dir, items = [], word, entry, idx = 0, score = 0, lives = 3, wrongs = 0, words = 0, tick = 0, over = false, flash = 0, parts = [];
+      let snake = [{ x: 3, y: 7 }, { x: 2, y: 7 }, { x: 1, y: 7 }], dir = { x: 1, y: 0 }, nextDir = dir, items = [], word, entry, idx = 0, score = 0, lives = 3, wrongs = 0, words = 0, tick = 0, over = false, flash = 0, parts = [], ready = 1.6;
       const period = () => Math.max(0.065, 0.16 - words * 0.008) / (api.relaxed ? 0.65 : 1);
       const free = () => { let p; do { p = { x: rand(C), y: rand(R) }; } while (snake.some(s => s.x === p.x && s.y === p.y) || items.some(i => i.x === p.x && i.y === p.y)); return p; };
       const newWord = () => {
@@ -51,7 +51,7 @@ registerGame({
       let sx = 0, sy = 0;
       cv.addEventListener('touchstart', e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
       cv.addEventListener('touchend', e => { const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy; if (Math.max(Math.abs(dx), Math.abs(dy)) < 20) return; if (Math.abs(dx) > Math.abs(dy)) turn(Math.sign(dx), 0); else turn(0, Math.sign(dy)); });
-      const die = () => { lives--; api.sfx('boom'); flash = 0.4; if (lives <= 0) return end(); snake = [{ x: 5, y: 7 }, { x: 4, y: 7 }, { x: 3, y: 7 }]; dir = nextDir = { x: 1, y: 0 }; };
+      const die = () => { lives--; api.sfx('boom'); flash = 0.4; if (lives <= 0) return end(); snake = [{ x: 3, y: 7 }, { x: 2, y: 7 }, { x: 1, y: 7 }]; dir = nextDir = { x: 1, y: 0 }; ready = 1.4; };
       const step = () => {
         dir = nextDir;
         let hd = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
@@ -83,8 +83,9 @@ registerGame({
       api.loop(dt => {
         if (over) return;
         tick += dt; flash = Math.max(0, flash - dt); parts.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.t -= dt; }); parts = parts.filter(p => p.t > 0);
-        while (tick >= period()) { tick -= period(); step(); if (over) break; }
+        if (ready > 0) { ready -= dt; tick = 0; } else while (tick >= period()) { tick -= period(); step(); if (over) break; }
         draw();
+        if (ready > 0) { c.fillStyle = 'rgba(4,17,10,.55)'; c.fillRect(0, 0, C * S, R * S); c.fillStyle = '#9dff5b'; c.font = '900 48px Segoe UI'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(api.fr ? 'PRÊT ?' : 'READY?', C * S / 2, R * S / 2); c.font = '600 18px Segoe UI'; c.fillText(api.fr ? 'Lis l’indice, puis va vers la 1re lettre' : 'Read the clue, then find letter 1', C * S / 2, R * S / 2 + 44); }
         api.hud([[t('score'), score], ['❤', lives], [api.fr ? 'Mots' : 'Words', words]]);
       });
     };

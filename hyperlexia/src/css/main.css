@@ -155,8 +155,8 @@ input.field:focus, textarea.field:focus { border-color: var(--cyan); box-shadow:
 .modal-back { position: fixed; inset: 0; z-index: 100; background: rgba(2,4,12,.72); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 16px; animation: fadein .2s; }
 .modal { width: min(720px, 100%); max-height: 88vh; overflow: auto; background: linear-gradient(180deg, #16204a, #0d1430); border: 1px solid rgba(255,255,255,.18); border-radius: 22px; padding: 22px; box-shadow: var(--shadow); }
 .modal h2 { margin: 0 0 10px; }
-.toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 120; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
-.toast { background: rgba(14,21,48,.95); border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: 10px 16px; box-shadow: var(--shadow); font-weight: 650; animation: toast 3s forwards; display: flex; gap: 10px; align-items: center; }
+.toasts { position: fixed; bottom: 18px; left: 0; right: 0; z-index: 120; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; padding: 0 12px; }
+.toast { background: rgba(14,21,48,.95); border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: 10px 16px; box-shadow: var(--shadow); font-weight: 650; animation: toast 3s forwards; display: flex; gap: 10px; align-items: center; max-width: min(560px, 100%); }
 @keyframes toast { 0% { opacity: 0; transform: translateY(10px); } 8%,85% { opacity: 1; transform: none; } 100% { opacity: 0; transform: translateY(-6px); } }
 .floaty { position: fixed; z-index: 95; pointer-events: none; font-weight: 900; font-family: var(--mono); animation: floaty 1s ease-out forwards; text-shadow: 0 2px 8px rgba(0,0,0,.6); }
 @keyframes floaty { to { transform: translateY(-50px); opacity: 0; } }
@@ -194,4 +194,27 @@ table.simple td, table.simple th { padding: 6px 8px; border-bottom: 1px solid va
   .kb button.wide { min-width: 48px; }
   .hide-sm { display: none !important; }
 }
+@media (max-width: 600px) {
+  .brand span { display: none; }
+  .topbar { gap: 6px; padding: 8px 10px; }
+  .seg button { padding: 5px 8px; font-size: 13px; }
+  .btn.icon { width: 36px; height: 36px; font-size: 16px; }
+  .xpbar { display: none; }
+  .player { padding: 3px; }
+  .hero { padding: 0 12px; margin-top: 14px; }
+  .hero-main { padding: 20px; border-radius: 22px; }
+  .grid, .filters, .footer { padding-left: 12px; padding-right: 12px; }
+  .gbar { gap: 6px; padding: 8px; }
+  .hud .h { font-size: 12px; padding: 3px 7px; }
+  .gtitle { font-size: 22px; }
+  .menu .mhead svg { width: 72px; height: 72px; }
+  .result .big { font-size: 42px; }
+}
+.gbar .hud { min-width: 0; }
+.trio { grid-column: span 2; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.trio .tg { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 12px; color: var(--ink2); background: none; border: 0; padding: 0; position: relative; max-width: 90px; text-align: center; }
+.trio .tg svg { width: 58px; height: 58px; }
+.trio .tg .ck { position: absolute; top: -4px; right: 8px; background: var(--good); color: #04220f; border-radius: 50%; width: 22px; height: 22px; display: grid; place-items: center; font-weight: 900; font-size: 13px; }
+.ticker span { display: inline-block; padding-left: 100%; animation: marquee 38s linear infinite; }
+@keyframes marquee { to { transform: translateX(-100%); } }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: .01ms !important; transition-duration: .01ms !important; } }

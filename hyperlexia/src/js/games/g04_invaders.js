@@ -14,8 +14,8 @@ registerGame({
     fr: 'Développe l’automatisme de frappe avec des mots faciles à décoder, puis les boss obligent à passer du sens au mot — le lien sémantique qui prédit la compréhension (Brown et al., 2013; Macdonald et al., 2022).',
   },
   start(api) {
-    const Wd = 960, Ht = 600;
-    let S = null;
+    const narrow = innerWidth < 700, Wd = narrow ? 480 : 960, Ht = narrow ? 640 : 600;
+    let S = null, input = null;
     const menu = () => UI.menu(api, {
       options: [
         { icon: '🚀', name: { en: 'Campaign', fr: 'Campagne' }, desc: { en: 'Waves grow faster; bosses every 4 waves', fr: 'Vagues de plus en plus rapides' }, go: () => play(1) },
@@ -33,7 +33,7 @@ registerGame({
     const play = (wave, bossRush, training) => {
       const root = api.clear();
       const cv = h('canvas', { class: 'game', width: Wd, height: Ht, style: { width: '100%', maxWidth: Wd + 'px', aspectRatio: `${Wd}/${Ht}` } });
-      const input = h('div', { class: 'mono center', style: { fontSize: '22px', minHeight: '32px', color: 'var(--cyan)', marginTop: '8px' } });
+      input = h('div', { class: 'mono center', style: { fontSize: '22px', minHeight: '32px', color: 'var(--cyan)', marginTop: '8px' } });
       const touch = matchMedia('(pointer:coarse)').matches;
       const kb = touch ? UI.keyboard(k => onKey(k), { enter: false }) : null;
       root.appendChild(h('div', { class: 'gwrap' }, cv, input, kb));
@@ -115,7 +115,7 @@ registerGame({
       hit.forEach(e => { S.lives--; boom(e.x, Ht - 60, '#ff5d73', 40); api.sfx('boom'); if (S.target === e) { S.target = null; input.textContent = ''; } S.combo = 1; });
       S.enemies = S.enemies.filter(e => e.y <= Ht - 70);
       if (S.boss) {
-        const b = S.boss; b.t += dt; b.y = Math.min(170, b.y + 40 * dt); b.x = Wd / 2 + Math.sin(b.t * 0.6) * 220; b.shake = Math.max(0, (b.shake || 0) - dt);
+        const b = S.boss; b.t += dt; b.y = Math.min(170, b.y + 40 * dt); b.x = Wd / 2 + Math.sin(b.t * 0.6) * Wd * 0.23; b.shake = Math.max(0, (b.shake || 0) - dt);
         if (b.t > (api.relaxed || S.training ? 90 : 45)) { S.lives -= 2; boom(b.x, b.y, '#ff5d73', 80); S.defCard = { w: b.g.w, d: b.g.d, t: 4, missed: true }; S.boss = null; api.sfx('lose'); }
       }
       for (const p of S.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96; p.t -= dt; }
@@ -163,10 +163,11 @@ registerGame({
         c.restore();
         // definition panel
         const def = b.g.d; c.font = '600 18px Segoe UI, Arial'; c.textAlign = 'center';
-        const lines = wrapText(c, '“' + def + '”', 560);
+        const PW = Math.min(600, Wd - 30);
+        const lines = wrapText(c, '“' + def + '”', PW - 40);
         const py = Math.max(10, b.y - 120);
-        c.fillStyle = 'rgba(5,8,20,.85)'; c.fillRect(Wd / 2 - 300, py - 4, 600, lines.length * 24 + 50);
-        c.strokeStyle = '#37e2ff'; c.strokeRect(Wd / 2 - 300, py - 4, 600, lines.length * 24 + 50);
+        c.fillStyle = 'rgba(5,8,20,.85)'; c.fillRect(Wd / 2 - PW / 2, py - 4, PW, lines.length * 24 + 50);
+        c.strokeStyle = '#37e2ff'; c.strokeRect(Wd / 2 - PW / 2, py - 4, PW, lines.length * 24 + 50);
         c.fillStyle = '#cdf6ff'; lines.forEach((ln, i) => c.fillText(ln, Wd / 2, py + 20 + i * 24));
         const slots = b.n.split('').map((ch, i) => i < b.buf.length ? ch.toUpperCase() : (b.miss >= 3 && i < Math.min(2, b.n.length) ? ch.toUpperCase() : '_')).join(' ');
         c.font = '900 24px ui-monospace, Menlo, monospace'; c.fillStyle = '#ffc545'; c.fillText(slots, Wd / 2, py + lines.length * 24 + 34);
@@ -177,8 +178,8 @@ registerGame({
       if (S.defCard) {
         c.font = '700 18px Segoe UI, Arial'; c.textAlign = 'center';
         c.fillStyle = S.defCard.missed ? 'rgba(255,93,115,.9)' : 'rgba(61,220,132,.9)';
-        c.fillRect(Wd / 2 - 320, Ht - 130, 640, 44);
-        c.fillStyle = '#04110a'; c.fillText(`📖 ${up(S.defCard.w)} — ${S.defCard.d}`.slice(0, 80), Wd / 2, Ht - 102);
+        c.fillRect(Wd / 2 - Math.min(320, Wd / 2 - 10), Ht - 130, Math.min(640, Wd - 20), 44);
+        c.fillStyle = '#04110a'; c.fillText(`📖 ${up(S.defCard.w)} — ${S.defCard.d}`.slice(0, narrow ? 44 : 80), Wd / 2, Ht - 102);
       }
       if (S.freeze > 0) { c.fillStyle = 'rgba(120,200,255,.08)'; c.fillRect(0, 0, Wd, Ht); }
       if (S.paused) { c.fillStyle = 'rgba(0,0,0,.6)'; c.fillRect(0, 0, Wd, Ht); c.fillStyle = '#fff'; c.font = '900 40px Segoe UI'; c.textAlign = 'center'; c.fillText('⏸ ' + t('pause') + ' — Esc', Wd / 2, Ht / 2); }

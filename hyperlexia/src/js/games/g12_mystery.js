@@ -21,7 +21,7 @@ registerGame({
     });
     const play = ci => {
       const M = MYSTERIES[api.lang][ci];
-      let qi = 0, score = 0, ansOK = 0, evOK = 0, phase = 'answer', chosen = null;
+      let qi = 0, score = 0, ansOK = 0, evOK = 0, phase = 'answer';
       let evSel = new Set();
       const root = api.clear();
       const textEl = h('div', { class: 'col', style: { gap: '6px' } });
@@ -46,7 +46,7 @@ registerGame({
       const hud = () => api.hud([[t('score'), score], ['❓', `${Math.min(qi + 1, M.q.length)}/${M.q.length}`], [t('evidence'), evOK]]);
       const showQ = () => {
         if (qi >= M.q.length) return end();
-        phase = 'answer'; evSel = new Set(); chosen = null; paintSents();
+        phase = 'answer'; evSel = new Set(); paintSents();
         const q = M.q[qi], [ic, lab, col] = WH[q.t];
         const opts = shuffle(q.o);
         qEl.innerHTML = '';
@@ -59,7 +59,7 @@ registerGame({
       };
       const pickAns = (o, btn, box) => {
         if (phase !== 'answer') return;
-        const q = M.q[qi]; chosen = o;
+        const q = M.q[qi];
         const ok = o === q.o[0];
         [...box.children].forEach(b => { b.disabled = true; if (b.textContent === q.o[0]) b.classList.add('right'); });
         if (ok) { ansOK++; score += 100; api.sfx('good'); } else { btn.classList.add('wrong'); api.sfx('bad'); }
