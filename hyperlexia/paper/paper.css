@@ -1,0 +1,68 @@
+@page { size: Letter; margin: 0.72in 0.62in 0.7in 0.62in; }
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { margin: 0; background: #fff; color: #111; font-family: 'Liberation Serif', 'Times New Roman', serif;
+  font-size: 9.4pt; line-height: 1.34; hyphens: auto; -webkit-hyphens: auto; }
+p { margin: 0 0 5pt; text-align: justify; text-indent: 1.1em; orphans: 3; widows: 3; }
+h2 + p, h3 + p, .box + p, figure + p, .tbl + p { text-indent: 0; }
+b { font-weight: 700; }
+
+/* masthead */
+.masthead { border-top: 3pt solid #0b0b0b; padding-top: 6pt; margin-bottom: 10pt; }
+.jrnl { font-family: 'Liberation Sans', Arial, sans-serif; font-size: 7.4pt; letter-spacing: .12em; color: #2a78d6; font-weight: 700; }
+.jrnl span { color: #b9b8b2; }
+h1 { font-size: 19pt; line-height: 1.16; margin: 7pt 0 4pt; font-weight: 700; letter-spacing: -.01em; }
+.subtitle { font-size: 11pt; font-style: italic; color: #333; margin-bottom: 7pt; }
+.authors { font-family: 'Liberation Sans', Arial, sans-serif; font-size: 8.6pt; color: #333; margin-bottom: 5pt; }
+.meta { font-family: 'Liberation Sans', Arial, sans-serif; font-size: 7.4pt; color: #52514e; display: flex; flex-wrap: wrap; gap: 4pt 12pt;
+  border-top: .6pt solid #cfcec9; border-bottom: .6pt solid #cfcec9; padding: 3pt 0; margin-bottom: 8pt; }
+.abstract { background: #f4f7fb; border-left: 3pt solid #2a78d6; padding: 7pt 10pt 4pt; font-size: 8.9pt; line-height: 1.32; }
+.abstract p { text-indent: 0; margin-bottom: 4pt; }
+.abs-h { font-family: 'Liberation Sans', Arial, sans-serif; font-weight: 700; font-size: 8.4pt; letter-spacing: .14em; text-transform: uppercase; color: #2a78d6; margin-bottom: 3pt; }
+.kw { font-size: 8.4pt; }
+.disclaimer { font-family: 'Liberation Sans', Arial, sans-serif; font-size: 7.2pt; color: #52514e; margin-top: 5pt; font-style: italic; }
+
+/* two-column body */
+.cols { column-count: 2; column-gap: 0.26in; column-fill: balance; }
+h2 { font-family: 'Liberation Sans', Arial, sans-serif; font-size: 10pt; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  margin: 10pt 0 4pt; break-after: avoid; color: #0b0b0b; }
+h2 .sn { display: inline-block; min-width: 1.4em; color: #2a78d6; }
+h3 { font-size: 9.6pt; font-style: italic; font-weight: 700; margin: 7pt 0 3pt; break-after: avoid; }
+.cite { color: #1c5cab; white-space: nowrap; }
+
+figure { margin: 6pt 0 9pt; break-inside: avoid; }
+figure svg { display: block; }
+figcaption { font-size: 7.9pt; line-height: 1.28; margin-top: 3pt; color: #222; text-align: left; }
+.box { border: .8pt solid #2a78d6; background: #f4f7fb; padding: 5pt 7pt; margin: 6pt 0 8pt; font-size: 8.5pt; break-inside: avoid; }
+
+.tbl { margin: 6pt 0 10pt; break-inside: avoid; }
+.tcap { font-size: 7.9pt; margin-bottom: 3pt; }
+table { width: 100%; border-collapse: collapse; font-family: 'Liberation Sans', Arial, sans-serif; font-size: 7.1pt; line-height: 1.25; table-layout: fixed; }
+thead th { text-align: left; border-top: 1.1pt solid #0b0b0b; border-bottom: .6pt solid #0b0b0b; padding: 2.5pt 3pt; font-weight: 700; vertical-align: bottom; }
+tbody td { padding: 2.2pt 3pt; vertical-align: top; border-bottom: .3pt solid #e6e5e1; }
+tbody tr:last-child td { border-bottom: 1.1pt solid #0b0b0b; }
+table.small { font-size: 6.6pt; }
+.fr { color: #52514e; font-style: italic; }
+.tbl .cite, table .cite { color: #1c5cab; }
+
+ol.principles { padding-left: 1.2em; margin: 2pt 0 6pt; }
+ol.principles li { margin-bottom: 2.5pt; text-align: justify; list-style: none; margin-left: -1.2em; }
+
+.refs-h { margin-top: 12pt; }
+ol.refs { font-size: 7.2pt; line-height: 1.27; padding-left: 2.1em; margin: 0; }
+ol.refs li { margin-bottom: 1.6pt; word-break: break-word; }
+
+/* appendix: single column, starts on new page */
+.appendix { break-before: page; }
+.appendix h2 { margin-top: 0; }
+.appnote { text-indent: 0; font-size: 8pt; color: #333; }
+table.app { font-size: 6.9pt; }
+table.app tr.grp td { background: #eef4fc; font-weight: 700; color: #1c5cab; border-bottom: .6pt solid #2a78d6; padding-top: 3pt; }
+table.app td .n { color: #8a8983; }
+.flag { color: #eb6834; font-weight: 700; }
+table.gloss { font-size: 7.6pt; margin-top: 4pt; }
+table.gloss td:first-child { width: 26%; }
+table.app tr { break-inside: avoid; }
+
+.tbl.breakable { break-inside: auto; }
+.tbl.breakable tr { break-inside: avoid; }
