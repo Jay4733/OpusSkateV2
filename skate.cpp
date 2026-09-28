@@ -5,16 +5,19 @@
 //
 //   Language : C++17, one file, no external assets (all geometry, textures,
 //              fonts, sound effects and music are generated procedurally).
-//   Libraries: SDL2 (window, input, audio) + OpenGL 3.3 core. No raylib.
+//   Libraries: SDL2 (window, input, audio, gamepad) + OpenGL 3.3 core.
+//   Renderer : linear HDR, PBR (GGX) with procedural bump detail, interior-mapped
+//              windows, cascaded PCSS shadows, SSAO, SSR, atmospheric sky,
+//              volumetric fog, point lights, rain, bloom, ACES, supersampling.
 //
 //   BUILD
 //     Linux  : g++ -O2 -std=c++17 skate.cpp -o skate $(sdl2-config --cflags --libs) -lGL
 //     macOS  : clang++ -O2 -std=c++17 skate.cpp -o skate $(sdl2-config --cflags --libs) -framework OpenGL
-//     Windows: g++ -O2 -std=c++17 skate.cpp -o skate.exe -lmingw32 -lSDL2main -lSDL2 -lopengl32
+//     Windows: g++ -O2 -std=c++17 skate.cpp -o skate.exe -lmingw32 -lSDL2main -lSDL2 -lopengl32 -mwindows
 //   RUN
-//     ./skate                 options: --fullscreen  --mute  --res 1600x900
+//     ./skate     options: --fullscreen --window --mute --res 1600x900 --quality 0-3 --tod 0-4 --scale S
 //
-//   CONTROLS (also shown in-game -- press H)
+//   CONTROLS (also shown in-game -- press H; gamepads work too)
 //     W / Up ............ push (accelerate)          S / Down ...... brake
 //     A D / Left Right .. steer | spin in the air | balance on rails
 //     SPACE ............. ollie (hold to crouch, release to pop: longer = higher)
@@ -22,7 +25,8 @@
 //     K or X + dir ...... grab tricks (hold to keep grabbing -- let go before landing!)
 //     L or C + dir ...... grind / slide when near a rail, ledge, bench or curb
 //     I or Shift (+W) ... manual / nose manual (W/S keep balance) -- links combos
-//     R reset  H help  M music  V camera  T 2-minute session  Esc pause  F11 fullscreen
+//     R reset  H help  M music  V camera  N time of day  G graphics  T 2-minute session
+//     Esc menu  F11 fullscreen
 // ============================================================================
 #if __has_include(<SDL2/SDL.h>)
 #include <SDL2/SDL.h>
@@ -82,7 +86,16 @@
     X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))         \
     X(GLenum, CheckFramebufferStatus, (GLenum))                                    \
     X(void, ActiveTexture, (GLenum))                                               \
-    X(void, GenerateMipmap, (GLenum))
+    X(void, GenerateMipmap, (GLenum))                                              \
+    X(void, DrawBuffers, (GLsizei, const GLenum*))                                 \
+    X(void, TexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
+    X(void, FramebufferTextureLayer, (GLenum, GLenum, GLuint, GLint, GLint))       \
+    X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
+    X(void, DeleteFramebuffers, (GLsizei, const GLuint*))                          \
+    X(void, GenSamplers, (GLsizei, GLuint*))                                       \
+    X(void, SamplerParameteri, (GLuint, GLenum, GLint))                            \
+    X(void, BindSampler, (GLuint, GLuint))                                         \
+    X(void, Uniform4fv, (GLint, GLsizei, const GLfloat*))
 
 struct GLApi {
 #define X(ret, name, args) ret (APIENTRY* name) args = nullptr;
@@ -321,7 +334,8 @@ static inline bool glyphPixel(int ch, int x, int y) {
 enum Mat : uint8_t {
     MAT_PLAIN = 0, MAT_BRICK, MAT_WINDOWS, MAT_STONEWIN, MAT_GLASSWALL, MAT_ASPHALT, MAT_SIDEWALK,
     MAT_EMISSIVE, MAT_WOOD, MAT_METAL, MAT_FOLIAGE, MAT_FENCE, MAT_SHOPGLASS, MAT_PAVERS, MAT_AWNING,
-    MAT_SKIN, MAT_COURT, MAT_CONCRETE, MAT_GRANITE, MAT_CLOTH, MAT_PAINTED, MAT_WATER, MAT_ROOF, MAT_BRICKBANK
+    MAT_SKIN, MAT_COURT, MAT_CONCRETE, MAT_GRANITE, MAT_CLOTH, MAT_PAINTED, MAT_WATER, MAT_ROOF, MAT_BRICKBANK,
+    MAT_ROADPAINT, MAT_CARPAINT, MAT_CARGLASS, MAT_RUBBER, MAT_BARK, MAT_BARS
 };
 
 struct Vtx {
@@ -411,6 +425,43 @@ struct MeshBuilder {
             }
         }
     }
+    // Smooth tapered capsule from a (radius ra) to b (radius rb) with rounded ends (caps squashed by capH).
+    // 'side' orients the cross-section, whose depth is scaled by 'flat' (1 = round).
+    void capsule(V3 a, V3 b, float ra, float rb, V3 side, Col col, uint8_t mat, float flat = 1.f, float capH = 1.f, int seg = 10) {
+        V3 ay = b - a;
+        float L = len(ay);
+        ay = L > 1e-5f ? ay / L : V3(0, 1, 0);
+        V3 ax = side - ay * dot(side, ay);
+        if (len(ax) < 1e-4f) ax = std::fabs(ay.y) < 0.9f ? cross(ay, V3(0, 1, 0)) : cross(ay, V3(1, 0, 0));
+        ax = norm(ax);
+        V3 az = cross(ax, ay);
+        const int CR = 3, MAXSEG = 16;
+        seg = std::min(seg, MAXSEG);
+        float cs[MAXSEG], sn[MAXSEG];
+        for (int j = 0; j < seg; j++) { cs[j] = std::cos(TAU * j / seg); sn[j] = std::sin(TAU * j / seg); }
+        uint32_t base = (uint32_t)v.size();
+        int nr = 0;
+        for (int end = 0; end < 2; end++)
+            for (int i = 0; i <= CR; i++) {
+                // cap A runs pole -> equator, cap B equator -> pole
+                float th = PI * 0.5f * (end == 0 ? 1.f - (float)i / CR : (float)i / CR);
+                float r = end == 0 ? ra : rb, sy = std::sin(th) * (end == 0 ? -1.f : 1.f);
+                V3 c = (end == 0 ? a : b) + ay * (r * sy * capH);
+                float rr = r * std::cos(th);
+                for (int j = 0; j < seg; j++) {
+                    V3 d = ax * cs[j] + az * (sn[j] * flat);
+                    V3 nd = norm(ax * cs[j] + az * (sn[j] / flat));
+                    vert(c + d * rr, norm(nd * std::cos(th) + ay * (sy / std::max(capH, 0.2f))), col, mat);
+                }
+                nr++;
+            }
+        for (int k = 0; k + 1 < nr; k++)
+            for (int j = 0; j < seg; j++) {
+                uint32_t i0 = base + k * seg + j, i1 = base + k * seg + (j + 1) % seg;
+                uint32_t i2 = i1 + seg, i3 = i0 + seg;
+                idx.insert(idx.end(), {i0, i2, i1, i0, i3, i2});
+            }
+    }
     // Low-poly ellipsoid
     void sphere(const M4& xf, V3 rad, int seg, int rings, Col col, uint8_t mat) {
         auto P = [&](int i, int j) {
@@ -494,215 +545,617 @@ struct GpuMesh {
 };
 
 // ----------------------------------------------------------------------------
-// Shaders (GLSL 3.30 core). All surface detail is procedural.
+// Shaders (GLSL 3.30 core). Everything is lit in linear HDR and tonemapped at
+// the end. All surface detail is procedural: bump relief, roughness, wetness,
+// and furnished rooms behind every window (interior mapping).
 // ----------------------------------------------------------------------------
-static const char* WORLD_VS = R"(#version 330 core
+#define MAX_LIGHTS 48
+
+// World geometry (depth/normal prepass, main pass and planar reflection share it so depths match exactly)
+static const char* WORLD_VS = R"(
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
 layout(location=2) in vec3 aCol;
 layout(location=3) in float aMat;
 uniform mat4 uVP;
-uniform mat4 uLightVP;
 uniform vec4 uClip;
-out vec3 vPos; out vec3 vNrm; out vec3 vCol; flat out int vMat; out vec4 vLight;
+out vec3 vPos; out vec3 vNrm; out vec3 vCol; flat out int vMat;
+invariant gl_Position;
 void main(){
   vPos = aPos; vNrm = aNrm; vCol = aCol; vMat = int(aMat + 0.5);
-  vLight = uLightVP * vec4(aPos, 1.0);
   gl_ClipDistance[0] = dot(vec4(aPos,1.0), uClip);
   gl_Position = uVP * vec4(aPos, 1.0);
 }
 )";
 
-// Shared GLSL helpers (noise + sky), prepended to fragment shaders
+// Shared GLSL: lighting uniforms, noise, sky environment, height fog
 static const char* GLSL_COMMON = R"(
-uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uSkyTop; uniform vec3 uSkyHorizon;
-uniform vec3 uGroundCol; uniform vec3 uFogCol; uniform vec3 uCamPos; uniform float uTime; uniform float uFogDensity;
+uniform vec3 uSunDir; uniform vec3 uSunCol; uniform vec3 uSkyUp; uniform vec3 uGroundCol;
+uniform vec3 uFogCol; uniform vec3 uCamPos; uniform float uTime;
+uniform float uFogDensity; uniform float uFogFall; uniform float uFogSun;
+uniform float uNight; uniform float uWet; uniform float uLitFrac; uniform float uEmit; uniform float uCloud;
+uniform sampler2D uSkyEnv;
+const float PI = 3.14159265;
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float hash13(vec3 p3){ p3 = fract(p3 * .1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }
 float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
   return mix(mix(hash12(i),hash12(i+vec2(1,0)),f.x), mix(hash12(i+vec2(0,1)),hash12(i+vec2(1,1)),f.x), f.y); }
 float fbm(vec2 p){ float s=0.0,a=0.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+vec2(1.7,9.2); a*=0.5; } return s; }
-vec3 skyColor(vec3 d){
-  float h = clamp(d.y, -1.0, 1.0);
-  vec3 c = mix(uSkyHorizon, uSkyTop, pow(clamp(h,0.0,1.0), 0.55));
-  c = mix(c, uFogCol*0.8, clamp(-h*4.0, 0.0, 1.0));
-  float s = max(dot(d, uSunDir), 0.0);
-  c += uSunCol * (pow(s, 900.0)*6.0 + pow(s, 12.0)*0.25 + pow(s,3.0)*0.08);
-  return c;
+float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+vec3 toLin(vec3 c){ return pow(max(c, vec3(0.0)), vec3(2.2)); }
+float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec2 skyUV(vec3 d){
+  float el = asin(clamp(d.y, -1.0, 1.0));
+  return vec2(atan(d.x, d.z) * (0.5 / PI) + 0.5, 0.5 + 0.5 * sign(el) * sqrt(abs(el) / (0.5 * PI)));
 }
+vec3 skyEnv(vec3 d, float lod){ return textureLod(uSkyEnv, skyUV(d), lod).rgb; }
+float hgPhase(float mu, float g){ float g2 = g * g; return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * mu, 1.5)); }
+float fogDensityAt(vec3 p){ return uFogDensity * exp(-uFogFall * p.y); }
+// optical depth of the exponential height fog between two points
+float fogOptical(vec3 a, vec3 b){
+  vec3 d = b - a;
+  float k = uFogFall * d.y;
+  float avg = abs(k) > 1e-4 ? (1.0 - exp(-k)) / k : 1.0;
+  return uFogDensity * exp(-uFogFall * a.y) * length(d) * avg;
+}
+vec3 fogLight(vec3 dir){ return uFogCol + uSunCol * PI * uFogSun * (0.7 * hgPhase(dot(dir, uSunDir), 0.62) + 0.3 / (4.0 * PI)); }
 vec3 applyFog(vec3 col, vec3 p){
-  float d = length(p - uCamPos);
-  float f = 1.0 - exp(-d * uFogDensity);
-  f = f*f*(3.0-2.0*f);
-  vec3 fc = uFogCol + uSunCol*0.12*pow(max(dot(normalize(p-uCamPos), uSunDir),0.0), 6.0);
-  return mix(col, fc, clamp(f, 0.0, 1.0));
+  float T = exp(-fogOptical(uCamPos, p));
+  return col * T + fogLight(normalize(p - uCamPos)) * (1.0 - T);
 }
-vec3 grade(vec3 c){
-  c = c / (1.0 + c*0.18);                           // soft shoulder
-  float l = dot(c, vec3(0.299,0.587,0.114));
-  c = mix(vec3(l), c, 1.08);                         // a touch of saturation
-  c *= vec3(1.03, 1.0, 0.95);                        // warm late-afternoon film
-  return pow(clamp(c,0.0,1.0), vec3(0.95));
+// raindrop rings on standing water; returns a normal offset
+vec2 ripples(vec2 p, float t){
+  vec2 g = vec2(0.0);
+  for(int k = 0; k < 2; k++){
+    vec2 q = p * 2.6 + float(k) * 0.37;
+    vec2 c = floor(q), f = fract(q) - 0.5;
+    float h = hash12(c + float(k) * 17.0);
+    vec2 d = f - (hash22(c + 3.1) - 0.5) * 0.5;
+    float r = length(d);
+    float ph = fract(t * 1.1 + h);
+    float x = r - ph * 0.45;
+    g += d / (r + 1e-3) * sin(x * 70.0) * exp(-x * x * 900.0) * (1.0 - ph) * 0.5;
+  }
+  return g;
+}
+// 4x4 ordered dither threshold in [0,1)
+float bayer4(vec2 fc){
+  ivec2 p = ivec2(mod(fc, 4.0));
+  int b[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
+  return (float(b[p.x + p.y * 4]) + 0.5) / 16.0;
+}
+// cut-out materials (identical in the prepass and the main pass): 11 chain link, 29 railing bars.
+// Once the pattern gets finer than a pixel it turns into an ordered dither of the same coverage.
+bool fenceCut(vec3 p, vec3 n, int m){
+  vec2 fuv = abs(n.x) > abs(n.z) ? vec2(p.z, p.y) : vec2(p.x, p.y);
+  if(m == 29){
+    float u = fuv.x / 0.11;
+    if(fwidth(u) > 0.3) return bayer4(gl_FragCoord.xy) > 0.2;
+    return abs(fract(u) - 0.5) < 0.4;
+  }
+  vec2 q = fuv * 14.0;
+  vec2 r = vec2(q.x + q.y, q.x - q.y);
+  vec2 fwq = fwidth(r);
+  if(max(fwq.x, fwq.y) > 0.28) return bayer4(gl_FragCoord.xy) > 0.33;
+  vec2 f = abs(fract(r) - 0.5);
+  return min(f.x, f.y) > 0.09;
+}
+// soft cloud layer (used by the sky and baked into the reflection environment)
+uniform vec3 uCloudLight;
+vec4 clouds(vec3 d, bool detail){
+  if(d.y < 0.01 || uCloud <= 0.0) return vec4(0.0);
+  float t = 1800.0 / d.y;
+  vec2 p = (uCamPos.xz + d.xz * t) * 0.00032 + vec2(uTime * 0.006, uTime * 0.0021);
+  float n = fbm(p) + (detail ? 0.16 * vnoise(p * 9.0) + 0.06 * vnoise(p * 23.0) : 0.1);
+  float lo = 1.02 - uCloud * 0.85, hi = lo + 0.32;
+  float dens = smoothstep(lo, hi, n);
+  if(dens <= 0.0) return vec4(0.0);
+  vec2 sd = normalize(uSunDir.xz + vec2(1e-4)) * 0.05;
+  float od = 0.0;
+  for(int i = 1; i <= 3; i++) od += smoothstep(lo, hi, fbm(p + sd * float(i)));
+  float mu = max(dot(d, uSunDir), 0.0);
+  float phase = 0.5 + 0.35 * pow(mu, 3.0) + 2.4 * pow(mu, 14.0);
+  float grey = mix(1.0, 0.32, smoothstep(0.65, 1.0, uCloud));
+  vec3 lit = uCloudLight * exp(-od * 1.15) * phase * grey;
+  vec3 amb = uSkyUp * mix(1.15, 0.7, dens) * grey + vec3(0.016, 0.011, 0.007) * uNight * (0.5 + uCloud);
+  float a = dens * smoothstep(0.01, 0.1, d.y) * (1.0 - smoothstep(40000.0, 120000.0, t));
+  return vec4(lit + amb, a);
+}
+)";
+
+// Cascaded shadow maps with PCSS soft shadows
+static const char* SHADOW_GLSL = R"(
+uniform sampler2DArrayShadow uShadowCmp; uniform sampler2DArray uShadowRaw;
+uniform mat4 uCascVP[4]; uniform vec4 uCascSplit; uniform vec4 uCascWorld; uniform vec4 uCascDepth;
+uniform int uNumCasc; uniform int uShadowQ; uniform float uShadowTexel; uniform float uSunSize; uniform vec3 uCamFwd;
+const vec2 POISSON[16] = vec2[16](
+  vec2(-0.94201624,-0.39906216), vec2(0.94558609,-0.76890725), vec2(-0.09418410,-0.92938870), vec2(0.34495938,0.29387760),
+  vec2(-0.91588581,0.45771432), vec2(-0.81544232,-0.87912464), vec2(-0.38277543,0.27676845), vec2(0.97484398,0.75648379),
+  vec2(0.44323325,-0.97511554), vec2(0.53742981,-0.47373420), vec2(-0.26496911,-0.41893023), vec2(0.79197514,0.19090188),
+  vec2(-0.24188840,0.99706507), vec2(-0.81409955,0.91437590), vec2(0.19984126,0.78641367), vec2(0.14383161,-0.14100790));
+int cascadeOf(float z){
+  int c = 0;
+  if(z > uCascSplit.x) c = 1;
+  if(z > uCascSplit.y) c = 2;
+  if(z > uCascSplit.z) c = 3;
+  return min(c, uNumCasc - 1);
+}
+vec3 cascadeCoord(vec3 p, int c){ return (uCascVP[c] * vec4(p, 1.0)).xyz * 0.5 + 0.5; }
+bool outside(vec3 s){ return s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0 || s.z > 1.0; }
+// one filtered tap: for fog, water and particles
+float shadowFast(vec3 p){
+  int c = cascadeOf(dot(p - uCamPos, uCamFwd));
+  vec3 s = cascadeCoord(p, c);
+  if(outside(s)) return 1.0;
+  return texture(uShadowCmp, vec4(s.xy, float(c), s.z - 0.15 / uCascDepth[c]));
+}
+float shadowSoft(vec3 p, vec3 n, float ndl){
+  float z = dot(p - uCamPos, uCamFwd);
+  int c = cascadeOf(z);
+  float split = c == 0 ? uCascSplit.x : (c == 1 ? uCascSplit.y : (c == 2 ? uCascSplit.z : 1e9));
+  float prev = c == 0 ? 0.0 : (c == 1 ? uCascSplit.x : (c == 2 ? uCascSplit.y : uCascSplit.z));
+  float fade0 = mix(prev, split, 0.82);
+  if(c < uNumCasc - 1 && z > fade0 && ign(gl_FragCoord.xy) < (z - fade0) / (split - fade0)) c++;
+  float texW = uCascWorld[c] * uShadowTexel;
+  float slope = sqrt(max(1.0 - ndl * ndl, 0.0)) / max(ndl, 0.2);
+  vec3 s = cascadeCoord(p + n * texW * (0.8 + slope), c);
+  if(outside(s)) return 1.0;
+  float ref = s.z - (0.012 + texW * 0.6) / uCascDepth[c];
+  if(uShadowQ == 0) return texture(uShadowCmp, vec4(s.xy, float(c), ref));
+  float a = ign(gl_FragCoord.xy + 17.0) * 6.2831853;
+  mat2 R = mat2(cos(a), sin(a), -sin(a), cos(a));
+  if(uShadowQ == 1){
+    float sum = 0.0;
+    for(int i = 0; i < 12; i++) sum += texture(uShadowCmp, vec4(s.xy + R * POISSON[i] * uShadowTexel * 1.8, float(c), ref));
+    return sum / 12.0;
+  }
+  // PCSS: find the average blocker, then filter with a penumbra that grows with blocker distance
+  float searchUV = max(uSunSize * 22.0 / uCascWorld[c], uShadowTexel * 3.0);
+  float bsum = 0.0, bn = 0.0;
+  for(int i = 0; i < 16; i++){
+    float d = texture(uShadowRaw, vec3(s.xy + R * POISSON[i] * searchUV, float(c))).r;
+    if(d < ref){ bsum += d; bn += 1.0; }
+  }
+  if(bn < 0.5) return 1.0;
+  float dist = (ref - bsum / bn) * uCascDepth[c];
+  float pen = clamp(dist * uSunSize / uCascWorld[c], uShadowTexel * 1.25, searchUV);
+  float sum = 0.0;
+  for(int i = 0; i < 16; i++) sum += texture(uShadowCmp, vec4(s.xy + R * POISSON[i] * pen, float(c), ref));
+  return sum / 16.0;
+}
+)";
+
+// Point / spot lights (street lamps, shop windows, car headlights, signals)
+static const char* LIGHTS_GLSL = R"(
+uniform int uNumLights; uniform vec4 uLPos[MAX_LIGHTS]; uniform vec4 uLCol[MAX_LIGHTS]; uniform vec4 uLDir[MAX_LIGHTS];
+float lightAtten(int i, vec3 p, out vec3 L){
+  vec3 d = uLPos[i].xyz - p;
+  float d2 = dot(d, d), r = uLPos[i].w;
+  L = d * inversesqrt(max(d2, 1e-6));
+  float x = d2 / (r * r);
+  if(x >= 1.0) return 0.0;
+  float win = 1.0 - x * x;
+  float att = win * win / (d2 + 0.3);
+  if(uLCol[i].w > -1.5) att *= smoothstep(uLCol[i].w, uLDir[i].w, dot(-L, uLDir[i].xyz));
+  return att;
+}
+)";
+
+// Shared by full-screen post passes
+static const char* POST_VS = R"(#version 330 core
+out vec2 vUV;
+void main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); vUV = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }
+)";
+static const char* POST_GLSL = R"(
+uniform mat4 uInvVP; uniform mat4 uVP; uniform float uNear; uniform float uFar;
+vec3 worldFromDepth(vec2 uv, float z){ vec4 p = uInvVP * vec4(uv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0); return p.xyz / p.w; }
+float linZ(float z){ float nd = z * 2.0 - 1.0; return 2.0 * uNear * uFar / (uFar + uNear - nd * (uFar - uNear)); }
+// screen-space ray march against the depth buffer; returns the hit uv
+bool traceSSR(sampler2D depthTex, vec3 P, vec3 R, int steps, float jitter, out vec2 hitUV){
+  float camD = length(P - uCamPos);
+  float stepLen = (0.08 + 0.08 * jitter) * (1.0 + camD * 0.04);
+  float t = 0.0, tPrev = 0.0;
+  for(int i = 0; i < steps; i++){
+    tPrev = t; t += stepLen; stepLen *= 1.13;
+    vec4 c = uVP * vec4(P + R * t, 1.0);
+    if(c.w < uNear) return false;
+    vec2 uv = c.xy / c.w * 0.5 + 0.5;
+    if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return false;
+    float dz = c.w - linZ(textureLod(depthTex, uv, 0.0).r);
+    if(dz > 0.0){
+      if(dz > max(stepLen * 2.5, 0.5)) continue;     // passed behind a thick object
+      float a = tPrev, b = t;
+      for(int k = 0; k < 6; k++){
+        float m = (a + b) * 0.5;
+        vec4 cm = uVP * vec4(P + R * m, 1.0);
+        vec2 um = cm.xy / cm.w * 0.5 + 0.5;
+        if(cm.w - linZ(textureLod(depthTex, um, 0.0).r) > 0.0) b = m; else a = m;
+      }
+      vec4 cb = uVP * vec4(P + R * b, 1.0);
+      hitUV = cb.xy / cb.w * 0.5 + 0.5;
+      return true;
+    }
+  }
+  return false;
+}
+)";
+
+static const char* PREPASS_FS = R"(
+in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat;
+uniform float uDynamic;
+layout(location=0) out vec4 oNrm;
+void main(){
+  vec3 n = normalize(vNrm);
+  if(!gl_FrontFacing) n = -n;
+  if((vMat == 11 || vMat == 29) && fenceCut(vPos, n, vMat)) discard;
+  oNrm = vec4(n * 0.5 + 0.5, uDynamic);
 }
 )";
 
 static const char* WORLD_FS_MAIN = R"(
-in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat; in vec4 vLight;
-uniform sampler2DShadow uShadow; uniform float uShadowTexel;
-out vec4 fragColor;
+in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat;
+uniform sampler2D uAO; uniform int uUseAO; uniform vec2 uInvRes; uniform int uInlineFog; uniform int uDebug;
+layout(location=0) out vec4 oCol; layout(location=1) out vec4 oRefl; layout(location=2) out vec4 oSurf;
 
-float shadowAt(vec3 n){
-  vec3 p = vLight.xyz / vLight.w * 0.5 + 0.5;
-  if(p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0||p.z>1.0) return 1.0;
-  float bias = 0.0006 + 0.0016*(1.0 - clamp(dot(n,uSunDir),0.0,1.0));
-  float s = 0.0;
-  for(int x=-1;x<=1;x++) for(int y=-1;y<=1;y++)
-    s += texture(uShadow, vec3(p.xy + vec2(x,y)*uShadowTexel*1.2, p.z - bias));
-  float fade = smoothstep(0.42, 0.5, max(abs(p.x-0.5), abs(p.y-0.5)));
-  return mix(s/9.0, 1.0, fade);
+float brickH(vec2 b, vec2 sc){
+  b.x += mod(floor(b.y), 2.0) * 0.5;
+  vec2 f = fract(b);
+  vec2 e = min(f, 1.0 - f) / sc;
+  return smoothstep(0.002, 0.011, min(e.x, e.y)) * 0.008;
 }
-// returns window mask (0 wall, 1 glass, 2 frame); id = unique window id
-float windowMask(vec2 uv, float cellW, float floorH, float y0, float winW, float winH, float sill, out vec2 id, out vec2 local){
+// window grid on a facade: 0 wall, 1 glass, 2 frame, 3 stone sill / lintel
+float windowMask(vec2 uv, float cellW, float floorH, float y0, float winW, float winH, float sill, out vec2 id, out vec2 lc, out vec2 cp){
   vec2 q = vec2(uv.x / cellW, (uv.y - y0) / floorH);
   id = floor(q);
-  vec2 f = fract(q) * vec2(cellW, floorH);
-  local = vec2((f.x - (cellW - winW)*0.5)/winW, (f.y - sill)/winH);
+  cp = fract(q) * vec2(cellW, floorH);
+  float sx = cp.x - (cellW - winW) * 0.5, sy = cp.y - sill;
+  lc = vec2(sx / winW, sy / winH);
   if(uv.y < y0) return 0.0;
-  if(local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0) return 0.0;
-  vec2 e = min(local, 1.0-local) * vec2(winW, winH);
-  if(min(e.x,e.y) < 0.07) return 2.0;
-  if(abs(local.y-0.55)*winH < 0.035) return 2.0;          // sash bar
+  if(sx > -0.1 && sx < winW + 0.1 && ((sy < 0.0 && sy > -0.1) || (sy > winH && sy < winH + 0.18))) return 3.0;
+  if(lc.x < 0.0 || lc.x > 1.0 || lc.y < 0.0 || lc.y > 1.0) return 0.0;
+  vec2 e = min(lc, 1.0 - lc) * vec2(winW, winH);
+  if(min(e.x, e.y) < 0.07 || abs(lc.y - 0.55) * winH < 0.035) return 2.0;
   return 1.0;
 }
+float crackMask(vec2 uv){ return smoothstep(0.006, 0.0, abs(fbm(uv * 0.5 + 11.0) - 0.5)) * step(0.62, vnoise(uv * 0.3)); }
+float stoneH(vec2 uv){
+  float cy = uv.y / 0.62, fy = fract(cy);
+  float bx = uv.x / 1.3 + mod(floor(cy), 2.0) * 0.5, fx = fract(bx);
+  float e = min(min(fy, 1.0 - fy) * 0.62, min(fx, 1.0 - fx) * 1.3);
+  return smoothstep(0.003, 0.012, e) * 0.006 + vnoise(uv * 9.0) * 0.0015;
+}
+float windowH(float w, float h){ return w > 2.5 ? 0.035 : (w > 1.5 ? 0.02 : (w > 0.5 ? -0.03 : h)); }
+// procedural relief per material (metres), sampled three times for the bump normal
+float heightAt(int m, vec2 uv){
+  vec2 id, lc, cp;
+  if(m == 1) return brickH(uv * vec2(4.4, 13.0), vec2(4.4, 13.0));
+  if(m == 2) return windowH(windowMask(uv, 2.7, 3.3, 4.8, 1.25, 1.85, 0.75, id, lc, cp), brickH(uv * vec2(4.4, 13.0), vec2(4.4, 13.0)));
+  if(m == 23) return brickH(uv * vec2(4.4, 8.0), vec2(4.4, 8.0));
+  if(m == 3) return windowH(windowMask(uv, 3.0, 3.6, 4.8, 1.4, 2.3, 0.7, id, lc, cp), stoneH(uv));
+  if(m == 4){ vec2 f = fract(vec2(uv.x / 1.6, uv.y / 3.4)); vec2 e = min(f, 1.0 - f) * vec2(1.6, 3.4); return smoothstep(0.04, 0.07, min(e.x, e.y)) * -0.03; }
+  if(m == 5 || m == 24) return vnoise(uv * 40.0) * 0.0016 + vnoise(uv * 97.0) * 0.0009 - crackMask(uv) * 0.004;
+  if(m == 6){
+    vec2 g = uv / 1.52, f = fract(g);
+    vec2 t = hash22(floor(g)) - 0.5;
+    float j = smoothstep(0.0, 0.012, min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y)));
+    return j * 0.004 + dot(t, f - 0.5) * 0.03 + vnoise(uv * 30.0) * 0.0008;
+  }
+  if(m == 13) return brickH(uv * vec2(5.0, 10.0), vec2(5.0, 10.0)) * 0.7;
+  if(m == 8){ float w = uv.y / 0.22; return (1.0 - smoothstep(0.92, 0.96, fract(w))) * 0.004 + vnoise(vec2(uv.x * 2.0, w * 25.0)) * 0.0008; }
+  if(m == 17) return vnoise(uv * 23.0) * 0.0015 + vnoise(uv * 6.0) * 0.002;
+  if(m == 18) return vnoise(uv * 70.0) * 0.0005;
+  if(m == 22) return vnoise(uv * 45.0) * 0.003;
+  if(m == 14 || m == 19) return vnoise(uv * 160.0) * 0.0004;
+  if(m == 10) return vnoise(uv * 7.0) * 0.06 + vnoise(uv * 19.0) * 0.03;
+  if(m == 28) return vnoise(vec2(uv.x * 18.0, uv.y * 2.5)) * 0.01;
+  return 0.0;
+}
+
+// packaging on shop shelves: varied but believable colours
+vec3 product(vec2 id){
+  float h = hash12(id), k = hash12(id + 7.7);
+  vec3 hue = clamp(abs(fract(h + vec3(0.0, 0.667, 0.333)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+  vec3 c = k < 0.35 ? vec3(0.86, 0.84, 0.78) : (k < 0.6 ? vec3(0.62, 0.46, 0.3) : mix(vec3(0.7), hue, 0.55));
+  return toLin(c * (0.55 + 0.45 * hash12(id + 3.3)));
+}
+// A furnished room behind a window (interior mapping). pr: where the view ray enters the room cell
+// (metres), rd: view ray in room space (x along the facade, y up, z into the building).
+// kind 0 apartment, 1 office, 2 shop
+vec3 roomInterior(vec2 pr, vec3 rd, vec3 size, float seed, int kind, float lit){
+  rd.z = max(rd.z, 0.02);
+  vec3 ro = vec3(clamp(pr, vec2(0.01), size.xy - 0.01), 0.0);
+  vec3 ird = 1.0 / vec3(abs(rd.x) < 1e-4 ? 1e-4 : rd.x, abs(rd.y) < 1e-4 ? 1e-4 : rd.y, rd.z);
+  vec3 tf = max(-ro * ird, (size - ro) * ird);
+  float t = min(min(tf.x, tf.y), tf.z);
+  vec3 hp = ro + rd * t;
+  float h1 = hash12(vec2(seed, 1.7)), h2 = hash12(vec2(seed, 5.3)), h3 = hash12(vec2(seed, 9.1));
+  vec3 wall = kind == 1 ? toLin(vec3(0.72, 0.73, 0.72)) : toLin(mix(vec3(0.8, 0.74, 0.62), mix(vec3(0.56, 0.63, 0.66), vec3(0.74, 0.58, 0.5), h3), h2));
+  vec3 c; vec3 glow = vec3(0.0);
+  if(t == tf.z){
+    c = wall;
+    if(kind == 0){
+      vec2 pc = hp.xy - vec2(size.x * (0.3 + 0.4 * h1), 1.6);
+      if(abs(pc.x) < 0.35 && abs(pc.y) < 0.25) c = toLin(vec3(h3, h1, h2) * 0.8);
+      vec2 tv = hp.xy - vec2(size.x * (0.25 + 0.5 * h3), 1.1);
+      if(h2 > 0.6 && abs(tv.x) < 0.45 && abs(tv.y) < 0.27){ c = vec3(0.02); glow = mix(vec3(0.3, 0.5, 1.0), vec3(0.8, 0.9, 1.0), vnoise(vec2(uTime * 2.0, seed))) * lit * 1.5; }
+    } else if(kind == 2 && hp.y > 0.3 && hp.y < 2.3){
+      float sy = fract(hp.y / 0.45);
+      c = sy < 0.12 ? toLin(vec3(0.8)) : product(floor(vec2(hp.x / 0.16, hp.y / 0.45)) + seed);
+    }
+  } else if(t == tf.y){
+    if(rd.y > 0.0){
+      c = toLin(vec3(0.82, 0.8, 0.76));
+      if(kind != 0 && fract(hp.x / 1.2) < 0.45 && fract(hp.z / 1.8) < 0.3){ c = vec3(0.9); glow = vec3(0.95, 0.97, 1.0) * lit * 5.0; }
+    } else {
+      c = kind == 1 ? toLin(vec3(0.34, 0.35, 0.37)) : toLin(vec3(0.44, 0.29, 0.17)) * (0.7 + 0.5 * vnoise(hp.xz * vec2(1.0, 8.0)));
+    }
+  } else {
+    c = wall * 0.85;
+    if(kind == 2 && hp.y > 0.3 && hp.y < 2.3 && fract(hp.y / 0.45) > 0.12) c = product(floor(vec2(hp.z / 0.16, hp.y / 0.45)) + seed * 3.0);
+  }
+  // furniture: sofa / desk / counter in the back half of the room
+  vec3 bmin = vec3(size.x * (0.1 + 0.25 * h3), 0.0, size.z * (0.52 + 0.12 * h1));
+  vec3 bmax = vec3(size.x * (0.55 + 0.35 * h2), kind == 2 ? 1.05 : 0.8, size.z * 0.93);
+  vec3 t0 = (bmin - ro) * ird, t1 = (bmax - ro) * ird;
+  vec3 tn3 = min(t0, t1), tx3 = max(t0, t1);
+  float tn = max(max(tn3.x, tn3.y), tn3.z), tx = min(min(tx3.x, tx3.y), tx3.z);
+  if(tn < tx && tn > 0.0 && tn < t){
+    t = tn; hp = ro + rd * t;
+    c = toLin(mix(vec3(0.26, 0.21, 0.18), vec3(0.5, 0.17, 0.14), h1)) * (tn == tn3.y ? 1.0 : 0.62);
+    glow = vec3(0.0);
+  }
+  vec3 lp = vec3(size.x * 0.5, size.y - 0.3, size.z * 0.45);
+  float d2 = dot(hp - lp, hp - lp);
+  vec3 lcol = kind == 1 ? vec3(0.9, 0.95, 1.0) : (kind == 2 ? vec3(1.0, 0.93, 0.82) : mix(vec3(1.0, 0.7, 0.4), vec3(1.0, 0.86, 0.66), h2));
+  vec3 L = lit * lcol * uEmit * (kind == 2 ? 0.9 + 1.3 * uNight : 1.5) / (1.0 + d2 * 0.22);
+  L += uSkyUp * 0.5 * exp(-hp.z * 0.35) + uSunCol * 0.05 * exp(-hp.z * 0.6);
+  return c * L + glow * uEmit * 0.5;
+}
+
+// glass pane with a room behind it (or curtains / blinds)
+void glassPane(vec2 id, vec2 lc, vec2 cp, vec3 room, float seedBase, int kind, vec3 n, vec3 T,
+               inout vec3 alb, inout float rough, inout vec3 emit, inout float isGlass, inout float f0){
+  float seed = dot(id, vec2(12.9898, 78.233)) + seedBase;
+  float lit = kind == 2 ? 1.0 : step(hash12(vec2(seed, 3.3)), uLitFrac * (kind == 1 ? 1.25 : 1.0));
+  float cur = hash12(vec2(seed, 8.8));
+  if(kind == 0 && cur < 0.28 && (lc.x < 0.3 || lc.x > 0.7)){
+    float ch = hash12(vec2(seed, 4.4));
+    alb = toLin(ch < 0.7 ? vec3(0.78, 0.74, 0.64) : (ch < 0.85 ? vec3(0.5, 0.36, 0.3) : vec3(0.42, 0.46, 0.4)));
+    rough = 0.9; emit = alb * lit * uEmit * 0.45; return;
+  }
+  if(kind != 2 && cur > 0.28 && cur < 0.5){
+    float level = 1.0 - hash12(vec2(seed, 6.1)) * 0.75;
+    if(lc.y > level){
+      float slat = smoothstep(0.3, 0.5, fract(cp.y * 22.0));
+      alb = toLin(vec3(0.86, 0.84, 0.78)) * (0.7 + 0.3 * slat);
+      rough = 0.55; emit = alb * lit * uEmit * 0.35; return;
+    }
+  }
+  vec3 Vd = normalize(vPos - uCamPos);
+  vec3 rd = vec3(dot(Vd, T), Vd.y, -dot(Vd, n));
+  emit = roomInterior(cp, rd, room, seed, kind, lit);
+  alb = vec3(0.0); isGlass = 1.0;
+  rough = 0.025 + 0.08 * hash12(vec2(seed, 2.2));
+  f0 = kind == 1 ? 0.07 : 0.04;
+}
+
 void main(){
   vec3 n = normalize(vNrm);
   if(!gl_FrontFacing) n = -n;
-  vec3 base = vCol;
-  float spec = 0.04, shin = 24.0, emit = 0.0, refl = 0.0, wrap = 0.0;
-  bool horiz = abs(n.y) > 0.6;
-  vec2 fuv = horiz ? vPos.xz : vec2(abs(n.x) > abs(n.z) ? vPos.z : vPos.x, vPos.y);
-  vec3 V = normalize(uCamPos - vPos);
   int m = vMat;
-  if(m == 1 || m == 2 || m == 23){                        // brick (+ windows)
-    vec2 b = m == 23 ? vPos.xz * vec2(4.4, 8.0) : vec2(fuv.x * 4.4, fuv.y * 13.0);
-    float row = floor(b.y);
-    b.x += mod(row, 2.0) * 0.5;
+  if((m == 11 || m == 29) && fenceCut(vPos, n, m)) discard;
+  bool horiz = abs(n.y) > 0.6;
+  vec2 uv; vec3 T, B;
+  if(horiz){ uv = vPos.xz; T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 0.0, 1.0); }
+  else if(abs(n.x) > abs(n.z)){ uv = vec2(vPos.z, vPos.y); T = vec3(0.0, 0.0, 1.0); B = vec3(0.0, 1.0, 0.0); }
+  else { uv = vec2(vPos.x, vPos.y); T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 1.0, 0.0); }
+  vec3 V = normalize(uCamPos - vPos);
+  vec3 alb = toLin(vCol);
+  float rough = 0.6, metal = 0.0, ao = 1.0, wrap = 0.0, trans = 0.0, f0 = 0.04, isGlass = 0.0, puddleOK = 0.0, porous = 1.0;
+  vec3 emit = vec3(0.0);
+  float fw = max(length(dFdx(vPos)), length(dFdy(vPos)));    // metres per pixel
+  float detail = 1.0 - smoothstep(0.01, 0.05, fw);
+  float seedBase = floor(dot(vPos, n) * 3.7) * 1.618;
+
+  if(m == 1 || m == 2 || m == 23){                                   // brick (+ windows)
+    vec2 sc = m == 23 ? vec2(4.4, 8.0) : vec2(4.4, 13.0);
+    vec2 b = uv * sc; b.x += mod(floor(b.y), 2.0) * 0.5;
     vec2 bi = floor(b), bf = fract(b);
     vec2 fwb = fwidth(b);
-    float aa = 1.0 - smoothstep(0.18, 0.5, max(fwb.x, fwb.y));   // fade detail out before it aliases
-    float mortar = (bf.y < 0.14 || bf.x < 0.05) ? 1.0 : 0.0;
-    float v = hash12(bi);
-    base *= mix(0.97, 0.82 + 0.3*v, aa);
-    base = mix(base, vec3(0.62,0.6,0.56), mix(0.14, mortar*0.85, aa));
-    base *= 0.9 + 0.2*fbm(vPos.xz*0.35 + vPos.y*0.2);
+    float aa = 1.0 - smoothstep(0.18, 0.5, max(fwb.x, fwb.y));
+    vec2 e = min(bf, 1.0 - bf) / sc;
+    float mortar = 1.0 - smoothstep(0.002, 0.011, min(e.x, e.y));
+    float v = hash12(bi), v2 = hash12(bi + 19.1);
+    vec3 brick = alb * (0.74 + 0.48 * v) * (v2 > 0.86 ? vec3(0.72, 0.6, 0.56) : vec3(1.0));
+    brick *= 0.88 + 0.24 * vnoise(uv * vec2(40.0, 90.0)) * detail;
+    alb = mix(alb * 0.92, brick, aa);
+    alb = mix(alb, toLin(vec3(0.6, 0.58, 0.54)), mix(0.12, mortar * 0.9, aa));
+    alb *= 0.78 + 0.32 * fbm(vec2(uv.x * 2.5, uv.y * 0.12) + 3.0);
+    alb *= mix(0.68, 1.0, smoothstep(0.0, 2.2, vPos.y));
+    rough = mix(0.8, 0.95, mortar);
+    ao = mix(1.0, 0.72, mortar * aa);
+    puddleOK = m == 23 ? 1.0 : 0.0;
     if(m == 2){
-      vec2 id, lc; float w = windowMask(fuv, 2.7, 3.3, 4.8, 1.25, 1.85, 0.75, id, lc);
-      if(w > 1.5){ base = mix(vec3(0.85,0.83,0.78), vec3(0.18,0.2,0.22), step(0.5, hash12(id*3.1+7.0))); spec = 0.1; }
-      else if(w > 0.5){
-        float r = hash12(id + floor(vPos.x*0.01)*13.0 + floor(vPos.z*0.01)*7.0);
-        vec3 glass = vec3(0.10,0.13,0.17) + vec3(0.05)*step(0.6,lc.y);
-        if(r < 0.22) { base = vec3(1.0,0.78,0.45) * (0.55 + 0.4*hash12(id+3.0)); emit = 0.75; }
-        else if(r < 0.35) { base = mix(vec3(0.75,0.72,0.62), glass, step(0.35, lc.x) * step(lc.x, 0.65)); }  // curtains
-        else { base = glass; refl = 0.55; spec = 0.9; shin = 90.0; }
-      }
+      vec2 id, lc, cp; float w = windowMask(uv, 2.7, 3.3, 4.8, 1.25, 1.85, 0.75, id, lc, cp);
+      if(w > 2.5){ alb = toLin(vec3(0.66, 0.63, 0.56)) * (0.85 + 0.2 * vnoise(uv * 20.0)); rough = 0.75; ao = 1.0; }
+      else if(w > 1.5){ alb = hash12(id * 3.1 + 7.0 + seedBase) > 0.5 ? toLin(vec3(0.86, 0.84, 0.8)) : toLin(vec3(0.14, 0.15, 0.16)); rough = 0.45; ao = 1.0; }
+      else if(w > 0.5) glassPane(id, lc, cp, vec3(2.7, 3.3, 4.2), seedBase, 0, n, T, alb, rough, emit, isGlass, f0);
     }
-  } else if(m == 3){                                        // limestone with windows
-    float cy = fuv.y / 0.62;
-    float course = step(0.94, fract(cy)) * (1.0 - smoothstep(0.15, 0.4, fwidth(cy)));
-    base *= (0.9 + 0.12*fbm(fuv*1.3)) * (1.0 - course*0.18);
-    vec2 id, lc; float w = windowMask(fuv, 3.0, 3.6, 4.8, 1.4, 2.3, 0.7, id, lc);
-    if(w > 1.5){ base = vec3(0.25,0.24,0.22); }
-    else if(w > 0.5){
-      float r = hash12(id + 17.0);
-      if(r < 0.18){ base = vec3(1.0,0.85,0.55)*0.8; emit = 0.7; }
-      else { base = vec3(0.1,0.12,0.15); refl = 0.6; spec = 0.9; shin = 90.0; }
-    }
-  } else if(m == 4){                                        // glass curtain wall
-    vec2 q = vec2(fuv.x / 1.6, fuv.y / 3.4);
+  } else if(m == 3){                                                 // limestone with windows
+    float cy = uv.y / 0.62, bx = uv.x / 1.3 + mod(floor(cy), 2.0) * 0.5;
+    float aa = 1.0 - smoothstep(0.15, 0.4, fwidth(cy));
+    float joint = 1.0 - smoothstep(0.003, 0.012, min(min(fract(cy), 1.0 - fract(cy)) * 0.62, min(fract(bx), 1.0 - fract(bx)) * 1.3));
+    alb *= (0.88 + 0.14 * fbm(uv * 1.3)) * (0.93 + 0.1 * hash12(floor(vec2(bx, cy)))) * (1.0 - joint * 0.28 * aa);
+    alb *= 0.8 + 0.26 * fbm(vec2(uv.x * 2.0, uv.y * 0.1) + 7.0);
+    alb *= mix(0.72, 1.0, smoothstep(0.0, 2.2, vPos.y));
+    rough = 0.82; ao = 1.0 - joint * 0.25 * aa;
+    vec2 id, lc, cp; float w = windowMask(uv, 3.0, 3.6, 4.8, 1.4, 2.3, 0.7, id, lc, cp);
+    if(w > 2.5){ alb *= 1.12; rough = 0.7; ao = 1.0; }
+    else if(w > 1.5){ alb = toLin(vec3(0.2, 0.19, 0.17)); rough = 0.4; ao = 1.0; }
+    else if(w > 0.5) glassPane(id, lc, cp, vec3(3.0, 3.6, 4.6), seedBase, 0, n, T, alb, rough, emit, isGlass, f0);
+  } else if(m == 4){                                                 // glass curtain wall (offices)
+    vec2 q = vec2(uv.x / 1.6, uv.y / 3.4);
     vec2 f = fract(q), id = floor(q);
-    float mull = (f.x < 0.04 || f.y < 0.03) ? 1.0 : 0.0;
-    base = mix(vec3(0.16,0.23,0.30) * (0.85 + 0.3*hash12(id)), vec3(0.55,0.57,0.6), mull);
-    if(mull < 0.5){ refl = 0.75; spec = 1.2; shin = 140.0; if(hash12(id*1.7) < 0.05){ base = vec3(0.8,0.78,0.66); emit = 0.35; refl=0.3; } }
-  } else if(m == 5){                                        // asphalt
-    float nz = fbm(vPos.xz * 0.9);
-    base *= 0.78 + 0.35*nz;
-    base *= 0.93 + 0.14*vnoise(vPos.xz*9.0);
-    float patch = smoothstep(0.62, 0.66, fbm(vPos.xz*0.12 + 4.0));
-    base = mix(base, base*0.72, patch);
-    float crack = smoothstep(0.006, 0.0, abs(fbm(vPos.xz*0.5+11.0) - 0.5)) * step(0.62, vnoise(vPos.xz*0.3));
-    base *= 1.0 - crack*0.25;
-  } else if(m == 6){                                        // sidewalk slabs
-    vec2 g = vPos.xz / 1.52;
-    vec2 gi = floor(g), gf = fract(g);
+    vec2 e = min(f, 1.0 - f) * vec2(1.6, 3.4);
+    if(min(e.x, e.y) < 0.05){ alb = toLin(vec3(0.58, 0.6, 0.63)); metal = 1.0; rough = 0.32; }
+    else if(f.y < 0.24){ alb = toLin(vec3(0.07, 0.09, 0.11)); rough = 0.1; f0 = 0.06; }
+    else glassPane(vec2(floor(uv.x / 4.8), id.y), vec2(0.5), vec2(mod(uv.x, 4.8), (f.y - 0.2) * 3.4), vec3(4.8, 3.0, 9.0), seedBase, 1, n, T, alb, rough, emit, isGlass, f0);
+  } else if(m == 5){                                                 // asphalt
+    alb *= 0.72 + 0.42 * fbm(uv * 0.9);
+    alb *= 0.9 + 0.2 * vnoise(uv * 9.0);
+    float patch = smoothstep(0.62, 0.66, fbm(uv * 0.12 + 4.0));
+    alb = mix(alb, alb * 0.66, patch);
+    alb *= 1.0 - crackMask(uv) * 0.3;
+    alb *= mix(1.0, 0.84 + 0.32 * vnoise(uv * 60.0), detail);
+    alb *= 1.0 - smoothstep(0.6, 0.85, fbm(uv * 0.35 + 21.0)) * 0.25;   // oil and tyre stains
+    rough = mix(0.9, 0.74, patch);
+    puddleOK = 1.0;
+  } else if(m == 24){                                                // road paint, worn through to the asphalt
+    float wear = smoothstep(0.45, 0.75, fbm(uv * 2.5 + 7.0) + 0.25 * vnoise(uv * 30.0));
+    vec3 asph = toLin(vec3(0.275, 0.275, 0.29)) * (0.72 + 0.42 * fbm(uv * 0.9));
+    alb = mix(alb * 0.9, asph, wear * 0.75);
+    rough = 0.62; puddleOK = 1.0;
+  } else if(m == 6){                                                 // sidewalk slabs
+    vec2 g = uv / 1.52; vec2 gi = floor(g), gf = fract(g);
     vec2 fwg = fwidth(g);
     float aa = 1.0 - smoothstep(0.02, 0.06, max(fwg.x, fwg.y));
-    float joint = (gf.x < 0.012 || gf.y < 0.012 || gf.x > 0.988 || gf.y > 0.988) ? 1.0 : 0.0;
-    base *= 0.86 + 0.16*hash12(gi) + 0.1*fbm(vPos.xz*2.0);
-    base *= 1.0 - joint*0.45*aa;
-    vec2 gc = floor(vPos.xz * 3.0);
-    if(hash12(gc) > 0.975){ vec2 d = fract(vPos.xz*3.0)-0.5; if(dot(d,d) < 0.06) base *= 0.55; }   // gum
-  } else if(m == 7){ emit = 1.0; }
-  else if(m == 8){                                          // wooden planks (along x)
-    float w = vPos.z / 0.22; float pi = floor(w);
+    float joint = 1.0 - smoothstep(0.004, 0.014, min(min(gf.x, 1.0 - gf.x), min(gf.y, 1.0 - gf.y)) * 1.52);
+    alb *= 0.7 + 0.16 * hash12(gi) + 0.1 * fbm(uv * 2.0);
+    alb *= mix(vec3(1.0), vec3(1.02, 0.98, 0.93), hash12(gi + 5.0));
+    alb *= 1.0 - smoothstep(0.5, 0.8, fbm(uv * 0.7 + 9.0)) * 0.3;
+    alb *= 1.0 - joint * 0.5 * aa;
+    vec2 gc = floor(uv * 6.0);
+    if(hash12(gc) > 0.965){ vec2 d = fract(uv * 6.0) - 0.5 - (hash22(gc) - 0.5) * 0.4; alb *= 1.0 - 0.35 * smoothstep(0.03, 0.015, dot(d, d)); }
+    rough = 0.84; ao = 1.0 - joint * 0.4 * aa; puddleOK = 0.7;
+  } else if(m == 7){                                                 // light sources
+    emit = alb * uEmit * 2.2; alb *= 0.15; rough = 0.3; porous = 0.0;
+  } else if(m == 8){                                                 // wooden planks
+    float w = uv.y / 0.22; float pi = floor(w);
     float aaw = 1.0 - smoothstep(0.12, 0.35, fwidth(w));
     float gap = step(0.93, fract(w)) * aaw;
-    float grain = vnoise(vec2(vPos.x*1.5 + pi*7.0, fract(w)*8.0));
-    base *= (0.8 + 0.25*hash12(vec2(pi, floor(vPos.x/3.0 + hash12(vec2(pi,1.0))*3.0)))) * (0.85 + 0.25*grain);
-    base *= 1.0 - gap*0.6;
-  } else if(m == 9){ spec = 0.8; shin = 60.0; base *= 0.9 + 0.1*vnoise(fuv*20.0); }
-  else if(m == 10){                                         // foliage
-    float nz = fbm(vPos.xz*3.0 + vPos.y*2.0);
-    base *= 0.6 + 0.8*nz; wrap = 0.5;
-  } else if(m == 11){                                       // chain-link fence (cutout)
-    vec2 q = fuv * 14.0;
-    vec2 r = vec2(q.x + q.y, q.x - q.y);
-    vec2 fwq = fwidth(r);
-    if(max(fwq.x, fwq.y) > 0.28){ if(hash12(gl_FragCoord.xy) > 0.33) discard; }   // far away: dithered density
-    else { vec2 f = abs(fract(r) - 0.5); if(min(f.x, f.y) > 0.09) discard; }
-    spec = 0.6; shin = 40.0;
-  } else if(m == 12){                                       // shop window glass
-    vec3 R = reflect(-V, n);
-    float fr = 0.25 + 0.75*pow(1.0 - max(dot(n, V), 0.0), 3.0);
-    vec3 inside = vec3(0.16,0.13,0.1) + vec3(0.5,0.4,0.25)*smoothstep(0.55,0.75,fbm(fuv*vec2(1.5,3.0)));
-    inside += vec3(0.6,0.55,0.4)*smoothstep(3.6, 4.2, vPos.y);
-    base = mix(inside, skyColor(R)*0.8, fr*0.7);
-    emit = 0.55; spec = 1.0; shin = 120.0;
-  } else if(m == 13){                                       // brick pavers
-    vec2 b = vPos.xz * vec2(5.0, 10.0);
+    float grain = vnoise(vec2(uv.x * 1.5 + pi * 7.0, fract(w) * 8.0));
+    alb *= (0.8 + 0.25 * hash12(vec2(pi, floor(uv.x / 3.0 + hash12(vec2(pi, 1.0)) * 3.0)))) * (0.85 + 0.25 * grain);
+    alb *= 1.0 - gap * 0.6;
+    rough = 0.7; ao = 1.0 - gap * 0.5; puddleOK = 0.4;
+  } else if(m == 9){                                                 // metal (bright = bare steel, dark = painted iron)
+    metal = smoothstep(0.25, 0.45, luma(vCol));
+    rough = mix(0.45, 0.26, metal) + 0.12 * vnoise(uv * 20.0);
+    alb *= 0.9 + 0.1 * vnoise(uv * 20.0);
+    porous = 0.2;
+  } else if(m == 10){                                                // foliage
+    alb *= 0.5 + 0.8 * fbm(vPos.xz * 3.0 + vPos.y * 2.0);
+    wrap = 0.5; trans = 0.7; rough = 0.72;
+    ao = mix(0.45, 1.0, clamp(n.y * 0.5 + 0.55, 0.0, 1.0));
+  } else if(m == 11){ metal = 1.0; rough = 0.42; porous = 0.0; }    // galvanised chain link
+  else if(m == 29){ rough = 0.5; porous = 0.2; }                     // painted iron railing bars
+  else if(m == 12){                                                  // shop window
+    glassPane(vec2(floor(uv.x / 4.0), 0.0), vec2(0.5), vec2(mod(uv.x, 4.0), vPos.y - 0.15), vec3(4.0, 3.8, 6.5), seedBase, 2, n, T, alb, rough, emit, isGlass, f0);
+  } else if(m == 13){                                                // brick pavers
+    vec2 b = uv * vec2(5.0, 10.0);
     b.x += mod(floor(b.y), 2.0) * 0.5;
     vec2 bf = fract(b);
     vec2 fwb = fwidth(b);
     float aa = 1.0 - smoothstep(0.15, 0.45, max(fwb.x, fwb.y));
-    base *= mix(0.95, 0.8 + 0.3*hash12(floor(b)), aa);
-    if(bf.x < 0.06 || bf.y < 0.1) base = mix(base, vec3(0.45,0.42,0.38), 0.7*aa);
-    base = mix(base, vec3(0.45,0.42,0.38), 0.12*(1.0-aa));
-  } else if(m == 14){                                       // striped awning
-    float s = step(0.5, fract(fuv.x / 0.45));
-    base = mix(base, vec3(0.92,0.9,0.86), s);
-    wrap = 0.3;
-  } else if(m == 15){ wrap = 0.35; spec = 0.08; }
-  else if(m == 16){ base *= 0.9 + 0.15*fbm(vPos.xz*1.5); }
-  else if(m == 17){ base *= 0.85 + 0.25*fbm(fuv*1.7) ; base *= 0.95 + 0.08*vnoise(fuv*14.0); }
-  else if(m == 18){ float gn = vnoise(fuv*14.0 + vPos.y*9.0); base *= 0.9 + 0.14*mix(gn, 0.5, smoothstep(0.1, 0.4, fwidth(fuv.x*14.0))); spec = 0.25; shin = 50.0; }
-  else if(m == 19){ base *= 0.9 + 0.12*vnoise(fuv*25.0); wrap = 0.25; }
-  else if(m == 20){ spec = 0.7; shin = 80.0; refl = 0.25; }
-  else if(m == 22){ base *= 0.75 + 0.35*fbm(vPos.xz*0.8); }
+    alb *= mix(0.95, 0.78 + 0.34 * hash12(floor(b)), aa);
+    float joint = (bf.x < 0.06 || bf.y < 0.1) ? 1.0 : 0.0;
+    alb = mix(alb, toLin(vec3(0.45, 0.42, 0.38)), mix(0.12, 0.7 * joint, aa));
+    rough = 0.8; ao = 1.0 - joint * 0.3 * aa; puddleOK = 1.0;
+  } else if(m == 14){                                                // striped awning
+    float s = step(0.5, fract(uv.x / 0.45));
+    alb = mix(alb, toLin(vec3(0.92, 0.9, 0.86)), s);
+    wrap = 0.3; trans = 0.35; rough = 0.9;
+  } else if(m == 15){ wrap = 0.45; trans = 0.12; rough = 0.52; porous = 0.0; }
+  else if(m == 16){ alb *= 0.9 + 0.15 * fbm(uv * 1.5); rough = 0.62; puddleOK = 1.0; }
+  else if(m == 17){ alb *= 0.82 + 0.28 * fbm(uv * 1.7); alb *= 0.94 + 0.1 * vnoise(uv * 14.0); rough = 0.88; puddleOK = 0.5; }
+  else if(m == 18){ float gn = vnoise(uv * 60.0 + vPos.y * 9.0); alb *= 0.84 + 0.32 * mix(0.5, gn, detail); rough = 0.36; }
+  else if(m == 19){ alb *= 0.9 + 0.12 * vnoise(uv * 25.0); wrap = 0.25; rough = 0.95; }
+  else if(m == 20){ rough = 0.38; alb *= 0.95 + 0.06 * vnoise(uv * 8.0); }
+  else if(m == 22){ alb *= 0.72 + 0.4 * fbm(uv * 0.8); rough = 0.95; puddleOK = 1.0; }
+  else if(m == 25){ rough = 0.16; f0 = 0.05; porous = 0.0; }        // car paint (clear coat)
+  else if(m == 26){ rough = 0.05; f0 = 0.06; alb *= 0.3; porous = 0.0; }
+  else if(m == 27){ rough = 0.8; alb *= 0.9 + 0.2 * vnoise(uv * 30.0); } // rubber, grip tape
+  else if(m == 28){ alb *= 0.7 + 0.5 * vnoise(vec2(uv.x * 18.0, uv.y * 2.5)); rough = 0.9; }  // bark
 
-  float ndl = dot(n, uSunDir);
-  float diff = max((ndl + wrap) / (1.0 + wrap), 0.0);
-  float sh = ndl > -0.2 ? shadowAt(n) : 0.0;
-  vec3 hemi = mix(uGroundCol, uSkyTop*0.9 + uSkyHorizon*0.2, n.y*0.5 + 0.5);
-  float ao = horiz ? 1.0 : mix(0.72, 1.0, smoothstep(0.0, 1.4, vPos.y + 0.1));
-  vec3 col = base * (hemi * 0.62 * ao + uSunCol * diff * sh);
-  vec3 H = normalize(uSunDir + V);
-  col += uSunCol * spec * pow(max(dot(n, H), 0.0), shin) * sh;
-  if(refl > 0.0){
-    vec3 R = reflect(-V, n);
-    float fr = 0.2 + 0.8*pow(1.0 - max(dot(n, V), 0.0), 4.0);
-    col = mix(col, skyColor(R) * 0.85, refl * fr);
+  // ---- bump mapping: procedural height, finite differences along the surface axes
+  vec3 N = n;
+  float bumpFade = 1.0 - smoothstep(0.006, 0.03, fw);
+  if(bumpFade > 0.0 && isGlass < 0.5){
+    const float E = 0.004;
+    float h0 = heightAt(m, uv);
+    float hx = heightAt(m, uv + vec2(E, 0.0)), hy = heightAt(m, uv + vec2(0.0, E));
+    vec3 g = (T * (hx - h0) + B * (hy - h0)) / E;
+    N = normalize(n - g * bumpFade);
   }
-  col = mix(col, base, emit);
-  col = applyFog(col, vPos);
-  fragColor = vec4(grade(col), 1.0);
+  if(!horiz) ao *= mix(0.82, 1.0, smoothstep(0.0, 1.2, vPos.y + 0.1));
+
+  // ---- rain: darker, glossier surfaces and standing water with ripples
+  float wet = uWet * (horiz ? smoothstep(0.6, 0.95, n.y) : 0.4) * porous;
+  if(isGlass > 0.5) wet = 0.0;
+  if(wet > 0.0){
+    alb *= mix(1.0, 0.5, wet);
+    rough = mix(rough, max(0.07, rough * 0.3), wet);
+    if(puddleOK > 0.0 && horiz){
+      float pm = smoothstep(0.54, 0.6, fbm(vPos.xz * 0.19 + 2.3) + (puddleOK - 1.0) * 0.2) * wet;
+      vec2 rp = ripples(vPos.xz, uTime);
+      N = normalize(mix(N, n, pm) + vec3(rp.x, 0.0, rp.y) * pm);
+      rough = mix(rough, 0.015, pm);
+      alb *= mix(1.0, 0.65, pm);
+    }
+  }
+
+  // ---- lighting: GGX sun + sky ambient + point lights
+  float NdotV = max(dot(N, V), 1e-3);
+  vec3 F0 = mix(vec3(f0), alb, metal);
+  vec3 diffC = alb * (1.0 - metal);
+  float ndlG = dot(n, uSunDir);
+  float ndl = dot(N, uSunDir);
+  float sh = (ndlG > -0.3 || wrap > 0.0) ? shadowSoft(vPos, n, max(ndlG, 0.0)) : 0.0;
+  float dif = clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
+  float rs = max(rough, 0.035);
+  float a2 = rs * rs * rs * rs;
+  float kk = (rs + 1.0) * (rs + 1.0) / 8.0;
+  float gv = NdotV / (NdotV * (1.0 - kk) + kk);
+  vec3 Hh = normalize(uSunDir + V);
+  float NdotL = max(ndl, 0.0), NdotH = max(dot(N, Hh), 0.0);
+  float dd = NdotH * NdotH * (a2 - 1.0) + 1.0;
+  vec3 Fs = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, Hh), 0.0), 5.0);
+  vec3 spec = a2 / (PI * dd * dd) * gv * (NdotL / (NdotL * (1.0 - kk) + kk)) * Fs / max(4.0 * NdotV * NdotL, 1e-4);
+  vec3 col = (diffC * dif + spec * PI * NdotL) * uSunCol * sh;
+  if(trans > 0.0) col += diffC * uSunCol * trans * pow(max(dot(-V, uSunDir), 0.0), 4.0) * mix(0.3, 1.0, sh);
+  float ssao = uUseAO == 1 ? texture(uAO, gl_FragCoord.xy * uInvRes).r : 1.0;
+  float occ = ao * ssao;
+  col += diffC * mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ;
+  vec3 R = reflect(-V, N);
+  vec3 env = skyEnv(R, rough * 7.0);
+  vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
+  float specOcc = clamp(pow(NdotV + occ, exp2(-16.0 * rough - 1.0)) - 1.0 + occ, 0.0, 1.0);
+  vec3 envSpec = Fr * env * specOcc;
+  col += envSpec;
+  col += isGlass > 0.5 ? emit * (1.0 - Fr) : emit;
+  for(int i = 0; i < uNumLights; i++){
+    vec3 L; float at = lightAtten(i, vPos, L);
+    if(at <= 0.0) continue;
+    float nl = dot(N, L);
+    float nlw = clamp((nl + wrap) / (1.0 + wrap), 0.0, 1.0);
+    if(nlw <= 0.0) continue;
+    vec3 H2 = normalize(L + V);
+    float nh = max(dot(N, H2), 0.0), nlc = max(nl, 0.0);
+    float d2 = nh * nh * (a2 - 1.0) + 1.0;
+    vec3 Fl = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H2), 0.0), 5.0);
+    vec3 sl = a2 / (PI * d2 * d2) * gv * (nlc / (nlc * (1.0 - kk) + kk)) * Fl / max(4.0 * NdotV * nlc, 1e-4);
+    col += (diffC * nlw + sl * PI * nlc) * uLCol[i].rgb * at;
+  }
+  if(uInlineFog == 1) col = applyFog(col, vPos);
+  if(uDebug == 1) col = vec3(sh);
+  else if(uDebug == 2) col = vec3(ssao);
+  else if(uDebug == 3) col = alb;
+  else if(uDebug == 4){ int c = cascadeOf(dot(vPos - uCamPos, uCamFwd)); col = c == 0 ? vec3(1,0.2,0.2) : (c == 1 ? vec3(0.2,1,0.2) : (c == 2 ? vec3(0.2,0.4,1) : vec3(1,1,0.2))); col *= 0.3 + 0.7 * sh; }
+  else if(uDebug == 5) col = N * 0.5 + 0.5;
+  oCol = vec4(min(col, vec3(30000.0)), 1.0);
+  float ssrW = 1.0 - smoothstep(0.2, 0.45, rough);
+  oRefl = vec4(envSpec * ssrW, luma(Fr) * specOcc * ssrW);
+  oSurf = vec4(N * 0.5 + 0.5, rough);
 }
 )";
 
@@ -722,6 +1175,7 @@ void main(){
     vec2 f = abs(fract(r) - 0.5);
     if(min(f.x, f.y) > 0.09) discard;
   }
+  if(vMat == 29 && abs(fract((vPos.x + vPos.z) / 0.11) - 0.5) < 0.4) discard;   // railing bars
   if(vMat == 7 && vPos.y > 30.0) discard;   // skyline lights
 }
 )";
@@ -731,41 +1185,101 @@ out vec2 vNdc;
 void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); vNdc = p*2.0-1.0; gl_Position = vec4(vNdc, 0.9999, 1.0); }
 )";
 static const char* SKY_FS_MAIN = R"(
-in vec2 vNdc; uniform mat4 uInvVP; out vec4 fragColor;
+in vec2 vNdc; uniform mat4 uInvVP; uniform sampler2D uSkyAtmo;
+uniform vec3 uSunPos; uniform vec3 uSunDisc; uniform vec3 uMoonDir; uniform vec3 uMoonDisc; uniform float uStars;
+layout(location=0) out vec4 oCol; layout(location=1) out vec4 oRefl; layout(location=2) out vec4 oSurf;
 void main(){
   vec4 a = uInvVP * vec4(vNdc, -1.0, 1.0), b = uInvVP * vec4(vNdc, 1.0, 1.0);
-  vec3 d = normalize(b.xyz/b.w - a.xyz/a.w);
-  vec3 c = skyColor(d);
-  if(d.y > 0.0){                                     // drifting clouds
-    vec2 uv = d.xz / (d.y + 0.08) * 1.6 + vec2(uTime*0.012, uTime*0.004);
-    float cl = smoothstep(0.5, 0.85, fbm(uv*0.8) + 0.15*fbm(uv*3.0));
-    vec3 cc = mix(vec3(1.0,0.93,0.85), uSunCol, 0.3) * (0.85 + 0.15*d.y);
-    c = mix(c, cc, cl * smoothstep(0.0, 0.25, d.y) * 0.7);
+  vec3 d = normalize(b.xyz / b.w - a.xyz / a.w);
+  vec3 c = textureLod(uSkyAtmo, skyUV(d), 0.0).rgb;
+  float ms = dot(d, uSunPos);
+  c += uSunDisc * smoothstep(0.99993, 0.99997, ms) * (0.6 + 0.4 * smoothstep(0.99993, 1.0, ms));
+  float mm = dot(d, uMoonDir);
+  if(mm > 0.9997){
+    vec3 mp = d - uMoonDir * mm;
+    c += uMoonDisc * smoothstep(0.99985, 0.99989, mm) * (0.7 + 0.3 * vnoise(mp.xz * 3000.0 + mp.y * 2000.0));
   }
-  fragColor = vec4(grade(c), 1.0);
+  if(uStars > 0.0 && d.y > 0.0){
+    vec3 q = d * 320.0, ic = floor(q);
+    float h = hash13(ic);
+    if(h > 0.996){
+      vec3 f = fract(q) - 0.5 - (vec3(hash13(ic + 1.3), hash13(ic + 2.7), hash13(ic + 4.1)) - 0.5) * 0.6;
+      float s = smoothstep(0.22, 0.0, length(f)) * (h - 0.996) * 250.0;
+      c += mix(vec3(1.0, 0.8, 0.6), vec3(0.7, 0.8, 1.0), hash13(ic + 9.0)) * s * uStars * (0.6 + 0.4 * sin(uTime * 3.0 + h * 500.0)) * smoothstep(0.02, 0.25, d.y);
+    }
+  }
+  vec4 cl = clouds(d, true);
+  c = mix(c, cl.rgb, cl.a);
+  oCol = vec4(min(c, vec3(30000.0)), 1.0);
+  oRefl = vec4(0.0);
+  oSurf = vec4(0.5, 1.0, 0.5, 1.0);
 }
 )";
 
-// Water: river, fountain pool, puddles. aMat: 0 river, 1 pool, 2 puddle, 3 spray sheet
+// Sky environment bake (atmospheric single scattering, Rayleigh + Mie) into lat-long textures
+static const char* SKYLUT_FS_MAIN = R"(
+in vec2 vNdc;
+uniform vec3 uAtmoSun; uniform float uAtmoSunI; uniform vec3 uAtmoMoon; uniform float uAtmoMoonI; uniform vec3 uGlow;
+layout(location=0) out vec4 oAtmo; layout(location=1) out vec4 oEnv;
+const float RE = 6360e3, RA = 6420e3, HR = 7994.0, HM = 1200.0;
+const vec3 BR = vec3(5.8e-6, 13.5e-6, 33.1e-6); const float BM = 21e-6;
+float sphFar(vec3 o, vec3 d, float r){ float b = dot(o, d), c = dot(o, o) - r * r, h = b * b - c; return h < 0.0 ? -1.0 : -b + sqrt(h); }
+bool hitsGround(vec3 o, vec3 d){ float b = dot(o, d), c = dot(o, o) - RE * RE; return b < 0.0 && b * b - c > 0.0; }
+vec3 scatter(vec3 d, vec3 s, float I){
+  vec3 o = vec3(0.0, RE + 2.0, 0.0);
+  float ds = sphFar(o, d, RA) / 16.0;
+  float mu = dot(d, s);
+  float pR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+  float g = 0.76, g2 = g * g;
+  float pM = 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
+  float odR = 0.0, odM = 0.0; vec3 sR = vec3(0.0), sM = vec3(0.0);
+  for(int i = 0; i < 16; i++){
+    vec3 p = o + d * (ds * (float(i) + 0.5));
+    float h = length(p) - RE;
+    float hr = exp(-h / HR) * ds, hm = exp(-h / HM) * ds;
+    odR += hr; odM += hm;
+    if(hitsGround(p, s)) continue;
+    float dl = sphFar(p, s, RA) / 8.0, lR = 0.0, lM = 0.0;
+    for(int j = 0; j < 8; j++){ float hq = length(p + s * (dl * (float(j) + 0.5))) - RE; lR += exp(-hq / HR) * dl; lM += exp(-hq / HM) * dl; }
+    vec3 att = exp(-(BR * (odR + lR) + BM * 1.1 * (odM + lM)));
+    sR += att * hr; sM += att * hm;
+  }
+  return I * (sR * BR * pR + sM * BM * pM);
+}
+void main(){
+  vec2 uv = vNdc * 0.5 + 0.5;
+  float az = (uv.x - 0.5) * 2.0 * PI, s = uv.y * 2.0 - 1.0, el = sign(s) * s * s * 0.5 * PI;
+  vec3 d = vec3(sin(az) * cos(el), sin(el), cos(az) * cos(el));
+  vec3 dh = normalize(vec3(d.x, max(d.y, 0.002), d.z));
+  vec3 c = uGlow * pow(1.0 - dh.y, 5.0);
+  if(uAtmoSunI > 0.0) c += scatter(dh, uAtmoSun, uAtmoSunI);
+  if(uAtmoMoonI > 0.0) c += scatter(dh, uAtmoMoon, uAtmoMoonI) * vec3(0.7, 0.82, 1.0);
+  if(d.y < 0.0) c = mix(c, uGroundCol * 1.1 + uFogCol * 0.3, smoothstep(0.0, 0.3, -d.y));
+  oAtmo = vec4(c, 1.0);
+  vec4 cl = clouds(dh, false);
+  oEnv = vec4(mix(c, cl.rgb, d.y < 0.0 ? 0.0 : cl.a), 1.0);
+}
+)";
+
+// Water: river, fountain pool, puddles. aMat: 0 river, 1 pool, 2 puddle
 static const char* WATER_VS = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
 layout(location=2) in vec3 aCol;
 layout(location=3) in float aMat;
-uniform mat4 uVP; uniform float uTime; uniform mat4 uLightVP;
-out vec3 vPos; out vec3 vCol; flat out int vKind; out vec4 vLight;
+uniform mat4 uVP; uniform float uTime;
+out vec3 vPos; out vec3 vCol; flat out int vKind;
 void main(){
   vec3 p = aPos; vKind = int(aMat+0.5);
-  if(vKind == 0){
-    p.y += 0.12*sin(p.x*0.35 + uTime*1.3) + 0.08*sin(p.z*0.5 - uTime*1.7 + p.x*0.2);
-  }
-  vPos = p; vCol = aCol; vLight = uLightVP * vec4(p,1.0);
+  if(vKind == 0) p.y += 0.12*sin(p.x*0.35 + uTime*1.3) + 0.08*sin(p.z*0.5 - uTime*1.7 + p.x*0.2);
+  vPos = p; vCol = aCol;
   gl_Position = uVP * vec4(p, 1.0);
 }
 )";
 static const char* WATER_FS_MAIN = R"(
-in vec3 vPos; in vec3 vCol; flat in int vKind; in vec4 vLight;
-uniform sampler2D uReflTex; uniform vec2 uViewport; uniform int uHasRefl; uniform vec2 uPoolCenter;
+in vec3 vPos; in vec3 vCol; flat in int vKind;
+uniform sampler2D uReflTex; uniform sampler2D uScene; uniform sampler2D uSceneDepth;
+uniform vec2 uViewport; uniform int uHasRefl; uniform vec2 uPoolCenter; uniform int uSSR;
 out vec4 fragColor;
 vec2 waveGrad(vec2 p, float t, float k){
   vec2 g = vec2(0.0);
@@ -782,51 +1296,333 @@ void main(){
   float t = uTime;
   vec2 g;
   float alpha = 1.0;
-  if(vKind == 0) g = waveGrad(vPos.xz, t, 0.9);
-  else if(vKind == 1){
+  if(vKind == 0){
+    g = waveGrad(vPos.xz, t, 0.9);
+    g += (vec2(vnoise(vPos.xz * 3.1 + t * 0.8), vnoise(vPos.zx * 3.3 - t * 0.7)) - 0.5) * 0.25;
+  } else if(vKind == 1){
     vec2 d = vPos.xz - uPoolCenter; float r = length(d);
     g = normalize(d + 1e-4) * cos(r*9.0 - t*6.0) * 0.18 + waveGrad(vPos.xz, t, 3.0)*0.25;
   } else {
-    g = waveGrad(vPos.xz*2.0, t*0.3, 2.0) * 0.12;
-    alpha = vCol.b;                                    // puddle edge fade
+    g = waveGrad(vPos.xz*2.0, t*0.3, 2.0) * 0.04;
+    alpha = vCol.b;
   }
+  if(vKind != 0) g += ripples(vPos.xz, t) * uWet * 1.5;
   vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
   vec3 V = normalize(uCamPos - vPos);
+  float NdotV = max(dot(n, V), 0.0);
   vec3 R = reflect(-V, n);
-  R.y = abs(R.y);
-  float fr = 0.04 + 0.96*pow(1.0 - max(dot(n, V), 0.0), 5.0);
-  vec3 refl = skyColor(R);
-  if(uHasRefl == 1 && vKind == 0){
-    vec2 suv = gl_FragCoord.xy / uViewport + n.xz * 0.035;
-    vec3 rt = texture(uReflTex, vec2(suv.x, suv.y)).rgb;
-    refl = mix(refl, rt, 0.85);
+  float fr = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
+  vec2 suv = gl_FragCoord.xy / uViewport;
+  vec3 Rs = vec3(R.x, abs(R.y), R.z);
+  vec3 refl = skyEnv(Rs, 0.0);
+  if(uHasRefl == 1 && vKind == 0) refl = texture(uReflTex, suv + n.xz * 0.035).rgb;
+  else if(uSSR == 1){
+    vec2 huv;
+    if(traceSSR(uSceneDepth, vPos + n * 0.01, R, 40, ign(gl_FragCoord.xy), huv)){
+      vec2 e = smoothstep(0.0, 0.08, huv) * smoothstep(1.0, 0.92, huv);
+      refl = mix(refl, textureLod(uScene, huv, 0.0).rgb, e.x * e.y);
+    }
   }
-  vec3 deep = vKind == 0 ? vec3(0.05,0.12,0.13) : (vKind == 1 ? vec3(0.08,0.24,0.28) : vec3(0.08,0.08,0.08));
-  vec3 lsh = vLight.xyz / vLight.w * 0.5 + 0.5;
-  vec3 col = mix(deep * (0.5 + 0.5*max(uSunDir.y,0.0)), refl, clamp(fr + (vKind==2?0.35:0.1), 0.0, 1.0));
+  float sh = shadowFast(vPos);
+  vec3 below = textureLod(uScene, suv + n.xz * (vKind == 1 ? 0.03 : 0.008), 0.0).rgb;
+  vec3 body;
+  if(vKind == 0){
+    vec3 deep = toLin(vec3(0.05, 0.13, 0.14));
+    body = deep * (uSkyUp * 0.7 + uSunCol * max(uSunDir.y, 0.0) * 0.35 * sh);
+    body += toLin(vec3(0.1, 0.3, 0.25)) * uSunCol * pow(max(dot(-V, uSunDir), 0.0), 3.0) * 0.08 * sh;   // light through the wave crests
+  } else if(vKind == 1) body = below * toLin(vec3(0.6, 0.86, 0.9));
+  else body = below * 0.75;
+  vec3 col = mix(body, refl, fr);
   vec3 H = normalize(uSunDir + V);
-  col += uSunCol * pow(max(dot(n, H), 0.0), 220.0) * 3.0;
-  if(vKind == 0){ float foam = smoothstep(0.72, 0.9, fbm(vPos.xz*0.6 + vec2(t*0.2, 0.0))); col += vec3(0.5)*foam*0.25; }
-  col = applyFog(col, vPos);
-  fragColor = vec4(grade(col), vKind == 0 ? 1.0 : (vKind == 1 ? 0.88 : alpha * (0.35 + 0.6*fr)));
+  col += uSunCol * pow(max(dot(n, H), 0.0), vKind == 0 ? 900.0 : 1400.0) * 120.0 * sh;
+  for(int i = 0; i < uNumLights; i++){
+    vec3 L; float at = lightAtten(i, vPos, L);
+    if(at <= 0.0) continue;
+    col += uLCol[i].rgb * at * pow(max(dot(n, normalize(L + V)), 0.0), 500.0) * 40.0 * max(dot(n, L), 0.0);
+  }
+  if(vKind == 0){ float foam = smoothstep(0.72, 0.9, fbm(vPos.xz*0.6 + vec2(t*0.2, 0.0))); col += (uSkyUp + uSunCol * 0.5) * foam * 0.06; }
+  if(vKind == 2) col = mix(below, col, alpha);
+  fragColor = vec4(min(col, vec3(30000.0)), 1.0);
 }
 )";
 
-// Billboard particles (premultiplied alpha: additive when a == 0)
+// Billboard particles. aCol.a < 0: emissive (additive) with intensity -a, otherwise lit and alpha-blended.
 static const char* PART_VS = R"(#version 330 core
 layout(location=0) in vec3 aPos; layout(location=1) in vec2 aUV; layout(location=2) in vec4 aCol;
-uniform mat4 uVP; out vec2 vUV; out vec4 vCol; out vec3 vPos;
-void main(){ vUV = aUV; vCol = aCol; vPos = aPos; gl_Position = uVP * vec4(aPos,1.0); }
+uniform mat4 uVP; out vec2 vUV; out vec4 vCol; out vec3 vPos; out float vW;
+void main(){ vUV = aUV; vCol = aCol; vPos = aPos; gl_Position = uVP * vec4(aPos,1.0); vW = gl_Position.w; }
 )";
 static const char* PART_FS_MAIN = R"(
-in vec2 vUV; in vec4 vCol; in vec3 vPos; out vec4 fragColor;
+in vec2 vUV; in vec4 vCol; in vec3 vPos; in float vW;
+uniform sampler2D uDepth; uniform vec2 uInvRes;
+out vec4 fragColor;
 void main(){
-  vec2 d = vUV*2.0-1.0; float r = dot(d,d);
+  vec2 d = vUV * 2.0 - 1.0; float r = dot(d, d);
   if(r > 1.0) discard;
-  float a = (1.0 - r);
-  float fogk = 1.0 - clamp(exp(-length(vPos-uCamPos)*uFogDensity), 0.0, 1.0);
-  vec3 c = vCol.rgb * (1.0 - fogk*0.8);
-  fragColor = vec4(c * a, vCol.a * a);
+  float dz = linZ(texture(uDepth, gl_FragCoord.xy * uInvRes).r) - vW;
+  if(dz <= 0.0) discard;
+  float a = (1.0 - r) * clamp(dz / 0.3, 0.0, 1.0);
+  float T = exp(-fogOptical(uCamPos, vPos));
+  if(vCol.a < 0.0){
+    fragColor = vec4(toLin(vCol.rgb) * (-vCol.a) * T * a, 0.0);
+  } else {
+    vec3 lightIn = uSkyUp * 1.4 + uSunCol * 0.7 * shadowFast(vPos);
+    for(int i = 0; i < uNumLights; i++){ vec3 L; lightIn += uLCol[i].rgb * lightAtten(i, vPos, L) * 0.22; }
+    vec3 c = toLin(vCol.rgb) * lightIn;
+    c = c * T + fogLight(normalize(vPos - uCamPos)) * (1.0 - T);
+    float al = vCol.a * a;
+    fragColor = vec4(c * al, al);
+  }
+}
+)";
+
+static const char* SSAO_FS = R"(
+in vec2 vUV; uniform sampler2D uDepth; uniform sampler2D uNrm; uniform float uRadius; uniform int uSamples;
+out float oAO;
+void main(){
+  float z = textureLod(uDepth, vUV, 0.0).r;
+  if(z >= 1.0){ oAO = 1.0; return; }
+  vec3 P = worldFromDepth(vUV, z);
+  vec3 N = normalize(textureLod(uNrm, vUV, 0.0).xyz * 2.0 - 1.0);
+  float dist = length(P - uCamPos);
+  float rad = uRadius * (1.0 + dist * 0.015);
+  vec3 up = abs(N.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+  vec3 Tt = normalize(cross(up, N)), Bt = cross(N, Tt);
+  float rot = ign(gl_FragCoord.xy) * 6.2831853;
+  float occ = 0.0;
+  for(int i = 0; i < uSamples; i++){
+    float fi = (float(i) + 0.5) / float(uSamples);
+    float ang = float(i) * 2.39996 + rot;
+    float r = sqrt(fi);
+    vec3 dir = Tt * (cos(ang) * r) + Bt * (sin(ang) * r) + N * sqrt(1.0 - fi);
+    float sc = mix(0.12, 1.0, fract(fi * 7.31 + rot * 0.159));
+    vec3 S = P + N * 0.03 + dir * rad * sc * sc;
+    vec4 c = uVP * vec4(S, 1.0);
+    vec2 suv = c.xy / c.w * 0.5 + 0.5;
+    if(suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
+    float sceneZ = linZ(textureLod(uDepth, suv, 0.0).r);
+    float diff = c.w - sceneZ;
+    occ += step(0.02, diff) * clamp(rad / max(diff, 1e-3) - 0.5, 0.0, 1.0);
+  }
+  oAO = pow(clamp(1.0 - occ / float(uSamples), 0.0, 1.0), 1.7);
+}
+)";
+static const char* AOBLUR_FS = R"(
+in vec2 vUV; uniform sampler2D uAO; uniform sampler2D uDepth; uniform vec2 uTexel;
+out float oAO;
+void main(){
+  float zc = linZ(textureLod(uDepth, vUV, 0.0).r);
+  float sum = 0.0, w = 0.0;
+  for(int y = -2; y <= 2; y++) for(int x = -2; x <= 2; x++){
+    vec2 o = vec2(x, y) * uTexel;
+    float z = linZ(textureLod(uDepth, vUV + o, 0.0).r);
+    float wt = exp(-abs(z - zc) / (zc * 0.02 + 0.05)) * (1.0 - 0.1 * float(abs(x) + abs(y)));
+    sum += textureLod(uAO, vUV + o, 0.0).r * wt; w += wt;
+  }
+  oAO = sum / max(w, 1e-4);
+}
+)";
+
+static const char* SSR_FS = R"(
+in vec2 vUV; uniform sampler2D uColor; uniform sampler2D uDepth; uniform sampler2D uReflInfo; uniform sampler2D uSurf;
+uniform int uSteps; uniform vec2 uRes;
+out vec4 oCol;
+void main(){
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec3 base = texelFetch(uColor, ip, 0).rgb;
+  vec4 ri = texelFetch(uReflInfo, ip, 0);
+  if(ri.a < 0.004 || uSteps == 0){ oCol = vec4(base, 1.0); return; }
+  vec4 sf = texelFetch(uSurf, ip, 0);
+  vec3 N = normalize(sf.xyz * 2.0 - 1.0);
+  float z = texelFetch(uDepth, ip, 0).r;
+  vec3 P = worldFromDepth((vec2(ip) + 0.5) / uRes, z);
+  vec3 R = reflect(normalize(P - uCamPos), N);
+  vec2 huv;
+  if(traceSSR(uDepth, P + N * 0.02, R, uSteps, ign(gl_FragCoord.xy), huv)){
+    vec2 e = smoothstep(0.0, 0.07, huv) * smoothstep(1.0, 0.93, huv);
+    vec3 sc = textureLod(uColor, huv, sf.w * 9.0).rgb;
+    oCol = vec4(max(base + e.x * e.y * (ri.a * sc - ri.rgb), vec3(0.0)), 1.0);
+  } else oCol = vec4(base, 1.0);
+}
+)";
+
+// Volumetric fog: ray-marched height fog lit by the shadowed sun and the nearest lamps
+static const char* FOG_FS = R"(
+in vec2 vUV; uniform sampler2D uDepth; uniform int uSteps; uniform float uMaxDist; uniform int uFogLights; uniform float uFogLightK;
+out vec4 oFog;
+void main(){
+  float z = textureLod(uDepth, vUV, 0.0).r;
+  vec3 P = worldFromDepth(vUV, min(z, 0.9999));
+  vec3 rd = normalize(P - uCamPos);
+  float dist = z < 1.0 ? length(P - uCamPos) : 5000.0;
+  float md = min(dist, uMaxDist);
+  float j = ign(gl_FragCoord.xy);
+  float ds = md / float(uSteps);
+  vec3 Lsun = uSunCol * PI * uFogSun * (0.7 * hgPhase(dot(rd, uSunDir), 0.62) + 0.3 / (4.0 * PI));
+  float T = 1.0; vec3 L = vec3(0.0);
+  int nl = min(uNumLights, uFogLights);
+  for(int i = 0; i < uSteps; i++){
+    vec3 x = uCamPos + rd * ((float(i) + j) * ds);
+    float e = exp(-fogDensityAt(x) * ds);
+    vec3 Li = uFogCol + Lsun * shadowFast(x);
+    for(int k = 0; k < nl; k++){ vec3 Ld; Li += uLCol[k].rgb * lightAtten(k, x, Ld) * uFogLightK; }
+    L += T * Li * (1.0 - e);
+    T *= e;
+  }
+  if(dist > md){
+    float e = exp(-fogOptical(uCamPos + rd * md, uCamPos + rd * dist));
+    L += T * (uFogCol + Lsun) * (1.0 - e);
+    T *= e;
+  }
+  oFog = vec4(L, T);
+}
+)";
+static const char* FOGAPPLY_FS = R"(
+in vec2 vUV; uniform sampler2D uFog; uniform sampler2D uDepth; uniform vec2 uFogRes;
+out vec4 oCol;
+void main(){
+  float zc = linZ(textureLod(uDepth, vUV, 0.0).r);
+  vec2 fp = vUV * uFogRes - 0.5, i0 = floor(fp), f = fp - i0;
+  vec4 acc = vec4(0.0); float wsum = 0.0;
+  for(int k = 0; k < 4; k++){
+    vec2 o = vec2(float(k & 1), float(k >> 1));
+    vec2 tuv = (i0 + o + 0.5) / uFogRes;
+    float zs = linZ(textureLod(uDepth, tuv, 0.0).r);
+    float w = (o.x > 0.5 ? f.x : 1.0 - f.x) * (o.y > 0.5 ? f.y : 1.0 - f.y) + 1e-3;
+    w *= exp(-abs(zs - zc) / (zc * 0.04 + 0.1));
+    acc += textureLod(uFog, tuv, 0.0) * w; wsum += w;
+  }
+  oCol = wsum > 1e-4 ? acc / wsum : textureLod(uFog, vUV, 0.0);
+}
+)";
+
+// Bloom: 13-tap downsample (Karis average on the first level) and tent upsample
+static const char* BLOOMDOWN_FS = R"(
+in vec2 vUV; uniform sampler2D uSrc; uniform vec2 uSrcTexel; uniform int uKaris;
+out vec4 oCol;
+vec3 tap(vec2 o){ vec3 c = textureLod(uSrc, vUV + o * uSrcTexel, 0.0).rgb; return any(isnan(c)) ? vec3(0.0) : min(c, vec3(30000.0)); }
+float kw(vec3 c){ return 1.0 / (1.0 + luma(c)); }
+void main(){
+  vec3 a = tap(vec2(-2, 2)), b = tap(vec2(0, 2)), c = tap(vec2(2, 2));
+  vec3 d = tap(vec2(-2, 0)), e = tap(vec2(0, 0)), f = tap(vec2(2, 0));
+  vec3 g = tap(vec2(-2, -2)), h = tap(vec2(0, -2)), i = tap(vec2(2, -2));
+  vec3 j = tap(vec2(-1, 1)), k = tap(vec2(1, 1)), l = tap(vec2(-1, -1)), m = tap(vec2(1, -1));
+  vec3 r;
+  if(uKaris == 1){
+    vec3 g0 = (j + k + l + m) * 0.25, g1 = (a + b + d + e) * 0.25, g2 = (b + c + e + f) * 0.25, g3 = (d + e + g + h) * 0.25, g4 = (e + f + h + i) * 0.25;
+    float w0 = 0.5 * kw(g0), w1 = 0.125 * kw(g1), w2 = 0.125 * kw(g2), w3 = 0.125 * kw(g3), w4 = 0.125 * kw(g4);
+    r = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+  } else {
+    r = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+  }
+  oCol = vec4(r, 1.0);
+}
+)";
+static const char* BLOOMUP_FS = R"(
+in vec2 vUV; uniform sampler2D uSrc; uniform vec2 uSrcTexel;
+out vec4 oCol;
+void main(){
+  vec3 s = vec3(0.0);
+  s += textureLod(uSrc, vUV + vec2(-1, 1) * uSrcTexel, 0.0).rgb + textureLod(uSrc, vUV + vec2(1, 1) * uSrcTexel, 0.0).rgb;
+  s += textureLod(uSrc, vUV + vec2(-1, -1) * uSrcTexel, 0.0).rgb + textureLod(uSrc, vUV + vec2(1, -1) * uSrcTexel, 0.0).rgb;
+  s += 2.0 * (textureLod(uSrc, vUV + vec2(0, 1) * uSrcTexel, 0.0).rgb + textureLod(uSrc, vUV + vec2(0, -1) * uSrcTexel, 0.0).rgb);
+  s += 2.0 * (textureLod(uSrc, vUV + vec2(-1, 0) * uSrcTexel, 0.0).rgb + textureLod(uSrc, vUV + vec2(1, 0) * uSrcTexel, 0.0).rgb);
+  s += 4.0 * textureLod(uSrc, vUV, 0.0).rgb;
+  oCol = vec4(s / 16.0, 1.0);
+}
+)";
+
+// Resolve (supersampling or camera motion blur), bloom, exposure, ACES filmic tonemap, grading
+static const char* COMPOSITE_FS = R"(
+in vec2 vUV; uniform sampler2D uHdr; uniform sampler2D uBloom; uniform sampler2D uDepth; uniform sampler2D uNrm;
+uniform vec2 uDstRes; uniform float uScale; uniform float uExposure; uniform float uBloomStr;
+uniform mat4 uPrevVP; uniform float uMotion;
+uniform vec3 uWB; uniform float uSat; uniform float uContrast; uniform vec3 uLift;
+out vec4 oCol;
+vec3 aces(vec3 x){
+  const mat3 IN = mat3(0.59719, 0.07600, 0.02840, 0.35458, 0.90834, 0.13383, 0.04823, 0.01566, 0.83777);
+  const mat3 OUT = mat3(1.60475, -0.10208, -0.00327, -0.53108, 1.10813, -0.07276, -0.07367, -0.00605, 1.07602);
+  vec3 v = IN * x;
+  vec3 a = v * (v + 0.0245786) - 0.000090537, b = v * (0.983729 * v + 0.4329510) + 0.238081;
+  return clamp(OUT * (a / b), 0.0, 1.0);
+}
+vec3 fetchHdr(vec2 uv){ vec3 c = textureLod(uHdr, uv, 0.0).rgb; return any(isnan(c)) ? vec3(0.0) : min(c, vec3(30000.0)); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / uDstRes;
+  vec2 vel = vec2(0.0);
+  if(uMotion > 0.0 && textureLod(uNrm, uv, 0.0).a < 0.5){
+    vec3 P = worldFromDepth(uv, min(textureLod(uDepth, uv, 0.0).r, 0.99995));
+    vec4 pc = uPrevVP * vec4(P, 1.0);
+    if(pc.w > 0.0){
+      vel = (uv - (pc.xy / pc.w * 0.5 + 0.5)) * uMotion;
+      float px = length(vel * uDstRes);
+      if(px > 40.0) vel *= 40.0 / px;
+    }
+  }
+  vec3 acc = vec3(0.0); float wsum = 0.0;
+  if(length(vel * uDstRes) > 1.0){
+    float j = ign(gl_FragCoord.xy);
+    for(int i = 0; i < 12; i++){
+      vec2 suv = uv + vel * ((float(i) + j) / 12.0 - 0.5);
+      if(textureLod(uNrm, suv, 0.0).a > 0.5) continue;
+      vec3 s = fetchHdr(suv);
+      float w = 1.0 / (1.0 + luma(s) * uExposure);
+      acc += s * w; wsum += w;
+    }
+  }
+  if(wsum <= 0.0){
+    int n = int(ceil(uScale - 0.01));
+    for(int y = 0; y < n; y++) for(int x = 0; x < n; x++){
+      vec2 o = (vec2(x, y) + 0.5) / float(n) - 0.5;
+      vec3 s = fetchHdr(uv + o / uDstRes);
+      float w = 1.0 / (1.0 + luma(s) * uExposure);
+      acc += s * w; wsum += w;
+    }
+  }
+  vec3 c = acc / wsum;
+  c = mix(c, textureLod(uBloom, uv, 0.0).rgb, uBloomStr);
+  c = aces(c * uExposure * uWB);
+  float l = luma(c);
+  c = max(mix(vec3(l), c, uSat), 0.0);
+  c = pow(c, vec3(1.0 / 2.2));
+  c = clamp((c - 0.5) * uContrast + 0.5 + uLift * (1.0 - c), 0.0, 1.0);
+  oCol = vec4(c, dot(c, vec3(0.299, 0.587, 0.114)));
+}
+)";
+
+// FXAA (when not supersampling), chromatic aberration, film grain and vignette
+static const char* FINAL_FS = R"(#version 330 core
+in vec2 vUV; uniform sampler2D uLdr; uniform vec2 uRes; uniform int uFxaa; uniform float uTime; uniform float uGrain; uniform float uVignette; uniform float uCA;
+out vec4 oCol;
+vec3 fxaa(vec2 uv, vec2 rcp){
+  vec3 rgbNW = texture(uLdr, uv + vec2(-1.0, -1.0) * rcp).rgb, rgbNE = texture(uLdr, uv + vec2(1.0, -1.0) * rcp).rgb;
+  vec3 rgbSW = texture(uLdr, uv + vec2(-1.0, 1.0) * rcp).rgb, rgbSE = texture(uLdr, uv + vec2(1.0, 1.0) * rcp).rgb;
+  vec3 rgbM = texture(uLdr, uv).rgb;
+  vec3 lw = vec3(0.299, 0.587, 0.114);
+  float lNW = dot(rgbNW, lw), lNE = dot(rgbNE, lw), lSW = dot(rgbSW, lw), lSE = dot(rgbSE, lw), lM = dot(rgbM, lw);
+  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE))), lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+  vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), ((lNW + lSW) - (lNE + lSE)));
+  float red = max((lNW + lNE + lSW + lSE) * (0.25 / 8.0), 1.0 / 128.0);
+  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + red), vec2(-8.0), vec2(8.0)) * rcp;
+  vec3 a = 0.5 * (texture(uLdr, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(uLdr, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+  vec3 b = a * 0.5 + 0.25 * (texture(uLdr, uv - dir * 0.5).rgb + texture(uLdr, uv + dir * 0.5).rgb);
+  float lB = dot(b, lw);
+  return (lB < lMin || lB > lMax) ? a : b;
+}
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = uFxaa == 1 ? fxaa(uv, 1.0 / uRes) : texture(uLdr, uv).rgb;
+  vec2 d = uv - 0.5;
+  if(uCA > 0.0){
+    vec2 off = d * dot(d, d) * uCA;
+    c.r = mix(c.r, texture(uLdr, uv - off).r, 0.85);
+    c.b = mix(c.b, texture(uLdr, uv + off).b, 0.85);
+  }
+  float vig = smoothstep(1.05, 0.3, length(d * vec2(uRes.x / uRes.y, 1.0) * 1.05));
+  c *= mix(1.0, vig, uVignette);
+  c += (hash12(gl_FragCoord.xy + fract(uTime * 7.13) * 419.0) - 0.5) * uGrain;
+  oCol = vec4(c, 1.0);
 }
 )";
 
@@ -872,7 +1668,6 @@ static GLuint makeProgram(const std::string& vs, const std::string& fs) {
     gl.DeleteShader(a); gl.DeleteShader(b);
     return p;
 }
-static std::string fsWithCommon(const char* body) { return std::string("#version 330 core\n") + GLSL_COMMON + body; }
 
 // ----------------------------------------------------------------------------
 // Collision world: oriented boxes, ramps and quarter pipes as a 2.5D height
@@ -1140,8 +1935,19 @@ static std::vector<V3> pigeonSpots;
 struct NpcPath { std::vector<V3> pts; bool loop = true; };
 static std::vector<NpcPath> npcPaths;
 static std::vector<V3> letterPos;
-struct Lamp { V3 pos; };
-static std::vector<Lamp> lamps;
+// ----------------------------------------------------------------------------
+// Lights: street lamps, shop windows, stoop lamps, traffic signals and cars.
+// The strongest ones around the camera are handed to the shaders each frame.
+// ----------------------------------------------------------------------------
+enum LightGroup { LG_LAMP = 0, LG_SHOP, LG_DOOR, LG_SIGNAL, LG_CAR };
+struct PointLight {
+    V3 pos, col;
+    float radius = 8.f;
+    V3 dir = V3(0, -1, 0);
+    float cosOuter = -2.f, cosInner = -2.f;   // spot cone (cosOuter < -1: omni)
+    int group = LG_LAMP;
+};
+static std::vector<PointLight> staticLights, dynLights, frameLights;
 
 // palette
 static const Col C_ASPHALT = hexc(0x46464a), C_SIDEWALK = hexc(0xa9a59c), C_CURB = hexc(0x8f8b84);
@@ -1301,17 +2107,54 @@ static void ledge(float cx, float cz, float rot, float hx, float hz, float y0, f
     edgeRails(cx, cz, rot, hx, hz, y0 + h, RK_LEDGE);
 }
 
+// A clump of leaves: an ellipsoid whose normals bend towards the canopy's outward direction,
+// so the whole crown shades as one soft volume instead of a pile of balls.
+static void leafClump(V3 c, V3 rad, V3 crownC, V3 crownR, Col col) {
+    const int SEG = 9, RINGS = 6;
+    uint32_t base = (uint32_t)SM.v.size();
+    for (int i = 0; i <= RINGS; i++)
+        for (int j = 0; j <= SEG; j++) {
+            float th = PI * i / RINGS, ph = TAU * j / SEG;
+            V3 u(std::sin(th) * std::sin(ph), std::cos(th), std::sin(th) * std::cos(ph));
+            float bump = 1.f + 0.18f * (hashf((int)(c.x * 37) + i * 7, (int)(c.z * 37) + j * 13, (int)(c.y * 11)) - 0.5f);
+            V3 p = c + mulv(u, rad) * (i == 0 || i == RINGS ? 1.f : bump);
+            V3 own = norm(V3(u.x / rad.x, u.y / rad.y, u.z / rad.z));
+            V3 d = p - crownC;
+            V3 crown = norm(V3(d.x / (crownR.x * crownR.x), d.y / (crownR.y * crownR.y), d.z / (crownR.z * crownR.z)));
+            SM.vert(p, norm(own * 0.4f + crown * 0.6f), col, MAT_FOLIAGE);
+        }
+    for (int i = 0; i < RINGS; i++)
+        for (int j = 0; j < SEG; j++) {
+            uint32_t a0 = base + i * (SEG + 1) + j, a1 = a0 + 1, b0 = a0 + SEG + 1, b1 = b0 + 1;
+            SM.idx.insert(SM.idx.end(), {a0, b0, b1, a0, b1, a1});
+        }
+}
+
 static void tree(float x, float z, float y0, float scale = 1.f) {
     Rng r((uint32_t)(x * 131 + z * 71 + 999));
-    SM.boxAA(V3(x - 0.75f, y0 - 0.02f, z - 0.75f), V3(x + 0.75f, y0 + 0.02f, z + 0.75f), hexc(0x4a3b2c), MAT_CONCRETE, 4);
+    SM.boxAA(V3(x - 0.75f, y0 - 0.02f, z - 0.75f), V3(x + 0.75f, y0 + 0.02f, z + 0.75f), hexc(0x3f3326), MAT_CONCRETE, 4);
     float th = 2.6f * scale;
-    SM.cylinder(frame(x, y0, z, 0), 0.12f * scale, th, 7, hexc(0x4d3d30), MAT_PLAIN, false, 0.08f * scale);
+    Col bark = hexc(0x4a3c30);
+    V3 top(x + r.range(-0.12f, 0.12f) * scale, y0 + th, z + r.range(-0.12f, 0.12f) * scale);
+    SM.capsule(V3(x, y0 - 0.05f, z), top, 0.14f * scale, 0.09f * scale, V3(1, 0, 0), bark, MAT_BARK, 1.f, 0.3f, 9);
     world.addBox(x, z, 0, 0.14f, 0.14f, y0, y0 + th + 2.f, SURF_WOOD, false);
+    // crown: branches reaching into an ellipsoid filled with leaf clumps
+    V3 crownC = top + V3(0, 1.25f * scale, 0), crownR = V3(1.75f, 1.35f, 1.75f) * scale;
     for (int k = 0; k < 4; k++) {
-        V3 c(x + r.range(-0.8f, 0.8f) * scale, y0 + th + r.range(0.3f, 1.6f) * scale, z + r.range(-0.8f, 0.8f) * scale);
-        float rad = r.range(1.0f, 1.5f) * scale;
-        Col g = mixc(hexc(0x3f6b2a), hexc(0x6f8f35), r.f());
-        SM.sphere(mTranslate(c), V3(rad, rad * 0.8f, rad), 8, 5, g, MAT_FOLIAGE);
+        float a = k * TAU / 4 + r.range(-0.4f, 0.4f);
+        V3 tip = crownC + V3(std::sin(a) * 1.0f, r.range(-0.2f, 0.6f), std::cos(a) * 1.0f) * scale;
+        SM.capsule(top - V3(0, 0.3f * scale, 0), tip, 0.07f * scale, 0.035f * scale, V3(0, 1, 0), bark, MAT_BARK, 1.f, 0.5f, 6);
+    }
+    Col g0 = hexc(0x365f24), g1 = hexc(0x6b8c33);
+    for (int k = 0; k < 30; k++) {
+        V3 d;
+        do d = V3(r.range(-1, 1), r.range(-1, 1), r.range(-1, 1)); while (len(d) > 1.f);
+        float l = len(d);
+        d = l > 1e-3f ? d / l * std::pow(l, 0.4f) : V3(0, 1, 0);   // favour the outside of the crown
+        V3 c = crownC + mulv(d, crownR) * 0.78f;
+        float rad = r.range(0.5f, 0.78f) * scale;
+        Col col = mixc(g0, g1, sat(r.f() * 0.8f + (d.y * 0.5f + 0.5f) * 0.35f));
+        leafClump(c, V3(rad, rad * 0.85f, rad), crownC, crownR, col);
     }
     // low iron tree-pit guard (grindable, NYC classic)
     float g = 0.8f, gy = y0 + 0.42f;
@@ -1334,7 +2177,10 @@ static void streetLamp(float x, float z, float y0, float yaw) {
     SM.box(hf, V3(0.22f, 0.08f, 0.45f), hexc(0x3a463e), MAT_METAL);
     SM.box(hf * mTranslate(V3(0, -0.09f, 0.05f)), V3(0.16f, 0.02f, 0.3f), hexc(0xfff1c0), MAT_EMISSIVE);
     world.addBox(x, z, 0, 0.12f, 0.12f, y0, y0 + 6.6f, SURF_METAL, false);
-    lamps.push_back({arm + V3(0, -0.15f, 0)});
+    PointLight l;
+    l.pos = arm + V3(0, -0.3f, 0); l.col = V3(1.f, 0.8f, 0.56f) * 60.f; l.radius = 20.f;
+    l.dir = V3(0, -1, 0); l.cosOuter = 0.15f; l.cosInner = 0.55f; l.group = LG_LAMP;
+    staticLights.push_back(l);
 }
 
 static void hydrant(float x, float z, float y0, bool open, float sprayYaw = 0) {
@@ -1368,31 +2214,91 @@ static void manhole(float x, float z, bool steam) {
     if (steam) emitters.push_back({V3(x, 0.05f, z), V3(0, 1, 0), EM_STEAM, 18.f});
 }
 
+// Extrude a convex side profile ({z, y} points, counter-clockwise seen from +X) across the car. Above
+// yBase the section narrows by 'tumble' per metre. Bits of glassEdges mark perimeter faces made of glass.
+static void carSection(MeshBuilder& mb, const M4& F, const float (*pts)[2], int n, float halfW, float tumble, float yBase,
+                       Col col, uint8_t mat, uint32_t glassEdges, Col glass, bool glassSides) {
+    V3 Lp[12], Rp[12];
+    float cz = 0, cy = 0;
+    for (int i = 0; i < n; i++) {
+        float w = halfW - tumble * std::max(0.f, pts[i][1] - yBase);
+        Lp[i] = xPoint(F, V3(-w, pts[i][1], pts[i][0]));
+        Rp[i] = xPoint(F, V3(w, pts[i][1], pts[i][0]));
+        cz += pts[i][0] / n; cy += pts[i][1] / n;
+    }
+    Col sc = glassSides ? glass : col;
+    uint8_t sm = glassSides ? (uint8_t)MAT_CARGLASS : mat;
+    for (int i = 1; i + 1 < n; i++) {
+        triOut(mb, Rp[0], Rp[i], Rp[i + 1], xDir(F, V3(1, 0, 0)), sc, sm);
+        triOut(mb, Lp[0], Lp[i], Lp[i + 1], xDir(F, V3(-1, 0, 0)), sc, sm);
+    }
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        float mz = (pts[i][0] + pts[j][0]) * 0.5f - cz, my = (pts[i][1] + pts[j][1]) * 0.5f - cy;
+        float pz = pts[j][1] - pts[i][1], py = -(pts[j][0] - pts[i][0]);
+        if (pz * mz + py * my < 0) { pz = -pz; py = -py; }
+        bool g = (glassEdges >> i) & 1;
+        mb.quadOut(Lp[i], Rp[i], Rp[j], Lp[j], xDir(F, V3(0, py, pz)), g ? glass : col, g ? (uint8_t)MAT_CARGLASS : mat);
+    }
+}
+
 // Car body geometry. type 0 = yellow cab, 1 = sedan, 2 = town car, 3 = van. F: ground frame, nose +Z.
 static void carGeom(MeshBuilder& mb, const M4& F, int type, Col body, float brake = 0) {
     float L = type == 3 ? 2.6f : 2.45f, Wd = 0.95f;
-    float bodyTop = type == 3 ? 1.9f : 0.95f;
-    mb.box(F * mTranslate(V3(0, (0.3f + bodyTop) * 0.5f, 0)), V3(Wd, (bodyTop - 0.3f) * 0.5f, L), body, MAT_PAINTED);
-    mb.box(F * mTranslate(V3(0, 0.36f, 0)), V3(Wd + 0.02f, 0.06f, L + 0.04f), hexc(0x2a2a2a), MAT_PLAIN);   // bumpers/rocker
+    Col glass = hexc(0x1a232c), trim = hexc(0x1c1c1e), tire = hexc(0x161616), chrome = hexc(0xb8bcc2);
     if (type != 3) {
-        mb.box(F * mTranslate(V3(0, 1.22f, -0.15f)), V3(Wd * 0.9f, 0.27f, 1.15f), body, MAT_PAINTED);
-        mb.box(F * mTranslate(V3(0, 1.2f, -0.15f)), V3(Wd * 0.92f, 0.2f, 1.1f), hexc(0x1d2630), MAT_PAINTED, 1 | 2 | 16 | 32);
+        float lower[8][2] = {{L - 0.05f, 0.3f}, {L + 0.02f, 0.62f}, {L - 0.3f, 0.83f}, {0.85f, 0.95f},
+                             {-L + 0.38f, 0.96f}, {-L, 0.84f}, {-L - 0.02f, 0.58f}, {-L + 0.05f, 0.3f}};
+        carSection(mb, F, lower, 8, Wd, 0.f, 0.f, body, MAT_CARPAINT, 0, glass, false);
+        float cf = type == 2 ? 0.95f : 0.85f, cr = type == 2 ? -1.75f : -1.6f;
+        float cabin[4][2] = {{cf, 0.95f}, {0.12f, 1.43f}, {cr + 0.62f, 1.45f}, {cr, 0.96f}};
+        carSection(mb, F, cabin, 4, Wd * 0.9f, 0.18f, 0.95f, body, MAT_CARPAINT, 1 | 4, glass, true);
+        // pillars
+        for (int sg = -1; sg <= 1; sg += 2) {
+            float wb = Wd * 0.9f + 0.005f, wt = wb - 0.18f * 0.48f;
+            V3 side = xDir(F, V3(0, 1, 0));
+            mb.limb(xPoint(F, V3(sg * wb, 0.95f, cf)), xPoint(F, V3(sg * wt, 1.43f, 0.12f)), 0.06f, 0.05f, side, body, MAT_CARPAINT);
+            mb.limb(xPoint(F, V3(sg * wb, 0.95f, -0.42f)), xPoint(F, V3(sg * wt, 1.44f, -0.42f)), 0.08f, 0.04f, side, body, MAT_CARPAINT);
+            mb.limb(xPoint(F, V3(sg * wb, 0.96f, cr)), xPoint(F, V3(sg * wt, 1.45f, cr + 0.62f)), 0.1f, 0.05f, side, body, MAT_CARPAINT);
+            mb.box(F * mTranslate(V3(sg * (Wd + 0.06f), 1.0f, 0.78f)), V3(0.06f, 0.05f, 0.08f), body, MAT_CARPAINT);   // mirror
+        }
     } else {
-        mb.box(F * mTranslate(V3(0, 1.45f, 1.9f)), V3(Wd * 0.95f, 0.25f, 0.72f), hexc(0x1d2630), MAT_PAINTED, 16 | 1 | 2);
+        float van[7][2] = {{L - 0.02f, 0.32f}, {L + 0.02f, 0.9f}, {L - 0.45f, 1.18f}, {L - 1.1f, 1.95f},
+                           {-L + 0.05f, 1.96f}, {-L, 1.85f}, {-L, 0.32f}};
+        carSection(mb, F, van, 7, Wd, 0.f, 0.f, body, MAT_CARPAINT, 4, glass, false);
+        for (int sg = -1; sg <= 1; sg += 2) {   // cab side windows
+            float x = sg * (Wd + 0.004f);
+            mb.quadOut(xPoint(F, V3(x, 1.25f, L - 0.55f)), xPoint(F, V3(x, 1.25f, L - 1.75f)), xPoint(F, V3(x, 1.78f, L - 1.75f)),
+                       xPoint(F, V3(x, 1.78f, L - 1.2f)), xDir(F, V3((float)sg, 0, 0)), glass, MAT_CARGLASS);
+        }
     }
+    // bumpers, grille, lights
+    mb.box(F * mTranslate(V3(0, 0.4f, L + 0.02f)), V3(Wd + 0.02f, 0.1f, 0.07f), trim, MAT_RUBBER);
+    mb.box(F * mTranslate(V3(0, 0.4f, -L - 0.02f)), V3(Wd + 0.02f, 0.1f, 0.07f), trim, MAT_RUBBER);
+    mb.box(F * mTranslate(V3(0, 0.63f, L + 0.015f)), V3(0.42f, 0.09f, 0.02f), type == 2 ? chrome : trim, MAT_METAL);
+    for (int sg = -1; sg <= 1; sg += 2) {
+        mb.box(F * mTranslate(V3(sg * 0.66f, 0.66f, L + 0.02f)), V3(0.19f, 0.07f, 0.02f), hexc(0xfff4d8), MAT_EMISSIVE);
+        mb.box(F * mTranslate(V3(sg * 0.68f, 0.74f, -L - 0.03f)), V3(0.17f, 0.07f, 0.02f), brake > 0.5f ? hexc(0xff2a1a) : hexc(0x9a1410), MAT_EMISSIVE);
+    }
+    // wheels with dark wheel wells and hub caps
+    float wz = type == 3 ? L * 0.66f : L * 0.62f;
     for (int i = 0; i < 4; i++) {
-        float sx = (i & 1) ? Wd * 0.92f : -Wd * 0.92f, sz = (i & 2) ? L * 0.62f : -L * 0.62f;
-        mb.box(F * mTranslate(V3(sx, 0.32f, sz)), V3(0.12f, 0.32f, 0.32f), hexc(0x111111), MAT_PLAIN);
+        float sg = (i & 1) ? 1.f : -1.f, sz = (i & 2) ? wz : -wz;
+        V3 c(sg * (Wd + 0.03f), 0.33f, sz);
+        mb.cylinder(F * mTranslate(c) * mRotZ(sg * PI / 2), 0.33f, 0.24f, 16, tire, MAT_RUBBER, true);
+        mb.cylinder(F * mTranslate(c + V3(sg * 0.012f, 0, 0)) * mRotZ(-sg * PI / 2), 0.19f, 0.012f, 12, chrome, MAT_METAL, true);
+        V3 wc = xPoint(F, V3(sg * (Wd + 0.004f), 0.33f, sz));
+        for (int k = 0; k < 8; k++) {
+            float a0 = PI * k / 8, a1 = PI * (k + 1) / 8;
+            triOut(mb, wc, xPoint(F, V3(sg * (Wd + 0.004f), 0.33f + std::sin(a0) * 0.42f, sz + std::cos(a0) * 0.42f)),
+                   xPoint(F, V3(sg * (Wd + 0.004f), 0.33f + std::sin(a1) * 0.42f, sz + std::cos(a1) * 0.42f)), xDir(F, V3(sg, 0, 0)), hexc(0x0c0c0c), MAT_RUBBER);
+        }
     }
-    mb.box(F * mTranslate(V3(0.6f, 0.75f, L + 0.005f)), V3(0.18f, 0.07f, 0.01f), hexc(0xfff4d0), MAT_EMISSIVE);
-    mb.box(F * mTranslate(V3(-0.6f, 0.75f, L + 0.005f)), V3(0.18f, 0.07f, 0.01f), hexc(0xfff4d0), MAT_EMISSIVE);
-    Col tail = brake > 0.5f ? hexc(0xff2a1a) : hexc(0x8a1010);
-    mb.box(F * mTranslate(V3(0.65f, 0.78f, -L - 0.005f)), V3(0.15f, 0.07f, 0.01f), tail, MAT_EMISSIVE);
-    mb.box(F * mTranslate(V3(-0.65f, 0.78f, -L - 0.005f)), V3(0.15f, 0.07f, 0.01f), tail, MAT_EMISSIVE);
     if (type == 0) {   // taxi roof light + checker stripe
-        mb.box(F * mTranslate(V3(0, 1.56f, -0.1f)), V3(0.35f, 0.08f, 0.12f), hexc(0xfff6c8), MAT_EMISSIVE);
-        mb.box(F * mTranslate(V3(Wd + 0.005f, 0.72f, 0)), V3(0.005f, 0.05f, L * 0.8f), hexc(0x111111), MAT_PLAIN);
-        mb.box(F * mTranslate(V3(-Wd - 0.005f, 0.72f, 0)), V3(0.005f, 0.05f, L * 0.8f), hexc(0x111111), MAT_PLAIN);
+        mb.box(F * mTranslate(V3(0, 1.53f, -0.35f)), V3(0.34f, 0.08f, 0.13f), hexc(0xfff6c8), MAT_EMISSIVE);
+        for (int k = 0; k < 16; k++)
+            for (int sg = -1; sg <= 1; sg += 2)
+                mb.box(F * mTranslate(V3(sg * (Wd + 0.006f), 0.74f + (k & 1) * 0.04f, -1.9f + k * 0.2f)), V3(0.004f, 0.02f, 0.1f), hexc(0x111111), MAT_PLAIN);
     }
 }
 
@@ -1411,7 +2317,7 @@ static void signBoard(V3 pos, V3 right, V3 up, V3 out, float w, float h, const s
     SM.box(F, V3(w * 0.5f, h * 0.5f, 0.06f), bg, MAT_PAINTED);
     float px = std::min(h * 0.62f / 7.f, (w * 0.9f) / (txt.size() * 6.f));
     float tw = textWidth3D(txt, px);
-    V3 o = c - right * (tw * 0.5f) - up * (3.5f * px) + out * 0.065f;
+    V3 o = c - right * (tw * 0.5f) - up * (3.5f * px) + out * 0.075f;
     SM.text3D(txt, o, right, up, px, fg, neon ? MAT_EMISSIVE : MAT_PLAIN);
 }
 
@@ -1440,6 +2346,14 @@ static void storefront(V3 o, V3 r, V3 n, float w, const std::string& name, Col s
     M4 T = mBasis(r, up, n, o + r * (w * 0.5f) + up * 3.75f + n * 0.1f);
     SM.box(T, V3(w * 0.5f - 0.5f, 0.25f, 0.1f), hexc(0x3d3935), MAT_PAINTED);
     signBoard(o + r * (w * 0.5f) + up * 4.3f + n * 0.12f, r, up, n, w - 1.0f, 0.75f, name, signBg, signFg, rng.chance(0.4f));
+    {   // shop light spilling onto the sidewalk at night
+        PointLight l;
+        l.pos = o + r * (w * 0.5f) + up * 2.2f + n * 1.2f;
+        float h1 = hashf((int)(l.pos.x * 7), (int)(l.pos.z * 7), 1), h2 = hashf((int)(l.pos.x * 7), (int)(l.pos.z * 7), 2);
+        l.col = mulv(V3(1.f, 0.86f, 0.66f), V3(0.9f + 0.2f * h1, 1.f, 0.85f + 0.3f * h2)) * 10.f;
+        l.radius = 9.f; l.group = LG_SHOP;
+        staticLights.push_back(l);
+    }
     // neon "OPEN" in the window sometimes
     if (rng.chance(0.55f)) {
         float px = 0.045f;
@@ -1468,22 +2382,53 @@ static void waterTower(float x, float y, float z, float s) {
 }
 
 // Fire escape (black iron balconies + ladders) on a facade
+// Railing panel between two points on the ground plane of a platform: vertical bars (cut out in the
+// shader so they stay clean at any distance), a top rail and end posts.
+static void barRailing(V3 a, V3 b, float h, Col col) {
+    V3 up(0, h, 0), d = b - a;
+    V3 nrm = norm(cross(V3(0, 1, 0), d));
+    SM.quadOut(a, b, b + up, a + up, nrm, col, MAT_BARS);
+    SM.limb(a + up, b + up, 0.045f, 0.045f, V3(0, 1, 0), col, MAT_METAL);
+    SM.limb(a + up * 0.08f, b + up * 0.08f, 0.03f, 0.03f, V3(0, 1, 0), col, MAT_METAL);
+    SM.limb(a, a + up, 0.045f, 0.045f, nrm, col, MAT_METAL);
+    SM.limb(b, b + up, 0.045f, 0.045f, nrm, col, MAT_METAL);
+}
+
+// Fire escape (black iron balconies, railings and stairs) on a facade
 static void fireEscape(V3 o, V3 r, V3 n, float w, int floors) {
+    V3 up(0, 1, 0);
+    Col iron = hexc(0x1b1d1c);
+    const float depth = 1.2f, stairW = 0.56f;
     for (int f = 0; f < floors; f++) {
         float y = 4.8f + 3.3f * f + 0.2f;
         V3 b0 = o + V3(0, y, 0), b1 = b0 + r * w;
-        SM.box(mBasis(r, V3(0, 1, 0), n, (b0 + b1) * 0.5f + n * 0.6f), V3(w * 0.5f, 0.03f, 0.6f), C_IRON, MAT_METAL);
-        V3 t0 = b0 + n * 1.2f + V3(0, 0.9f, 0), t1 = b1 + n * 1.2f + V3(0, 0.9f, 0);
-        SM.limb(t0, t1, 0.04f, 0.04f, V3(0, 1, 0), C_IRON, MAT_METAL);
-        SM.limb(b0 + n * 1.2f, t0, 0.04f, 0.04f, V3(1, 0, 0), C_IRON, MAT_METAL);
-        SM.limb(b1 + n * 1.2f, t1, 0.04f, 0.04f, V3(1, 0, 0), C_IRON, MAT_METAL);
-        for (int k = 1; k < 8; k++) {
-            V3 p = b0 + r * (w * k / 8.f) + n * 1.2f;
-            SM.limb(p, p + V3(0, 0.9f, 0), 0.015f, 0.015f, V3(1, 0, 0), C_IRON, MAT_METAL);
+        // platform: slab with an angle-iron frame along its outer edge
+        SM.box(mBasis(r, up, n, (b0 + b1) * 0.5f + n * (depth * 0.5f)), V3(w * 0.5f, 0.035f, depth * 0.5f), iron, MAT_METAL);
+        SM.limb(b0 + n * depth - up * 0.02f, b1 + n * depth - up * 0.02f, 0.05f, 0.1f, up, iron, MAT_METAL);
+        // railings on the open sides
+        barRailing(b0 + n * depth, b1 + n * depth, 0.95f, iron);
+        barRailing(b0 + n * 0.02f, b0 + n * depth, 0.95f, iron);
+        barRailing(b1 + n * depth, b1 + n * 0.02f, 0.95f, iron);
+        // brackets holding the platform to the wall
+        for (int k = 0; k < 2; k++) {
+            V3 p = lerp3(b0, b1, k ? 0.85f : 0.15f);
+            SM.limb(p - up * 0.7f + n * 0.02f, p + n * (depth * 0.8f) - up * 0.03f, 0.04f, 0.04f, r, iron, MAT_METAL);
         }
-        if (f + 1 < floors) {   // diagonal stair to the next balcony
-            V3 s0 = b0 + r * (w * 0.2f) + n * 0.6f, s1 = b0 + r * (w * 0.75f) + n * 0.6f + V3(0, 3.3f, 0);
-            SM.limb(s0, s1, 0.5f, 0.05f, n, C_IRON, MAT_METAL);
+        if (f + 1 < floors) {   // stair to the next balcony: two stringers, treads and a handrail
+            V3 s0 = b0 + r * (w * 0.18f) + n * (depth * 0.5f), s1 = b0 + r * (w * 0.74f) + n * (depth * 0.5f) + V3(0, 3.3f, 0);
+            V3 run = s1 - s0;
+            for (int sg = -1; sg <= 1; sg += 2) {
+                V3 side = n * (sg * stairW * 0.5f);
+                SM.limb(s0 + side, s1 + side, 0.035f, 0.18f, n, iron, MAT_METAL);
+            }
+            int steps = 14;
+            for (int k = 1; k < steps; k++) {
+                V3 p = s0 + run * ((float)k / steps);
+                SM.box(mBasis(r, up, n, p + up * 0.02f), V3(len(V3(run.x, 0, run.z)) / steps * 0.5f, 0.012f, stairW * 0.5f), iron, MAT_METAL);
+            }
+            V3 hr = n * (stairW * 0.5f) + up * 0.9f;
+            SM.limb(s0 + hr, s1 + hr, 0.035f, 0.035f, up, iron, MAT_METAL);
+            SM.limb(s0 + n * (stairW * 0.5f), s0 + hr, 0.035f, 0.035f, r, iron, MAT_METAL);
         }
     }
 }
@@ -1497,9 +2442,13 @@ static const float SH = 0.15f;   // sidewalk height
 
 static void building(float x0, float z0, float x1, float z1, float h, int style, Col col, uint32_t seed, bool roofStuff = true) {
     uint8_t mat = style == 1 ? MAT_STONEWIN : (style == 2 ? MAT_GLASSWALL : MAT_WINDOWS);
+    world.addBox((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0, (x1 - x0) * 0.5f, (z1 - z0) * 0.5f, 0, h, SURF_CONCRETE, true);
+    // Neighbouring and overlapping buildings share wall planes; a small unique inset per building keeps
+    // those walls from being exactly coplanar (which z-fights into flickering triangle-shaped patches).
+    float e = 0.01f + 0.035f * (hash32(seed * 2654435761u + 17u) & 0xFFFF) / 65535.f;
+    x0 += e; z0 += e; x1 -= e; z1 -= e;
     SM.boxAA(V3(x0, 0, z0), V3(x1, h, z1), col, mat, 1 | 2 | 16 | 32);
     SM.quadN(V3(x0, h, z1), V3(x1, h, z1), V3(x1, h, z0), V3(x0, h, z0), V3(0, 1, 0), hexc(0x55514c), MAT_ROOF);
-    world.addBox((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0, (x1 - x0) * 0.5f, (z1 - z0) * 0.5f, 0, h, SURF_CONCRETE, true);
     Rng r(seed);
     if (style != 2) {
         Col cor = style == 1 ? shade(col, 0.85f) : hexc(0x6d665c);
@@ -1559,7 +2508,7 @@ static void facadeRow(V3 left, V3 out, float length, float depth, uint32_t seed,
 
 static void stripeQuad(V3 a, V3 dirLong, V3 dirWide, float L, float W, Col c) {
     V3 p0 = a, p1 = a + dirWide * W, p2 = p1 + dirLong * L, p3 = a + dirLong * L;
-    SM.quadOut(p0, p1, p2, p3, V3(0, 1, 0), c, MAT_PLAIN);
+    SM.quadOut(p0, p1, p2, p3, V3(0, 1, 0), c, MAT_ROADPAINT);
 }
 
 static void buildStreets() {
@@ -1573,7 +2522,7 @@ static void buildStreets() {
     slab(-600, RIVER_EDGE_Z, 600, -74, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 8);
     // road markings
     Col white = hexc(0xdedbd2), yel = hexc(0xe0b416);
-    float y = 0.006f;
+    float y = 0.012f;
     for (float z = -60; z < 200; z += 6) {
         if (z > -12 && z < 12) continue;
         stripeQuad(V3(-2.3f, y, z), V3(0, 0, 1), V3(1, 0, 0), 3, 0.14f, white);
@@ -1598,10 +2547,10 @@ static void buildStreets() {
     for (float x = -8.5f; x < 8.5f; x += 1.1f) stripeQuad(V3(x, y, -61.0f), V3(0, 0, 1), V3(1, 0, 0), 3.0f, 0.55f, white);
     // manholes, steam, puddles
     manhole(-3.5f, -30, true); manhole(4, 36, true); manhole(-30, 1.5f, false); manhole(38, -2, true); manhole(-3, -69, false);
-    puddle(-8.2f, 20, 0.012f, 1.6f, 3.2f);
-    puddle(5, -45, 0.012f, 2.2f, 1.4f);
-    puddle(26, 5.5f, 0.012f, 2.6f, 1.1f);
-    puddle(-45, -66, 0.012f, 1.8f, 2.8f);
+    puddle(-8.2f, 20, 0.022f, 1.6f, 3.2f);
+    puddle(5, -45, 0.022f, 2.2f, 1.4f);
+    puddle(26, 5.5f, 0.022f, 2.6f, 1.1f);
+    puddle(-45, -66, 0.022f, 1.8f, 2.8f);
     // traffic lights at the corners
     float tl[4][2] = {{-10.2f, -8.2f}, {10.2f, -8.2f}, {-10.2f, 8.2f}, {10.2f, 8.2f}};
     for (int i = 0; i < 4; i++) {
@@ -1631,6 +2580,9 @@ static void subwayEntrance(float cx, float cz) {
         V3 p(cx + hx, SH, cz + s * hz);
         SM.cylinder(frame(p.x, p.y, p.z, 0), 0.05f, 1.9f, 6, hexc(0x2c4a36), MAT_METAL);
         SM.sphere(mTranslate(p + V3(0, 2.05f, 0)), V3(0.17f, 0.17f, 0.17f), 8, 5, hexc(0x40ff70), MAT_EMISSIVE);
+        PointLight l;
+        l.pos = p + V3(0, 2.05f, 0); l.col = V3(0.25f, 1.f, 0.4f) * 3.f; l.radius = 5.f; l.group = LG_DOOR;
+        staticLights.push_back(l);
     }
 }
 
@@ -1712,7 +2664,7 @@ static void buildFountain(float cx, float cz) {
 
 static void buildPlaza() {
     // pavers + glass office tower on the east with a raised terrace, stairs and brick banks
-    overlay(14, -57, 58, -12, SH + 0.003f, hexc(0x9a5b47), MAT_PAVERS);
+    overlay(14, -57, 58, -12, SH + 0.01f, hexc(0x9a5b47), MAT_PAVERS);
     building(58, -57, 200, -12, 96, 2, hexc(0x8899aa), 21);
     float tTop = SH + 1.05f;
     Col gran = hexc(0x9a968f), gtop = hexc(0xa8a49c);
@@ -1813,11 +2765,11 @@ static void hoop(float x, float z, float faceYaw) {
 
 static void buildCourt() {
     float x0 = -48, x1 = -18, z0 = 16, z1 = 46;
-    overlay(x0, z0, x1, z1, SH + 0.003f, hexc(0x3c6b4c), MAT_COURT);
-    overlay(x0 + 1.5f, z0 + 1.5f, x1 - 1.5f, z1 - 1.5f, SH + 0.005f, hexc(0x9a4a3a), MAT_COURT);
+    overlay(x0, z0, x1, z1, SH + 0.01f, hexc(0x3c6b4c), MAT_COURT);
+    overlay(x0 + 1.5f, z0 + 1.5f, x1 - 1.5f, z1 - 1.5f, SH + 0.018f, hexc(0x9a4a3a), MAT_COURT);
     Col line = hexc(0xeeeeea);
     auto L = [&](float ax, float az, float bx, float bz) {
-        V3 a(ax, SH + 0.008f, az), b(bx, SH + 0.008f, bz);
+        V3 a(ax, SH + 0.026f, az), b(bx, SH + 0.026f, bz);
         V3 d = norm(b - a), n = cross(V3(0, 1, 0), d) * 0.05f;
         SM.quadOut(a - n, b - n, b + n, a + n, V3(0, 1, 0), line, MAT_PLAIN);
     };
@@ -1917,6 +2869,11 @@ static void brownstone(float z0, int i) {
     solidBox(15.8f, sz, 0, 0.2f, 0.95f, SH, top, col, MAT_CONCRETE, SURF_CONCRETE, false, &lt);
     SM.boxAA(V3(15.95f, top, sz - 0.6f), V3(16.02f, top + 2.3f, sz + 0.6f), hexc(0x3a2418), MAT_WOOD);   // door
     SM.boxAA(V3(15.9f, top + 2.3f, sz - 0.75f), V3(16.05f, top + 2.9f, sz + 0.75f), hexc(0xe0c890), MAT_EMISSIVE);
+    {
+        PointLight l;
+        l.pos = V3(15.3f, top + 2.5f, sz); l.col = V3(1.f, 0.78f, 0.5f) * 5.f; l.radius = 6.f; l.group = LG_DOOR;
+        staticLights.push_back(l);
+    }
     for (int s = -1; s <= 1; s += 2) {   // stoop handrails (sloped, grindable)
         V3 a(12.45f, SH + 0.2f + 0.85f, sz + s * 0.88f), b(15.55f, top + 0.85f, sz + s * 0.88f);
         handrail(a, b, true, C_IRON, 1.0f);
@@ -1963,7 +2920,7 @@ static void buildSE() {
         }
     }
     SM.boxAA(V3(30.5f, SH + 3.3f, 7.5f), V3(69.5f, SH + 3.75f, 12.3f), hexc(0x3b5f3a), MAT_PAINTED);
-    overlay(30, 12.45f, 69.5f, 45, SH + 0.003f, hexc(0x8d8272), MAT_CONCRETE);
+    overlay(30, 12.45f, 69.5f, 45, SH + 0.01f, hexc(0x8d8272), MAT_CONCRETE);
     {   // dumpster with a plywood kicker leaning on it
         Col dc = hexc(0x2f6b3f), dt = hexc(0x3d7a4d);
         solidBox(38, 25, 0, 1.0f, 2.0f, SH, SH + 1.3f, dc, MAT_PAINTED, SURF_METAL, false, &dt);
@@ -2018,7 +2975,7 @@ static void parkedCars() {
 
 static void buildPromenade() {
     float top = SH;
-    overlay(-600, -86.6f, 600, -76.4f, top + 0.003f, hexc(0x8b6d4e), MAT_WOOD);
+    overlay(-600, -86.6f, 600, -76.4f, top + 0.01f, hexc(0x8b6d4e), MAT_WOOD);
     world.addBox(0, -81.5f, 0, 600, 5.1f, -0.3f, top, SURF_WOOD);
     // seawall + granite coping + railing
     SM.quadOut(V3(-600, top, RIVER_EDGE_Z), V3(600, top, RIVER_EDGE_Z), V3(600, WATER_LEVEL - 3, RIVER_EDGE_Z), V3(-600, WATER_LEVEL - 3, RIVER_EDGE_Z),
@@ -2154,7 +3111,11 @@ static void spawnDust(V3 p, int n);
 static void spawnSparks(V3 p, V3 v, int n);
 static void spawnSplash(V3 p, int n, float power = 1.f);
 static void popup(const std::string& s, Col c, float scale = 1.f, float life = 1.6f);
-struct AudioParams { float roll = 0, rollPitch = 1, rollSurf = 0, grind = 0, grindMetal = 1, water = 0, wind = 0; };
+// best scores, kept in the save file
+struct Records { long long bestScore = 0, bestSession = 0, bestCombo = 0; };
+static Records REC;
+static void saveGame();
+struct AudioParams { float roll = 0, rollPitch = 1, rollSurf = 0, grind = 0, grindMetal = 1, water = 0, wind = 0, rain = 0; };
 static AudioParams aud;
 
 // ----------------------------------------------------------------------------
@@ -2299,11 +3260,16 @@ struct Player {
         long long v = combo.value();
         score += v;
         if (score > best) best = score;
+        bool record = v > REC.bestCombo && v >= 1000;
+        if (v > REC.bestCombo) REC.bestCombo = v;
+        if (best > REC.bestScore) REC.bestScore = best;
+        saveGame();
         const char* word = v >= 50000 ? "INSANE!!" : v >= 15000 ? "SICK COMBO!" : v >= 5000 ? "SWEET!" : v >= 1500 ? "NICE!" : "LANDED";
         char buf[64];
         snprintf(buf, sizeof buf, "%s  +%lld", word, v);
         popup(buf, v >= 5000 ? hexc(0xffd23a) : hexc(0x7dff8a), v >= 5000 ? 1.35f : 1.1f, 2.0f);
         sfx(v >= 5000 ? SFX_BIGCOMBO : SFX_COMBO, 0.8f);
+        if (record) popup("NEW BEST COMBO!", hexc(0xff9ad8), 1.0f, 2.2f);
         combo.reset();
         gapDone.clear();
     }
@@ -2956,8 +3922,8 @@ static V3 ikJoint(V3 a, V3 target, float l1, float l2, V3 hint, V3& end) {
     return a + dn * x + hp * h;
 }
 
-// Draw a figure. M maps character space to world. Pose values are in character space (metres, unscaled).
-static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit& o) {
+// Blocky low-detail figure for distant pedestrians
+static void drawHumanLow(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit& o) {
     float s = o.height;
     auto W = [&](V3 v) { return xPoint(M, v); };
     auto WD = [&](V3 v) { return xDir(M, v); };
@@ -3023,6 +3989,103 @@ static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit&
     if (o.bag) {
         V3 bc = pel + left * (-0.26f * s) + V3(0, -0.1f * s, 0);
         mb.box(mBasis(WD(left), WD(V3(0, 1, 0)), WD(xDir(Rp, V3(-1, 0, 0))), W(bc)), V3(0.05f * s, 0.16f * s, 0.2f * s), o.bagCol, MAT_CLOTH);
+    }
+}
+
+// Draw a figure. M maps character space to world. Pose values are in character space (metres, unscaled).
+// Smooth capsule limbs, a shaped torso and a head with a face; 'lod' picks the blocky version.
+static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit& o, bool lod = false) {
+    if (lod) { drawHumanLow(mb, M, p, o); return; }
+    float s = o.height;
+    auto W = [&](V3 v) { return xPoint(M, v); };
+    auto WD = [&](V3 v) { return xDir(M, v); };
+    M4 Rp = mRotY(p.pelvisYaw);
+    V3 left = xDir(Rp, V3(0, 0, 1)), pfwd = xDir(Rp, V3(-1, 0, 0));
+    V3 pel = p.pelvis * s;
+    M4 Rt = mRotY(p.pelvisYaw + p.twist) * mRotZ(p.lean) * mRotX(p.side);
+    V3 tUp = xDir(Rt, V3(0, 1, 0)), tLeft = xDir(Rt, V3(0, 0, 1)), tFwd = xDir(Rt, V3(-1, 0, 0));
+    Col sole = hexc(0xefeee8), lace = shade(o.shoes, 0.8f);
+    // legs: thigh + shin capsules, chunky skate shoes
+    float thighR = (o.baggy ? 0.095f : 0.078f) * s, kneeR = (o.baggy ? 0.085f : 0.06f) * s, ankleR = (o.baggy ? 0.083f : 0.05f) * s;
+    for (int k = 0; k < 2; k++) {
+        float sg = k == 0 ? 1.f : -1.f;
+        V3 hip = pel + left * (0.1f * sg * s) - V3(0, 0.04f * s, 0);
+        V3 foot = (k == 0 ? p.footL : p.footR) * s;
+        V3 ankle = foot + V3(0, 0.08f * s, 0);
+        V3 end;
+        V3 hint = p.kneeHint + left * (0.25f * sg);
+        V3 knee = ikJoint(hip, ankle, 0.44f * s, 0.44f * s, hint, end);
+        mb.capsule(W(hip), W(knee), thighR, kneeR, WD(left), o.pants, MAT_CLOTH, 1.f, 0.6f);
+        mb.capsule(W(knee), W(end), kneeR * 0.97f, ankleR, WD(left), o.pants, MAT_CLOTH, 1.f, 0.6f);
+        float fy = k == 0 ? p.footYawL : p.footYawR;
+        V3 fdir(-std::cos(fy), 0, std::sin(fy));
+        V3 fside = cross(V3(0, 1, 0), fdir);
+        V3 fc = end + V3(0, -0.035f * s, 0) + fdir * (0.065f * s);
+        M4 SB = mBasis(WD(fside), WD(V3(0, 1, 0)), WD(fdir), W(fc));
+        // rounded upper, a sole that follows the same outline (no square corners), a tongue over the laces
+        mb.sphere(SB * mTranslate(V3(0, 0.014f * s, 0)), V3(0.06f * s, 0.05f * s, 0.138f * s), 12, 7, o.shoes, MAT_CLOTH);
+        mb.capsule(W(fc - fdir * (0.085f * s) + V3(0, -0.018f * s, 0)), W(fc + fdir * (0.085f * s) + V3(0, -0.018f * s, 0)),
+                   0.06f * s, 0.056f * s, WD(fside), sole, MAT_RUBBER, 0.3f, 1.f, 12);
+        mb.sphere(SB * mTranslate(V3(0, 0.05f * s, 0.03f * s)), V3(0.036f * s, 0.016f * s, 0.06f * s), 8, 4, lace, MAT_CLOTH);
+    }
+    // hips + torso
+    mb.sphere(mBasis(WD(left), WD(V3(0, 1, 0)), WD(pfwd), W(pel + V3(0, 0.01f * s, 0))), V3(0.185f * s, 0.12f * s, 0.125f * s), 10, 6, o.pants, MAT_CLOTH);
+    V3 waist = pel + tUp * (0.1f * s), chestTop = pel + tUp * (0.46f * s);
+    mb.capsule(W(waist), W(chestTop), 0.165f * s, 0.2f * s, WD(tLeft), o.shirt, MAT_CLOTH, 0.62f, 0.45f, 12);
+    mb.capsule(W(pel + tUp * (0.04f * s)), W(waist), 0.172f * s, 0.168f * s, WD(tLeft), shade(o.shirt, 0.93f), MAT_CLOTH, 0.66f, 0.3f, 12);   // shirt hem
+    V3 neck = pel + tUp * (0.56f * s);
+    // head
+    M4 Rh = Rt * mRotY(p.headYaw) * mRotZ(p.headPitch);
+    V3 hUp = xDir(Rh, V3(0, 1, 0)), hLeft = xDir(Rh, V3(0, 0, 1)), hFwd = xDir(Rh, V3(-1, 0, 0));
+    V3 headC = neck + hUp * (0.14f * s);
+    mb.capsule(W(neck - tUp * (0.07f * s)), W(neck + hUp * (0.06f * s)), 0.052f * s, 0.048f * s, WD(tLeft), o.skin, MAT_SKIN, 1.f, 0.5f, 8);
+    M4 HB = mBasis(WD(hLeft), WD(hUp), WD(hFwd), W(headC));
+    auto part = [&](V3 c, V3 r, Col col, uint8_t mat, int seg = 8, int rings = 5) { mb.sphere(HB * mTranslate(c * s), r * s, seg, rings, col, mat); };
+    part(V3(0, 0, 0), V3(0.094f, 0.115f, 0.104f), o.skin, MAT_SKIN, 12, 8);
+    part(V3(0, -0.06f, 0.035f), V3(0.075f, 0.05f, 0.07f), o.skin, MAT_SKIN);                  // jaw
+    part(V3(0, -0.005f, 0.103f), V3(0.016f, 0.026f, 0.022f), shade(o.skin, 0.95f), MAT_SKIN, 6, 4);   // nose
+    for (int e = -1; e <= 1; e += 2) {
+        part(V3(e * 0.036f, 0.022f, 0.093f), V3(0.014f, 0.01f, 0.008f), hexc(0x141210), MAT_PLAIN, 6, 3);        // eyes
+        part(V3(e * 0.038f, 0.047f, 0.096f), V3(0.02f, 0.005f, 0.006f), o.hair, MAT_CLOTH, 6, 3);                  // brows
+        part(V3(e * 0.095f, 0.0f, -0.005f), V3(0.016f, 0.03f, 0.022f), shade(o.skin, 0.92f), MAT_SKIN, 6, 4);    // ears
+    }
+    part(V3(0, -0.052f, 0.094f), V3(0.024f, 0.005f, 0.006f), shade(o.skin, 0.6f), MAT_SKIN, 6, 3);                 // mouth
+    if (o.hat_ == 0) {
+        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.1f, 0.112f), o.hair, MAT_CLOTH, 12, 7);
+    } else if (o.hat_ == 3) {
+        part(V3(0, 0.05f, -0.01f), V3(0.108f, 0.098f, 0.117f), o.hat, MAT_CLOTH, 12, 7);
+        mb.capsule(W(headC + hUp * (0.02f * s)), W(headC + hUp * (0.05f * s)), 0.108f * s, 0.108f * s, WD(hLeft), shade(o.hat, 0.85f), MAT_CLOTH, 1.08f, 0.1f, 12);
+    } else {
+        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.09f, 0.112f), o.hair, MAT_CLOTH, 10, 6);
+        part(V3(0, 0.062f, -0.004f), V3(0.107f, 0.075f, 0.116f), o.hat, MAT_CLOTH, 12, 7);
+        float bz = o.hat_ == 1 ? 0.14f : -0.14f;
+        part(V3(0, 0.07f, bz), V3(0.08f, 0.011f, 0.075f), shade(o.hat, 0.9f), MAT_CLOTH, 10, 3);
+    }
+    // arms: sleeve, forearm, hand
+    for (int k = 0; k < 2; k++) {
+        float sg = k == 0 ? 1.f : -1.f;
+        V3 sh = neck - tUp * (0.07f * s) + tLeft * (0.205f * sg * s);
+        V3 hand = (k == 0 ? p.handL : p.handR) * s;
+        V3 hint = k == 0 ? p.elbowHintL : p.elbowHintR;
+        V3 end;
+        V3 elbow = ikJoint(sh, hand, 0.29f * s, 0.27f * s, hint, end);
+        Col fore = o.longSleeves ? o.shirt : o.skin;
+        uint8_t foreMat = o.longSleeves ? MAT_CLOTH : MAT_SKIN;
+        if (o.longSleeves) mb.capsule(W(sh), W(elbow), 0.06f * s, 0.05f * s, WD(tFwd), o.shirt, MAT_CLOTH, 1.f, 0.8f, 8);
+        else {
+            V3 mid = lerp3(sh, elbow, 0.55f);
+            mb.capsule(W(sh), W(mid), 0.066f * s, 0.06f * s, WD(tFwd), o.shirt, MAT_CLOTH, 1.f, 0.8f, 8);
+            mb.capsule(W(mid - norm(elbow - sh) * (0.02f * s)), W(elbow), 0.045f * s, 0.042f * s, WD(tFwd), o.skin, MAT_SKIN, 1.f, 0.8f, 8);
+        }
+        mb.capsule(W(elbow), W(end), 0.043f * s, 0.034f * s, WD(tFwd), fore, foreMat, 1.f, 0.8f, 8);
+        V3 hd = norm(end - elbow);
+        V3 hs = norm(cross(hd, tUp));
+        mb.sphere(mBasis(WD(hs), WD(cross(hd, hs)), WD(hd), W(end + hd * (0.05f * s))), V3(0.03f * s, 0.042f * s, 0.055f * s), 8, 5, o.skin, MAT_SKIN);
+    }
+    if (o.bag) {
+        V3 bc = pel + left * (-0.26f * s) + V3(0, -0.1f * s, 0);
+        mb.capsule(W(bc - V3(0, 0.12f * s, 0)), W(bc + V3(0, 0.12f * s, 0)), 0.09f * s, 0.09f * s, WD(pfwd), o.bagCol, MAT_CLOTH, 0.5f, 0.5f, 8);
+        mb.capsule(W(bc + V3(0, 0.12f * s, 0)), W(neck + tLeft * (-0.12f * s)), 0.012f * s, 0.012f * s, WD(pfwd), shade(o.bagCol, 0.7f), MAT_CLOTH, 1.f, 1.f, 5);
     }
 }
 
@@ -3380,7 +4443,7 @@ static void drawNpcs(MeshBuilder& mb, V3 cam) {
             walkPose(p, 0, 0);
             p.handL = V3(-0.3f, 1.2f, 0.5f); p.handR = V3(-0.3f, 1.2f, -0.5f);
         } else walkPose(p, n.phase, n.speed);
-        drawHuman(mb, M, p, n.outfit);
+        drawHuman(mb, M, p, n.outfit, len(n.pos - cam) > 28.f);
     }
 }
 
@@ -3545,6 +4608,32 @@ static void drawSignals(MeshBuilder& mb) {
             mb.box(F * mTranslate(V3(0, 0.28f - i * 0.28f, 0.325f)), V3(0.09f, 0.09f, 0.01f), lamp[i], MAT_EMISSIVE);
     }
 }
+// car headlights / tail lights and the lit signal lamps, as light sources for the renderer
+static void updateDynLights() {
+    dynLights.clear();
+    for (auto& c : cars) {
+        const Lane& L = LANES[c.lane];
+        V3 fwd((float)L.dir, 0, 0), base(c.x, 0, L.z);
+        float half = c.type == 3 ? 2.6f : 2.45f;
+        PointLight h;
+        h.pos = base + fwd * (half + 0.3f) + V3(0, 0.75f, 0);
+        h.col = V3(1.f, 0.93f, 0.8f) * 70.f; h.radius = 28.f;
+        h.dir = norm(fwd + V3(0, -0.12f, 0)); h.cosOuter = 0.72f; h.cosInner = 0.9f; h.group = LG_CAR;
+        dynLights.push_back(h);
+        PointLight t;
+        t.pos = base - fwd * (half + 0.3f) + V3(0, 0.78f, 0);
+        t.col = V3(1.f, 0.08f, 0.04f) * (c.brake > 0.5f ? 6.f : 2.f); t.radius = 5.f; t.group = LG_CAR;
+        dynLights.push_back(t);
+    }
+    for (auto& t : tlights) {
+        int ph = t.axis == 0 ? ewPhase() : nsPhase();
+        PointLight l;
+        l.pos = t.pos + fwdYaw(t.yaw) * 0.5f + V3(0, ph == 2 ? 0.28f : (ph == 1 ? 0.f : -0.28f), 0);   // red top, green bottom
+        l.col = (ph == 2 ? V3(1.f, 0.12f, 0.06f) : (ph == 1 ? V3(1.f, 0.55f, 0.08f) : V3(0.15f, 1.f, 0.4f))) * 3.f;
+        l.radius = 7.f; l.dir = fwdYaw(t.yaw); l.cosOuter = -0.2f; l.cosInner = 0.3f; l.group = LG_SIGNAL;
+        dynLights.push_back(l);
+    }
+}
 static void drawLetters(MeshBuilder& mb, const Player& pl, float time) {
     static const char L[5] = {'S', 'K', 'A', 'T', 'E'};
     for (int i = 0; i < 5 && i < (int)letterPos.size(); i++) {
@@ -3566,11 +4655,13 @@ struct Particle {
     V3 p, v;
     float life = 1, maxLife = 1, size = 0.1f, grow = 0, drag = 0, grav = 9.8f;
     float r = 1, g = 1, b = 1, a = 1;
+    float glow = 10.f;          // HDR intensity of additive (emissive) particles
+    float streakLen = 0.f;      // > 0: stretched along the velocity (rain)
     bool additive = false, water = false;
 };
 static std::vector<Particle> parts;
 static Rng prng(2024);
-static void addParticle(const Particle& p) { if (parts.size() < 7000) parts.push_back(p); }
+static void addParticle(const Particle& p) { if (parts.size() < 20000) parts.push_back(p); }
 static V3 randDir() {
     for (;;) {
         V3 d(prng.range(-1, 1), prng.range(-1, 1), prng.range(-1, 1));
@@ -3615,6 +4706,23 @@ static void spawnSplash(V3 p, int n, float power) {
     }
 }
 
+// Rain: streaks falling in a cylinder around the camera, splashing where they land
+static void spawnRain(float dt, V3 cam, float amount) {
+    static float acc = 0;
+    acc += dt * 3600.f * amount;
+    while (acc >= 1.f) {
+        acc -= 1.f;
+        float a = prng.range(0, TAU), r = 26.f * std::sqrt(prng.f());
+        Particle q;
+        q.p = V3(cam.x + std::sin(a) * r, cam.y + prng.range(-2.f, 16.f), cam.z + std::cos(a) * r);
+        q.v = V3(1.4f + prng.range(-0.3f, 0.3f), -prng.range(10.5f, 12.5f), 0.6f);
+        q.life = q.maxLife = 2.2f;
+        q.size = 0.007f; q.streakLen = 0.013f; q.grav = 0.f; q.drag = 0.f;
+        q.r = 0.72f; q.g = 0.78f; q.b = 0.86f; q.a = 0.4f;
+        q.water = true;
+        addParticle(q);
+    }
+}
 static void updateParticles(float dt, V3 cam) {
     // emitters near the camera
     for (auto& e : emitters) {
@@ -3684,7 +4792,15 @@ static void updateParticles(float dt, V3 cam) {
                 if ((q.p.x - pool.x) * (q.p.x - pool.x) + (q.p.z - pool.z) * (q.p.z - pool.z) < pool.r * pool.r) gy = std::max(gy, SH + 0.38f);
             if (q.p.y < gy) {
                 dead = true;
-                if (prng.chance(0.08f)) {   // little bounce droplet
+                if (q.streakLen > 0) {      // raindrop: tiny crown splash
+                    if (prng.chance(0.35f)) {
+                        Particle s = q;
+                        s.streakLen = 0; s.p.y = gy + 0.02f; s.size = 0.018f; s.a = 0.35f;
+                        s.v = V3(prng.range(-0.5f, 0.5f), prng.range(0.5f, 1.1f), prng.range(-0.5f, 0.5f));
+                        s.grav = 9.8f; s.life = s.maxLife = 0.18f; s.water = false;
+                        spawned.push_back(s);
+                    }
+                } else if (prng.chance(0.08f)) {   // little bounce droplet
                     Particle s = q;
                     s.p.y = gy + 0.02f; s.v = V3(prng.range(-0.6f, 0.6f), prng.range(0.6f, 1.4f), prng.range(-0.6f, 0.6f));
                     s.life = s.maxLife = 0.3f; s.size *= 0.7f; s.water = false;
@@ -3698,21 +4814,30 @@ static void updateParticles(float dt, V3 cam) {
     for (const Particle& s : spawned) addParticle(s);
 }
 
-// Particle vertex: pos3, uv2, rgba4 (premultiplied; alpha 0 = additive)
+// Particle vertex: pos3, uv2, rgba4 (colour is sRGB; alpha < 0 marks an emissive particle of intensity -alpha)
 static std::vector<float> partVerts;
 static std::vector<uint32_t> partIdx;
-static void buildParticleMesh(V3 camRight, V3 camUp) {
+static void buildParticleMesh(V3 camRight, V3 camUp, V3 camFwd) {
     partVerts.clear();
     partIdx.clear();
     for (auto& q : parts) {
         float fade = sat(q.life / q.maxLife * 3.f) * sat((q.maxLife - q.life) * 12.f + 0.3f);
         float a = q.a * fade;
-        float r = q.r * a, g = q.g * a, b = q.b * a, oa = q.additive ? 0.f : a;
+        if (a <= 0.002f) continue;
+        float oa = q.additive ? -a * q.glow : a;
         V3 R = camRight * q.size, U = camUp * q.size;
+        if (q.streakLen > 0) {   // stretched along the motion, facing the camera
+            float sp = len(q.v);
+            V3 dir = sp > 1e-3f ? q.v / sp : V3(0, -1, 0);
+            V3 side = cross(dir, camFwd);
+            float sl = len(side);
+            R = (sl > 1e-4f ? side / sl : camRight) * q.size;
+            U = dir * (q.size + sp * q.streakLen);
+        }
         V3 c[4] = {q.p - R - U, q.p + R - U, q.p + R + U, q.p - R + U};
         float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
         uint32_t base = (uint32_t)(partVerts.size() / 9);
-        for (int k = 0; k < 4; k++) partVerts.insert(partVerts.end(), {c[k].x, c[k].y, c[k].z, uv[k][0], uv[k][1], r, g, b, oa});
+        for (int k = 0; k < 4; k++) partVerts.insert(partVerts.end(), {c[k].x, c[k].y, c[k].z, uv[k][0], uv[k][1], q.r, q.g, q.b, oa});
         partIdx.insert(partIdx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
     }
 }
@@ -3725,6 +4850,7 @@ static const int AR = 44100;
 static std::vector<float> sfxBuf[SFX_COUNT];
 struct Voice { int id = -1; double pos = 0; float rate = 1, vol = 1; };
 static Voice voices[32];
+static float sfxVolume = 1.f;
 static SDL_AudioDeviceID audioDev = 0;
 static bool musicOn = true, audioMuted = false;
 
@@ -3905,14 +5031,14 @@ static void sfx(int id, float vol, float pitch) {
     voices[best].id = id;
     voices[best].pos = 0;
     voices[best].rate = pitch;
-    voices[best].vol = vol;
+    voices[best].vol = vol * sfxVolume;
     SDL_UnlockAudioDevice(audioDev);
 }
 
 // --- live synthesis state (audio thread only) ---
 struct LiveState {
-    float roll = 0, grind = 0, wind = 0, water = 0, metal = 0;
-    OnePole rollLp1, rollLp2, ambLp, windLp, waterLp;
+    float roll = 0, grind = 0, wind = 0, water = 0, metal = 0, rain = 0;
+    OnePole rollLp1, rollLp2, ambLp, windLp, waterLp, rainLp, rainLp2;
     SVF grindBp, grindBp2, windBp;
     double t = 0;
     // music
@@ -3970,6 +5096,7 @@ static void audioCallback(void*, Uint8* stream, int bytes) {
         LS.grind += (aud.grind - LS.grind) * 0.004f;
         LS.wind += (aud.wind - LS.wind) * 0.0005f;
         LS.water += (aud.water - LS.water) * 0.0005f;
+        LS.rain += (aud.rain - LS.rain) * 0.0002f;
         LS.metal += (aud.grindMetal - LS.metal) * 0.002f;
         float n = anoise();
         if (LS.roll > 0.001f) {
@@ -3986,6 +5113,11 @@ static void audioCallback(void*, Uint8* stream, int bytes) {
         }
         if (LS.wind > 0.001f) mix += LS.windBp.bp(n, 500.f, 0.9f) * LS.wind * 0.35f;
         if (LS.water > 0.001f) { float lo = LS.waterLp.lp(n, lpA(1800)); mix += (n - lo) * LS.water * 0.18f; }
+        if (LS.rain > 0.001f) {   // steady hiss of rain on asphalt plus heavier drops
+            float hiss = n - LS.rainLp.lp(n, lpA(900));
+            float drop = anoise() > 0.9975f ? anoise() : 0.f;
+            mix += (LS.rainLp2.lp(hiss, lpA(7000)) * 0.22f + drop * 0.35f) * LS.rain;
+        }
         mix += LS.ambLp.lp(n, lpA(140)) * 0.06f;   // distant traffic rumble
         // music
         if (musicOn) {
@@ -4138,8 +5270,11 @@ static const char* HELP_LINES[] = {
     "GRABS: - INDY  A MELON  D METHOD  W NOSE  S TAIL",
     "GRINDS: - 50-50  A BOARDSLIDE  W NOSEGRIND  S 5-0",
     "",
-    "R RESET  V CAMERA  M MUSIC  T 2-MIN SESSION",
-    "H HIDE HELP   ESC PAUSE   F11 FULLSCREEN",
+    "R RESET  V CAMERA  N TIME OF DAY  T 2-MIN SESSION",
+    "H HIDE HELP   ESC MENU   F11 FULLSCREEN",
+    "",
+    "GAMEPAD: STICK/DPAD MOVE  A OLLIE  X FLIP  B GRAB",
+    "  Y GRIND  LB/RB MANUAL  START MENU  BACK CAMERA",
 };
 
 static float helpPanelW(float sc) { return 52 * 6 * sc + 24 * hud.U; }
@@ -4279,7 +5414,7 @@ static void drawGameHud(const Player& pl, float time, float sessionLeft, bool se
     char sb[48];
     snprintf(sb, sizeof sb, "%d MPH", (int)(len(pl.vel) * 2.237f + 0.5f));
     hud.text(24 * U, hud.H - 30 * U, 2 * U, sb, Col(220, 220, 220), 0.8f);
-    if (!showHelp) hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, "H: CONTROLS / TRICK LIST   M: MUSIC   V: CAMERA   ESC: PAUSE", Col(220, 220, 220), 0.75f, 2);
+    if (!showHelp) hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, "H: CONTROLS / TRICKS   N: TIME OF DAY   V: CAMERA   ESC: MENU", Col(220, 220, 220), 0.75f, 2);
     else hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, helpPage == 1 ? "H: TRICK LIST" : "H: HIDE", hexc(0xffd23a), 0.9f, 2);
     if (helpPage == 1 && helpAlpha > 0.01f) drawHelpPanel(20 * U, 110 * U, helpAlpha, 1.5f);
     if (helpPage == 2 && helpAlpha > 0.01f) drawTrickPanel(20 * U, 110 * U, helpAlpha);
@@ -4288,25 +5423,17 @@ static void drawGameHud(const Player& pl, float time, float sessionLeft, bool se
 
 static void drawTitle(float time) {
     float U = hud.U;
-    hud.rect(0, 0, hud.W, hud.H, Col(0, 0, 0), 0.25f);
-    float y = hud.H * 0.16f;
+    hud.rect(0, 0, hud.W, hud.H, Col(0, 0, 0), 0.22f);
+    float y = hud.H * 0.1f;
     float wob = std::sin(time * 2.f) * 3 * U;
     hud.text(hud.W * 0.5f + 5 * U, y + 5 * U + wob, 10 * U, "CONCRETE JUNGLE", hexc(0xc01e1e), 1, 1, false);
     hud.text(hud.W * 0.5f, y + wob, 10 * U, "CONCRETE JUNGLE", hexc(0xffd23a), 1, 1, false);
     hud.text(hud.W * 0.5f, y + 86 * U, 2.5f * U, "NEW YORK CITY STREET SKATING", Col(255, 255, 255), 1, 1);
-    bool blink = std::fmod(time, 1.f) < 0.65f;
-    hud.text(hud.W * 0.5f, hud.H * 0.42f, 3 * U, "PRESS ENTER TO FREE SKATE", blink ? Col(255, 255, 255) : Col(200, 200, 200), 1, 1);
-    hud.text(hud.W * 0.5f, hud.H * 0.42f + 34 * U, 2.5f * U, "T - 2 MINUTE SESSION (HIGH SCORE)", Col(230, 230, 230), 1, 1);
-    hud.text(hud.W * 0.5f, hud.H * 0.42f + 60 * U, 2 * U, "ESC - QUIT", Col(200, 200, 200), 0.9f, 1);
-    drawHelpPanel(hud.W * 0.5f - helpPanelW(1.5f * U) / 2, hud.H * 0.55f, 1, 1.5f);
+    std::string rec = "BEST SCORE " + fmtNum(REC.bestScore) + "     BEST COMBO " + fmtNum(REC.bestCombo) + "     SESSION RECORD " + fmtNum(REC.bestSession);
+    hud.text(hud.W * 0.5f, hud.H - 76 * U, 2 * U, rec, Col(230, 230, 230), 0.95f, 1);
+    hud.text(hud.W * 0.5f, hud.H - 44 * U, 1.5f * U, "ARROWS / STICK  SELECT     ENTER / A  OK     ESC / B  BACK     F11  FULLSCREEN", Col(200, 200, 200), 0.85f, 1);
 }
-static void drawPause() {
-    float U = hud.U;
-    hud.rect(0, 0, hud.W, hud.H, Col(0, 0, 0), 0.5f);
-    hud.text(hud.W * 0.5f, hud.H * 0.14f, 7 * U, "PAUSED", hexc(0xffd23a), 1, 1);
-    hud.text(hud.W * 0.5f, hud.H * 0.14f + 64 * U, 2 * U, "ESC RESUME    Q QUIT TO TITLE    R RESET SKATER", Col(240, 240, 240), 1, 1);
-    drawTrickPanel(hud.W * 0.5f - (90 * 6 * 1.5f * U + 24 * U) / 2, hud.H * 0.3f, 1);
-}
+static void drawPause() { hud.rect(0, 0, hud.W, hud.H, Col(0, 0, 0), 0.5f); }
 static void drawResults(long long score, long long best, bool newBest, float time) {
     float U = hud.U;
     hud.rect(0, 0, hud.W, hud.H, Col(0, 0, 0), 0.55f);
@@ -4319,41 +5446,294 @@ static void drawResults(long long score, long long best, bool newBest, float tim
 }
 
 // ----------------------------------------------------------------------------
-// Renderer
+// Time of day. The same single-scattering atmosphere the sky shader bakes is
+// evaluated here to derive sun colour, sky ambient and fog for each preset.
 // ----------------------------------------------------------------------------
+struct TimeOfDay {
+    const char* name;
+    float sunElev, sunAz, moonElev, moonAz;    // degrees; azimuth measured from +Z towards +X
+    float cloud, fog, fogFall, fogSun, sunSize;
+    float exposure, bloom, litFrac, emit, lamps, wet, rain, stars;
+    V3 wb; float sat, contrast; V3 lift;
+};
+static const TimeOfDay TODS[] = {
+    // name           sun el/az   moon el/az   cloud  fog     fall   fogSun size    expo  bloom lit   emit lamps wet rain stars  white balance              sat    con   lift
+    {"GOLDEN HOUR",   16, -46,    -30, 120,    0.40f, 0.0022f, 0.030f, 0.55f, 0.012f, 0.68f, 0.05f, 0.14f, 1.2f, 0.f, 0, 0, 0, V3(1.03f, 1.0f, 0.95f), 1.06f, 1.04f, V3(0.012f, 0.008f, 0.0f)},
+    {"MIDDAY",        62, -30,    -30, 120,    0.30f, 0.0016f, 0.030f, 0.35f, 0.010f, 0.36f, 0.04f, 0.08f, 1.0f, 0.f, 0, 0, 0, V3(1.0f, 1.0f, 1.0f),    1.04f, 1.05f, V3(0.0f, 0.004f, 0.01f)},
+    {"SUNSET",        3.2f, -54,  -30, 120,    0.50f, 0.0045f, 0.025f, 0.8f,  0.016f, 1.35f, 0.06f, 0.32f, 1.8f, 0.45f, 0, 0, 0, V3(1.04f, 0.98f, 0.93f), 1.1f, 1.05f, V3(0.02f, 0.01f, 0.02f)},
+    {"NIGHT",         -24, -46,   36, 150,     0.28f, 0.0040f, 0.035f, 0.5f,  0.02f,  5.0f,  0.08f, 0.5f,  0.6f, 0.5f, 0, 0, 1, V3(0.95f, 0.98f, 1.06f), 1.1f, 1.06f, V3(0.004f, 0.008f, 0.02f)},
+    {"RAINY NIGHT",   -24, -46,   36, 150,     0.96f, 0.0110f, 0.030f, 0.4f,  0.06f,  5.5f,  0.09f, 0.55f, 0.6f, 0.5f, 1, 1, 0, V3(0.95f, 0.98f, 1.05f), 1.05f, 1.07f, V3(0.004f, 0.01f, 0.02f)},
+};
+static const int NUM_TODS = (int)(sizeof(TODS) / sizeof(TODS[0]));
+
 struct Lighting {
-    V3 sunDir = norm(V3(-0.62f, 0.5f, 0.6f));
-    V3 sunCol = V3(1.38f, 1.14f, 0.86f);
-    V3 skyTop = V3(0.3f, 0.48f, 0.76f), skyHorizon = V3(0.86f, 0.79f, 0.68f);
-    V3 groundCol = V3(0.36f, 0.32f, 0.28f), fogCol = V3(0.78f, 0.74f, 0.68f);
-    float fogDensity = 0.0042f;
+    int tod = -1;
+    V3 sunDir = norm(V3(-0.62f, 0.5f, 0.6f)), sunCol, sunPos, sunDisc, moonDir, moonDisc;
+    V3 skyUp, groundCol, fogCol, glow, cloudLight, atmoSun, atmoMoon;
+    float atmoSunI = 0, atmoMoonI = 0;
+    float fogDensity = 0.003f, fogFall = 0.03f, fogSun = 0.5f, night = 0, wet = 0, litFrac = 0.15f, emit = 1, lamps = 0;
+    float cloud = 0.4f, sunSize = 0.012f, exposure = 0.6f, bloom = 0.05f, stars = 0, rain = 0;
+    V3 wb = V3(1, 1, 1), lift; float sat = 1, contrast = 1;
 };
 static Lighting LIGHT;
 
+namespace atmo {
+static const double RE = 6360e3, RA = 6420e3, HR = 7994.0, HM = 1200.0, BM = 21e-6;
+static const double BR[3] = {5.8e-6, 13.5e-6, 33.1e-6};
+static double sphFar(const double* o, const double* d, double r) {
+    double b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2], c = o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - r * r, h = b * b - c;
+    return h < 0 ? -1 : -b + std::sqrt(h);
+}
+static bool hitsGround(const double* o, const double* d) {
+    double b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2], c = o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - RE * RE;
+    return b < 0 && b * b - c > 0;
+}
+static double height(const double* p) { return std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) - RE; }
+// single-scattered sky radiance in direction d for a light of intensity I in direction s (matches SKYLUT_FS)
+static V3 scatter(V3 dv, V3 sv, float I) {
+    if (I <= 0) return V3(0, 0, 0);
+    double o[3] = {0, RE + 2, 0}, d[3] = {dv.x, std::max(dv.y, 0.002f), dv.z}, s[3] = {sv.x, sv.y, sv.z};
+    double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    for (double& x : d) x /= dl;
+    double ds = sphFar(o, d, RA) / 16.0, mu = d[0] * s[0] + d[1] * s[1] + d[2] * s[2];
+    double pR = 3.0 / (16.0 * PI) * (1 + mu * mu), g = 0.76, g2 = g * g;
+    double pM = 3.0 / (8.0 * PI) * ((1 - g2) * (1 + mu * mu)) / ((2 + g2) * std::pow(1 + g2 - 2 * g * mu, 1.5));
+    double odR = 0, odM = 0, sR[3] = {0, 0, 0}, sM[3] = {0, 0, 0};
+    for (int i = 0; i < 16; i++) {
+        double p[3] = {o[0] + d[0] * ds * (i + 0.5), o[1] + d[1] * ds * (i + 0.5), o[2] + d[2] * ds * (i + 0.5)};
+        double h = height(p), hr = std::exp(-h / HR) * ds, hm = std::exp(-h / HM) * ds;
+        odR += hr; odM += hm;
+        if (hitsGround(p, s)) continue;
+        double dls = sphFar(p, s, RA) / 8.0, lR = 0, lM = 0;
+        for (int j = 0; j < 8; j++) {
+            double q[3] = {p[0] + s[0] * dls * (j + 0.5), p[1] + s[1] * dls * (j + 0.5), p[2] + s[2] * dls * (j + 0.5)};
+            double hq = height(q);
+            lR += std::exp(-hq / HR) * dls; lM += std::exp(-hq / HM) * dls;
+        }
+        for (int k = 0; k < 3; k++) {
+            double att = std::exp(-(BR[k] * (odR + lR) + BM * 1.1 * (odM + lM)));
+            sR[k] += att * hr; sM[k] += att * hm;
+        }
+    }
+    double r[3];
+    for (int k = 0; k < 3; k++) r[k] = I * (sR[k] * BR[k] * pR + sM[k] * BM * pM);
+    return V3((float)r[0], (float)r[1], (float)r[2]);
+}
+// transmittance from the street towards direction s
+static V3 transmittance(V3 sv) {
+    double o[3] = {0, RE + 2, 0}, s[3] = {sv.x, sv.y, sv.z};
+    if (hitsGround(o, s)) return V3(0, 0, 0);
+    double L = sphFar(o, s, RA), ds = L / 48.0, odR = 0, odM = 0;
+    for (int i = 0; i < 48; i++) {
+        double p[3] = {o[0] + s[0] * ds * (i + 0.5), o[1] + s[1] * ds * (i + 0.5), o[2] + s[2] * ds * (i + 0.5)};
+        double h = height(p);
+        odR += std::exp(-h / HR) * ds; odM += std::exp(-h / HM) * ds;
+    }
+    return V3((float)std::exp(-(BR[0] * odR + BM * 1.1 * odM)), (float)std::exp(-(BR[1] * odR + BM * 1.1 * odM)),
+              (float)std::exp(-(BR[2] * odR + BM * 1.1 * odM)));
+}
+}  // namespace atmo
+
+static V3 dirFromAngles(float elevDeg, float azDeg) {
+    float e = elevDeg * PI / 180.f, a = azDeg * PI / 180.f;
+    return V3(std::sin(a) * std::cos(e), std::sin(e), std::cos(a) * std::cos(e));
+}
+static float lumaOf(V3 c) { return c.x * 0.2126f + c.y * 0.7152f + c.z * 0.0722f; }
+
+static void applyTimeOfDay(int idx) {
+    idx = ((idx % NUM_TODS) + NUM_TODS) % NUM_TODS;
+    const TimeOfDay& t = TODS[idx];
+    Lighting& L = LIGHT;
+    L.tod = idx;
+    const float SUN_I = 20.f, MOON_I = 0.07f;
+    const V3 MOON_TINT(0.7f, 0.82f, 1.0f);
+    V3 sun = dirFromAngles(t.sunElev, t.sunAz), moon = dirFromAngles(t.moonElev, t.moonAz);
+    L.sunPos = sun; L.moonDir = moon;
+    L.atmoSun = sun; L.atmoSunI = t.sunElev > -14 ? SUN_I : 0.f;
+    L.atmoMoon = moon; L.atmoMoonI = t.moonElev > 0 ? MOON_I * 3.f : 0.f;   // brighter than physical: a readable deep-blue night sky
+    L.night = sat((2.f - t.sunElev) / 10.f);
+    L.glow = V3(0.03f, 0.021f, 0.015f) * (L.night * (1.f + t.cloud * 2.f));   // city light pollution
+    float overcast = sat((t.cloud - 0.6f) / 0.35f);
+    bool useSun = t.sunElev > -1.5f;
+    V3 Tsun = atmo::transmittance(sun), Tmoon = atmo::transmittance(moon);
+    V3 direct = useSun ? Tsun * SUN_I : mulv(Tmoon * MOON_I, MOON_TINT);
+    L.sunDir = useSun ? sun : moon;
+    L.cloudLight = direct * (1.f / PI) * (1.f - 0.6f * overcast);
+    L.sunCol = direct * ((1.f - 0.9f * overcast) / PI);
+    // sky irradiance on an upward surface and the average horizon radiance
+    V3 E(0, 0, 0), horizon(0, 0, 0);
+    const int NA = 16, NE = 8;
+    for (int i = 0; i < NE; i++)
+        for (int j = 0; j < NA; j++) {
+            float el = (i + 0.5f) / NE * PI * 0.5f, az = (j + 0.5f) / NA * TAU;
+            V3 d(std::sin(az) * std::cos(el), std::sin(el), std::cos(az) * std::cos(el));
+            V3 Ls = atmo::scatter(d, sun, L.atmoSunI) + mulv(atmo::scatter(d, moon, L.atmoMoonI), MOON_TINT) + L.glow * std::pow(1.f - d.y, 5.f);
+            E += Ls * (std::sin(el) * std::cos(el) * (PI * 0.5f / NE) * (TAU / NA));
+            if (i == 0) horizon += Ls / (float)NA;
+        }
+    V3 skyUp = E * (2.0f / PI);   // x2: single scattering misses roughly half of the real sky light
+    V3 grey = V3(1, 1, 1) * lumaOf(skyUp + direct * (0.12f / PI));
+    L.skyUp = lerp3(skyUp, mulv(grey, V3(0.95f, 0.98f, 1.04f)), overcast * 0.8f) * (1.f + 0.25f * t.cloud * (1.f - overcast));
+    L.groundCol = (L.skyUp * 0.5f + L.sunCol * std::max(L.sunDir.y, 0.f)) * 0.2f;
+    L.fogCol = lerp3(horizon * 0.3f + L.skyUp * 0.6f, L.skyUp * 1.1f, overcast * 0.7f);
+    L.sunDisc = (useSun && sun.y > -0.02f) ? Tsun * (SUN_I / 3.46e-4f) * (1.f - overcast) : V3(0, 0, 0);
+    float sd = std::max({L.sunDisc.x, L.sunDisc.y, L.sunDisc.z});
+    if (sd > 20000.f) L.sunDisc = L.sunDisc * (20000.f / sd);
+    L.moonDisc = t.moonElev > 0 ? V3(0.95f, 0.96f, 1.0f) * (1.4f * (1.f - overcast)) : V3(0, 0, 0);
+    L.fogDensity = t.fog; L.fogFall = t.fogFall; L.fogSun = t.fogSun;
+    L.wet = t.wet; L.rain = t.rain; L.litFrac = t.litFrac; L.emit = t.emit; L.lamps = t.lamps;
+    L.cloud = t.cloud; L.sunSize = t.sunSize; L.exposure = t.exposure; L.bloom = t.bloom; L.stars = t.stars;
+    L.wb = t.wb; L.sat = t.sat; L.contrast = t.contrast; L.lift = t.lift;
+    if (getenv("CJ_DEBUG_LIGHT"))
+        fprintf(stderr, "TOD %s: sunCol %.3f %.3f %.3f  skyUp %.3f %.3f %.3f  ground %.3f %.3f %.3f  fog %.3f %.3f %.3f  sunDir %.2f %.2f %.2f\n", t.name,
+                L.sunCol.x, L.sunCol.y, L.sunCol.z, L.skyUp.x, L.skyUp.y, L.skyUp.z, L.groundCol.x, L.groundCol.y, L.groundCol.z,
+                L.fogCol.x, L.fogCol.y, L.fogCol.z, L.sunDir.x, L.sunDir.y, L.sunDir.z);
+}
+
+// ----------------------------------------------------------------------------
+// Graphics settings
+// ----------------------------------------------------------------------------
+struct Quality { const char* name; float scale; int shadowRes, shadowQ, ssao, ssr, fogSteps, fogLights, motion, lights; };
+static const Quality QUALITY[4] = {
+    {"LOW", 0.75f, 1024, 0, 0, 0, 0, 0, 0, 16},
+    {"MEDIUM", 1.0f, 2048, 1, 8, 0, 16, 0, 0, 32},
+    {"HIGH", 1.0f, 2048, 2, 12, 32, 24, 8, 1, MAX_LIGHTS},
+    {"ULTRA", -1.0f, 4096, 2, 16, 56, 40, 16, 1, MAX_LIGHTS},   // scale -1: supersample up to 2x2
+};
+struct Settings {
+    int quality = 3, tod = 0;
+    float musicVol = 0.6f, sfxVol = 1.0f, scaleOverride = 0.f;
+    bool motionBlur = true, filmGrain = true, showFps = false, fullscreen = false;
+};
+static Settings SET;
+
+static float renderScale(int W, int H) {
+    if (SET.scaleOverride > 0) return SET.scaleOverride;
+    float s = QUALITY[SET.quality].scale;
+    if (s > 0) return s;
+    return clampf(std::sqrt(3840.f * 2160.f * 2.f / std::max(1.f, (float)W * H)), 1.f, 2.f);
+}
+
+// Pick the strongest lights around the camera for this frame
+static void gatherLights(V3 cam, V3 camFwd, int maxLights) {
+    frameLights.clear();
+    if (LIGHT.lamps <= 0.f) return;
+    std::vector<std::pair<float, PointLight>> cand;
+    auto consider = [&](const PointLight& l) {
+        V3 d = l.pos - cam;
+        float dist = len(d);
+        if (dist > 120.f) return;
+        if (dot(d, camFwd) < -(l.radius + 4.f)) return;    // behind the camera and out of reach of anything visible
+        PointLight c = l;
+        c.col = l.col * (LIGHT.lamps * (1.f - smooth01((dist - 85.f) / 35.f)));
+        float bright = std::max({c.col.x, c.col.y, c.col.z});
+        cand.push_back({bright * l.radius * l.radius / (dist * dist + l.radius * l.radius), c});
+    };
+    for (const PointLight& l : staticLights) consider(l);
+    for (const PointLight& l : dynLights) consider(l);
+    size_t n = std::min(cand.size(), (size_t)maxLights);
+    std::partial_sort(cand.begin(), cand.begin() + n, cand.end(), [](const std::pair<float, PointLight>& a, const std::pair<float, PointLight>& b) { return a.first > b.first; });
+    for (size_t i = 0; i < n; i++) frameLights.push_back(cand[i].second);
+}
+
+// ----------------------------------------------------------------------------
+// Renderer: HDR pipeline.
+//   sky bake -> 4 shadow cascades -> depth/normal prepass -> SSAO -> planar river reflection
+//   -> forward PBR pass (+ sky) -> SSR -> water -> volumetric fog -> particles -> bloom
+//   -> resolve (supersampling / motion blur) + ACES tonemap -> FXAA, film grain -> HUD
+// ----------------------------------------------------------------------------
+enum TexUnit { TU_SHADOWCMP = 0, TU_SHADOWRAW, TU_SKYENV, TU_A, TU_B, TU_C, TU_D, TU_E };
+static const int SKY_W = 256, SKY_H = 128, NUM_CASC = 4;
+static const float CAM_NEAR = 0.1f, CAM_FAR = 1500.f;
+
 struct Renderer {
-    GLuint pWorld = 0, pShadow = 0, pSky = 0, pWater = 0, pPart = 0, pHud = 0;
+    GLuint pWorld = 0, pPre = 0, pShadow = 0, pSky = 0, pSkyLut = 0, pWater = 0, pPart = 0, pHud = 0;
+    GLuint pSSAO = 0, pAOBlur = 0, pSSR = 0, pFog = 0, pFogApply = 0, pBloomDown = 0, pBloomUp = 0, pComposite = 0, pFinal = 0;
     GpuMesh staticMesh, dynMesh, waterMesh;
-    GLuint shadowFbo = 0, shadowTex = 0;
-    int shadowRes = 2048;
-    GLuint reflFbo = 0, reflTex = 0, reflDepth = 0;
-    int reflW = 0, reflH = 0;
+    // cascaded shadow map
+    GLuint shadowTex = 0, shadowFbo = 0, sampCmp = 0, sampRaw = 0;
+    int shadowRes = 0;
+    M4 cascVP[NUM_CASC];
+    float cascSplit[4] = {}, cascWorld[4] = {}, cascDepth[4] = {};
+    // sky environment (lat-long): atmosphere only, and atmosphere + clouds with mips for reflections
+    GLuint skyAtmo = 0, skyEnv = 0, skyFbo = 0;
+    // screen targets: internal resolution iw x ih (supersampled), output ow x oh
+    int ow = 0, oh = 0, iw = 0, ih = 0, targetQuality = -1;
+    float targetScale = 0;
+    bool targetShot = false;
+    GLuint depth = 0, nrm = 0, hdr0 = 0, reflInfo = 0, surf = 0, hdr1 = 0, depthCopy = 0, whiteTex = 0;
+    GLuint fboPre = 0, fboMain = 0, fboHdr1D = 0, fboHdr1 = 0, fboDepthCopy = 0;
+    int aw = 0, ah = 0, fw = 0, fh = 0, pw = 0, ph = 0, nBloom = 0;
+    GLuint ao[2] = {0, 0}, fboAo[2] = {0, 0}, fog = 0, fboFog = 0;
+    GLuint bloom[8] = {}, fboBloom[8] = {};
+    int bw[8] = {}, bh[8] = {};
+    GLuint ldr = 0, fboLdr = 0, planar = 0, planarDepth = 0, fboPlanar = 0;
+    GLuint outFbo = 0, outTex = 0;   // offscreen final image (screenshot mode)
+    std::vector<GLuint> ownedTex, ownedFbo;
+    // streamed geometry
     GLuint partVao = 0, partVbo = 0, partEbo = 0, hudVao = 0, hudVbo = 0, hudEbo = 0, fontTex = 0, emptyVao = 0;
     size_t partVCap = 0, partICap = 0, hudVCap = 0, hudICap = 0;
-    GLuint mainFbo = 0, mainTex = 0, mainDepth = 0;   // offscreen target (screenshot mode only)
+    M4 prevVP;
+    bool havePrev = false;
 };
 static Renderer RD;
 
 static GLint U_(GLuint p, const char* n) { return gl.GetUniformLocation(p, n); }
 static void setMat(GLuint p, const char* n, const M4& m) { gl.UniformMatrix4fv(U_(p, n), 1, GL_FALSE, m.m); }
 static void set3(GLuint p, const char* n, V3 v) { gl.Uniform3f(U_(p, n), v.x, v.y, v.z); }
+static void set1f(GLuint p, const char* n, float v) { gl.Uniform1f(U_(p, n), v); }
+static void set1i(GLuint p, const char* n, int v) { gl.Uniform1i(U_(p, n), v); }
+static void set2f(GLuint p, const char* n, float a, float b) { gl.Uniform2f(U_(p, n), a, b); }
+static void set4f(GLuint p, const char* n, const float* v) { gl.Uniform4f(U_(p, n), v[0], v[1], v[2], v[3]); }
+static void bindTex(int unit, GLenum target, GLuint tex, GLuint sampler = 0) {
+    gl.ActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(target, tex);
+    gl.BindSampler(unit, sampler);
+}
+static void bindTexU(GLuint p, const char* name, int unit, GLuint tex) {
+    bindTex(unit, GL_TEXTURE_2D, tex);
+    set1i(p, name, unit);
+}
+
 static void setCommon(GLuint p, V3 cam, float time) {
     gl.UseProgram(p);
     set3(p, "uSunDir", LIGHT.sunDir); set3(p, "uSunCol", LIGHT.sunCol);
-    set3(p, "uSkyTop", LIGHT.skyTop); set3(p, "uSkyHorizon", LIGHT.skyHorizon);
-    set3(p, "uGroundCol", LIGHT.groundCol); set3(p, "uFogCol", LIGHT.fogCol);
-    set3(p, "uCamPos", cam);
-    gl.Uniform1f(U_(p, "uTime"), time);
-    gl.Uniform1f(U_(p, "uFogDensity"), LIGHT.fogDensity);
+    set3(p, "uSkyUp", LIGHT.skyUp); set3(p, "uGroundCol", LIGHT.groundCol); set3(p, "uFogCol", LIGHT.fogCol);
+    set3(p, "uCamPos", cam); set1f(p, "uTime", time);
+    set1f(p, "uFogDensity", LIGHT.fogDensity); set1f(p, "uFogFall", LIGHT.fogFall); set1f(p, "uFogSun", LIGHT.fogSun);
+    set1f(p, "uNight", LIGHT.night); set1f(p, "uWet", LIGHT.wet); set1f(p, "uLitFrac", LIGHT.litFrac);
+    set1f(p, "uEmit", LIGHT.emit); set1f(p, "uCloud", LIGHT.cloud); set3(p, "uCloudLight", LIGHT.cloudLight);
+    bindTexU(p, "uSkyEnv", TU_SKYENV, RD.skyEnv);
+}
+static void setShadowUniforms(GLuint p, V3 camFwd, int quality) {
+    bindTex(TU_SHADOWCMP, GL_TEXTURE_2D_ARRAY, RD.shadowTex, RD.sampCmp);
+    bindTex(TU_SHADOWRAW, GL_TEXTURE_2D_ARRAY, RD.shadowTex, RD.sampRaw);
+    set1i(p, "uShadowCmp", TU_SHADOWCMP); set1i(p, "uShadowRaw", TU_SHADOWRAW);
+    gl.UniformMatrix4fv(U_(p, "uCascVP"), NUM_CASC, GL_FALSE, RD.cascVP[0].m);
+    set4f(p, "uCascSplit", RD.cascSplit); set4f(p, "uCascWorld", RD.cascWorld); set4f(p, "uCascDepth", RD.cascDepth);
+    set1i(p, "uNumCasc", NUM_CASC); set1i(p, "uShadowQ", quality);
+    set1f(p, "uShadowTexel", 1.f / RD.shadowRes); set1f(p, "uSunSize", LIGHT.sunSize); set3(p, "uCamFwd", camFwd);
+}
+static void setLightUniforms(GLuint p) {
+    int n = (int)frameLights.size();
+    std::vector<float> pos(4 * MAX_LIGHTS, 0.f), col(4 * MAX_LIGHTS, 0.f), dir(4 * MAX_LIGHTS, 0.f);
+    for (int i = 0; i < n; i++) {
+        const PointLight& l = frameLights[i];
+        float* P = &pos[4 * i]; float* C = &col[4 * i]; float* D = &dir[4 * i];
+        P[0] = l.pos.x; P[1] = l.pos.y; P[2] = l.pos.z; P[3] = l.radius;
+        C[0] = l.col.x; C[1] = l.col.y; C[2] = l.col.z; C[3] = l.cosOuter;
+        D[0] = l.dir.x; D[1] = l.dir.y; D[2] = l.dir.z; D[3] = l.cosInner;
+    }
+    set1i(p, "uNumLights", n);
+    if (n > 0) {
+        gl.Uniform4fv(U_(p, "uLPos"), n, pos.data());
+        gl.Uniform4fv(U_(p, "uLCol"), n, col.data());
+        gl.Uniform4fv(U_(p, "uLDir"), n, dir.data());
+    }
+}
+static void setPostUniforms(GLuint p, const M4& vp, const M4& invVP) {
+    setMat(p, "uVP", vp); setMat(p, "uInvVP", invVP);
+    set1f(p, "uNear", CAM_NEAR); set1f(p, "uFar", CAM_FAR);
 }
 
 static GLuint makeTex(int w, int h, GLenum ifmt, GLenum fmt, GLenum type, GLenum filter, const void* data) {
@@ -4367,40 +5747,152 @@ static GLuint makeTex(int w, int h, GLenum ifmt, GLenum fmt, GLenum type, GLenum
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     return t;
 }
-
-static void resizeReflection(int w, int h) {
-    w = std::max(64, w / 2); h = std::max(64, h / 2);
-    if (w == RD.reflW && h == RD.reflH) return;
-    if (RD.reflTex) { glDeleteTextures(1, &RD.reflTex); glDeleteTextures(1, &RD.reflDepth); }
-    RD.reflW = w; RD.reflH = h;
-    RD.reflTex = makeTex(w, h, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GL_LINEAR, nullptr);
-    RD.reflDepth = makeTex(w, h, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_NEAREST, nullptr);
-    if (!RD.reflFbo) gl.GenFramebuffers(1, &RD.reflFbo);
-    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.reflFbo);
-    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, RD.reflTex, 0);
-    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, RD.reflDepth, 0);
-    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) fprintf(stderr, "reflection FBO incomplete\n");
+static GLuint makeFbo(std::initializer_list<GLuint> colors, GLuint depthTex, const char* what) {
+    GLuint f;
+    gl.GenFramebuffers(1, &f);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, f);
+    GLenum bufs[4];
+    int n = 0;
+    for (GLuint c : colors) {
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + n, GL_TEXTURE_2D, c, 0);
+        bufs[n] = GL_COLOR_ATTACHMENT0 + n;
+        n++;
+    }
+    if (depthTex) gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthTex, 0);
+    if (n) gl.DrawBuffers(n, bufs);
+    else { glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE); }
+    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) fprintf(stderr, "framebuffer '%s' incomplete\n", what);
     gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    return f;
+}
+static GLuint rtTex(int w, int h, GLenum ifmt, GLenum fmt, GLenum type, GLenum filter) {
+    GLuint t = makeTex(w, h, ifmt, fmt, type, filter, nullptr);
+    RD.ownedTex.push_back(t);
+    return t;
+}
+static GLuint rtFbo(std::initializer_list<GLuint> colors, GLuint depthTex, const char* what) {
+    GLuint f = makeFbo(colors, depthTex, what);
+    RD.ownedFbo.push_back(f);
+    return f;
+}
+
+// (Re)create every screen-sized target when the window size or graphics quality changes
+static void ensureTargets(int W, int H, bool shot) {
+    float scale = renderScale(W, H);
+    if (W == RD.ow && H == RD.oh && SET.quality == RD.targetQuality && scale == RD.targetScale && shot == RD.targetShot) return;
+    if (!RD.ownedTex.empty()) glDeleteTextures((GLsizei)RD.ownedTex.size(), RD.ownedTex.data());
+    if (!RD.ownedFbo.empty()) gl.DeleteFramebuffers((GLsizei)RD.ownedFbo.size(), RD.ownedFbo.data());
+    RD.ownedTex.clear(); RD.ownedFbo.clear();
+    RD.ow = W; RD.oh = H; RD.targetQuality = SET.quality; RD.targetScale = scale; RD.targetShot = shot;
+    int iw = std::max(16, (int)std::lround(W * scale)), ih = std::max(16, (int)std::lround(H * scale));
+    RD.iw = iw; RD.ih = ih;
+    RD.depth = rtTex(iw, ih, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, GL_NEAREST);
+    RD.depthCopy = rtTex(iw, ih, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, GL_NEAREST);
+    RD.nrm = rtTex(iw, ih, GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+    RD.hdr0 = rtTex(iw, ih, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
+    RD.reflInfo = rtTex(iw, ih, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_NEAREST);
+    RD.surf = rtTex(iw, ih, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+    RD.hdr1 = rtTex(iw, ih, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    RD.fboPre = rtFbo({RD.nrm}, RD.depth, "prepass");
+    RD.fboMain = rtFbo({RD.hdr0, RD.reflInfo, RD.surf}, RD.depth, "main");
+    RD.fboHdr1D = rtFbo({RD.hdr1}, RD.depth, "hdr1+depth");
+    RD.fboHdr1 = rtFbo({RD.hdr1}, 0, "hdr1");
+    RD.fboDepthCopy = rtFbo({}, RD.depthCopy, "depth copy");
+    RD.aw = std::max(8, iw / 2); RD.ah = std::max(8, ih / 2);
+    for (int i = 0; i < 2; i++) {
+        RD.ao[i] = rtTex(RD.aw, RD.ah, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_LINEAR);
+        RD.fboAo[i] = rtFbo({RD.ao[i]}, 0, "ssao");
+    }
+    RD.fw = std::max(8, iw / 2); RD.fh = std::max(8, ih / 2);
+    RD.fog = rtTex(RD.fw, RD.fh, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    RD.fboFog = rtFbo({RD.fog}, 0, "fog");
+    int bw = iw / 2, bh = ih / 2;
+    RD.nBloom = 0;
+    while (RD.nBloom < 7 && bw >= 8 && bh >= 8) {
+        int i = RD.nBloom++;
+        RD.bw[i] = bw; RD.bh[i] = bh;
+        RD.bloom[i] = rtTex(bw, bh, GL_R11F_G11F_B10F, GL_RGB, GL_FLOAT, GL_LINEAR);
+        RD.fboBloom[i] = rtFbo({RD.bloom[i]}, 0, "bloom");
+        bw /= 2; bh /= 2;
+    }
+    RD.ldr = rtTex(W, H, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GL_LINEAR);
+    RD.fboLdr = rtFbo({RD.ldr}, 0, "ldr");
+    RD.pw = std::max(64, W / 2); RD.ph = std::max(64, H / 2);
+    RD.planar = rtTex(RD.pw, RD.ph, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR);
+    RD.planarDepth = rtTex(RD.pw, RD.ph, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_NEAREST);
+    RD.fboPlanar = rtFbo({RD.planar}, RD.planarDepth, "planar");
+    RD.outFbo = 0;
+    if (shot) {
+        RD.outTex = rtTex(W, H, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+        RD.outFbo = rtFbo({RD.outTex}, 0, "output");
+    }
+    RD.havePrev = false;
+}
+
+static void ensureShadowMap(int res) {
+    if (res == RD.shadowRes) return;
+    if (RD.shadowTex) glDeleteTextures(1, &RD.shadowTex);
+    glGenTextures(1, &RD.shadowTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, RD.shadowTex);
+    gl.TexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT32F, res, res, NUM_CASC, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    RD.shadowRes = res;
+}
+
+static std::string vsSrc(const char* body) { return std::string("#version 330 core\n") + body; }
+static std::string fsSrc(std::initializer_list<const char*> parts) {
+    std::string s = "#version 330 core\n#define MAX_LIGHTS " + std::to_string(MAX_LIGHTS) + "\n";
+    for (const char* p : parts) s += p;
+    return s;
 }
 
 static void initRenderer() {
-    RD.pWorld = makeProgram(WORLD_VS, fsWithCommon(WORLD_FS_MAIN));
+    RD.pWorld = makeProgram(vsSrc(WORLD_VS), fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, WORLD_FS_MAIN}));
+    RD.pPre = makeProgram(vsSrc(WORLD_VS), fsSrc({GLSL_COMMON, PREPASS_FS}));
     RD.pShadow = makeProgram(SHADOW_VS, SHADOW_FS);
-    RD.pSky = makeProgram(SKY_VS, fsWithCommon(SKY_FS_MAIN));
-    RD.pWater = makeProgram(WATER_VS, fsWithCommon(WATER_FS_MAIN));
-    RD.pPart = makeProgram(PART_VS, fsWithCommon(PART_FS_MAIN));
+    RD.pSky = makeProgram(SKY_VS, fsSrc({GLSL_COMMON, SKY_FS_MAIN}));
+    RD.pSkyLut = makeProgram(SKY_VS, fsSrc({GLSL_COMMON, SKYLUT_FS_MAIN}));
+    RD.pWater = makeProgram(WATER_VS, fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, POST_GLSL, WATER_FS_MAIN}));
+    RD.pPart = makeProgram(PART_VS, fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, POST_GLSL, PART_FS_MAIN}));
+    RD.pSSAO = makeProgram(POST_VS, fsSrc({GLSL_COMMON, POST_GLSL, SSAO_FS}));
+    RD.pAOBlur = makeProgram(POST_VS, fsSrc({GLSL_COMMON, POST_GLSL, AOBLUR_FS}));
+    RD.pSSR = makeProgram(POST_VS, fsSrc({GLSL_COMMON, POST_GLSL, SSR_FS}));
+    RD.pFog = makeProgram(POST_VS, fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, POST_GLSL, FOG_FS}));
+    RD.pFogApply = makeProgram(POST_VS, fsSrc({GLSL_COMMON, POST_GLSL, FOGAPPLY_FS}));
+    RD.pBloomDown = makeProgram(POST_VS, fsSrc({GLSL_COMMON, BLOOMDOWN_FS}));
+    RD.pBloomUp = makeProgram(POST_VS, fsSrc({GLSL_COMMON, BLOOMUP_FS}));
+    RD.pComposite = makeProgram(POST_VS, fsSrc({GLSL_COMMON, POST_GLSL, COMPOSITE_FS}));
+    RD.pFinal = makeProgram(POST_VS, FINAL_FS);
     RD.pHud = makeProgram(HUD_VS, HUD_FS);
-    // shadow map
-    RD.shadowTex = makeTex(RD.shadowRes, RD.shadowRes, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_LINEAR, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    // shadow samplers: hardware comparison (PCF) and raw depth (PCSS blocker search)
+    gl.GenSamplers(1, &RD.sampCmp);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    gl.SamplerParameteri(RD.sampCmp, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    gl.GenSamplers(1, &RD.sampRaw);
+    gl.SamplerParameteri(RD.sampRaw, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl.SamplerParameteri(RD.sampRaw, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.SamplerParameteri(RD.sampRaw, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.SamplerParameteri(RD.sampRaw, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gl.GenFramebuffers(1, &RD.shadowFbo);
-    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.shadowFbo);
-    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, RD.shadowTex, 0);
-    glDrawBuffer(GL_NONE);
-    glReadBuffer(GL_NONE);
-    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) fprintf(stderr, "shadow FBO incomplete\n");
-    gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    // sky environment
+    RD.skyAtmo = makeTex(SKY_W, SKY_H, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    RD.skyEnv = makeTex(SKY_W, SKY_H, GL_RGBA16F, GL_RGBA, GL_FLOAT, GL_LINEAR, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
+    RD.skyFbo = makeFbo({RD.skyAtmo, RD.skyEnv}, 0, "sky");
+    uint8_t white = 255;
+    RD.whiteTex = makeTex(1, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE, GL_NEAREST, &white);
     // font
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     std::vector<uint8_t> atlas = buildFontAtlas();
@@ -4440,42 +5932,324 @@ static void streamDraw(GLuint vao, GLuint vbo, GLuint ebo, size_t& vcap, size_t&
     glDrawElements(GL_TRIANGLES, (GLsizei)idx.size(), GL_UNSIGNED_INT, 0);
     gl.BindVertexArray(0);
 }
-
-static M4 lightMatrix(V3 focus) {
-    float R = 62.f;
-    V3 eye = focus + LIGHT.sunDir * 150.f;
-    M4 view = mLookAt(eye, focus, V3(0, 1, 0));
-    // snap to shadow texels to avoid shimmering
-    V3 ls = xPoint(view, focus);
-    float texel = 2 * R / RD.shadowRes;
-    V3 snapped(std::floor(ls.x / texel) * texel, std::floor(ls.y / texel) * texel, ls.z);
-    view = mTranslate(V3(snapped.x - ls.x, snapped.y - ls.y, 0)) * view;
-    return mOrtho(-R, R, -R, R, 1.f, 330.f) * view;
-}
-
-static void drawSceneGeometry(const M4& vp, const M4& lightVP, V3 camPos, float time, bool clip) {
-    // sky
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    setCommon(RD.pSky, camPos, time);
-    setMat(RD.pSky, "uInvVP", mInverse(vp));
+static void drawFullscreen() {
     gl.BindVertexArray(RD.emptyVao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    gl.BindVertexArray(0);
+}
+
+// Stable cascades: each covers a fixed-size bounding sphere of its slice of the view frustum,
+// snapped to whole shadow texels so the shadows do not shimmer as the camera moves.
+static void computeCascades(const M4& view, float fovDeg, float aspect) {
+    static const float splits[NUM_CASC + 1] = {0.1f, 10.f, 30.f, 90.f, 280.f};
+    V3 L = LIGHT.sunDir;
+    V3 up = std::fabs(L.y) > 0.98f ? V3(1, 0, 0) : V3(0, 1, 0);
+    M4 inv = mInverse(view);
+    float th = std::tan(std::max(fovDeg, 80.f) * PI / 180.f * 0.5f);
+    float back = std::min(900.f, 110.f / std::max(0.08f, L.y));   // reach for tall buildings far towards the light
+    for (int c = 0; c < NUM_CASC; c++) {
+        V3 pts[8], ctr(0, 0, 0);
+        for (int k = 0; k < 8; k++) {
+            float z = (k & 4) ? splits[c + 1] : splits[c];
+            pts[k] = xPoint(inv, V3(((k & 1) ? 1.f : -1.f) * th * aspect * z, ((k & 2) ? 1.f : -1.f) * th * z, -z));
+            ctr += pts[k];
+        }
+        ctr = ctr / 8.f;
+        float r = 0;
+        for (int k = 0; k < 8; k++) r = std::max(r, len(pts[k] - ctr));
+        r = std::ceil(r);
+        M4 lv = mLookAt(ctr + L * (back + r), ctr, up);
+        float texel = 2 * r / RD.shadowRes;
+        V3 o = xPoint(lv, V3(0, 0, 0));
+        lv = mTranslate(V3(std::floor(o.x / texel) * texel - o.x, std::floor(o.y / texel) * texel - o.y, 0)) * lv;
+        float farP = back + 2 * r + 60.f;
+        RD.cascVP[c] = mOrtho(-r, r, -r, r, 1.f, farP) * lv;
+        RD.cascWorld[c] = 2 * r;
+        RD.cascDepth[c] = farP - 1.f;
+        RD.cascSplit[c] = splits[c + 1];
+    }
+}
+
+struct FrameInfo {
+    M4 view, proj, vp;
+    V3 camPos, camFwd;
+    float fovDeg = 60, aspect = 1, time = 0, dt = 1 / 60.f;
+    int W = 1, H = 1;
+    bool shot = false;
+};
+
+static void renderFrame(const FrameInfo& F, V3 poolCenter) {
+    const Quality& Q = QUALITY[SET.quality];
+    ensureShadowMap(Q.shadowRes);
+    ensureTargets(F.W, F.H, F.shot);
+    M4 invVP = mInverse(F.vp);
+    gatherLights(F.camPos, F.camFwd, Q.lights);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+
+    // ---- 1. sky environment bake
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.skyFbo);
+    glViewport(0, 0, SKY_W, SKY_H);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    setCommon(RD.pSkyLut, F.camPos, F.time);
+    bindTex(TU_SKYENV, GL_TEXTURE_2D, 0);
+    set3(RD.pSkyLut, "uAtmoSun", LIGHT.atmoSun); set1f(RD.pSkyLut, "uAtmoSunI", LIGHT.atmoSunI);
+    set3(RD.pSkyLut, "uAtmoMoon", LIGHT.atmoMoon); set1f(RD.pSkyLut, "uAtmoMoonI", LIGHT.atmoMoonI);
+    set3(RD.pSkyLut, "uGlow", LIGHT.glow);
+    drawFullscreen();
+    glBindTexture(GL_TEXTURE_2D, RD.skyEnv);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
+
+    // ---- 2. shadow cascades
+    computeCascades(F.view, F.fovDeg, F.aspect);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.shadowFbo);
+    glViewport(0, 0, RD.shadowRes, RD.shadowRes);
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
-    // opaque world
-    setCommon(RD.pWorld, camPos, time);
-    setMat(RD.pWorld, "uVP", vp);
-    setMat(RD.pWorld, "uLightVP", lightVP);
-    if (clip) { gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 1, 0, -WATER_LEVEL + 0.05f); glEnable(GL_CLIP_DISTANCE0); }
-    else gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 0, 0, 1);
-    gl.ActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, RD.shadowTex);
-    gl.Uniform1i(U_(RD.pWorld, "uShadow"), 0);
-    gl.Uniform1f(U_(RD.pWorld, "uShadowTexel"), 1.f / RD.shadowRes);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.4f, 2.0f);
+    gl.UseProgram(RD.pShadow);
+    for (int c = 0; c < NUM_CASC; c++) {
+        gl.FramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, RD.shadowTex, 0, c);
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        setMat(RD.pShadow, "uLightVP", RD.cascVP[c]);
+        RD.staticMesh.draw();
+        RD.dynMesh.draw();
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+
+    // ---- 3. depth + normal prepass
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboPre);
+    glViewport(0, 0, RD.iw, RD.ih);
+    glClearColor(0.5f, 1.f, 0.5f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClearColor(0, 0, 0, 0);
+    setCommon(RD.pPre, F.camPos, F.time);
+    setMat(RD.pPre, "uVP", F.vp);
+    gl.Uniform4f(U_(RD.pPre, "uClip"), 0, 0, 0, 1);
+    set1f(RD.pPre, "uDynamic", 0.f);
+    RD.staticMesh.draw();
+    set1f(RD.pPre, "uDynamic", 1.f);
+    RD.dynMesh.draw();
+
+    // ---- 4. SSAO (half resolution) + depth-aware blur
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    if (Q.ssao > 0) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboAo[0]);
+        glViewport(0, 0, RD.aw, RD.ah);
+        setCommon(RD.pSSAO, F.camPos, F.time);
+        setPostUniforms(RD.pSSAO, F.vp, invVP);
+        bindTexU(RD.pSSAO, "uDepth", TU_A, RD.depth);
+        bindTexU(RD.pSSAO, "uNrm", TU_B, RD.nrm);
+        set1f(RD.pSSAO, "uRadius", 0.55f);
+        set1i(RD.pSSAO, "uSamples", Q.ssao);
+        drawFullscreen();
+        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboAo[1]);
+        setCommon(RD.pAOBlur, F.camPos, F.time);
+        setPostUniforms(RD.pAOBlur, F.vp, invVP);
+        bindTexU(RD.pAOBlur, "uAO", TU_A, RD.ao[0]);
+        bindTexU(RD.pAOBlur, "uDepth", TU_B, RD.depth);
+        set2f(RD.pAOBlur, "uTexel", 1.f / RD.aw, 1.f / RD.ah);
+        drawFullscreen();
+    }
+
+    // ---- 5. planar reflection of the city in the river
+    bool refl = F.camPos.z < 25.f || F.camFwd.z < -0.3f;
+    M4 mirror = mTranslate(V3(0, WATER_LEVEL, 0)) * mScale(V3(1, -1, 1)) * mTranslate(V3(0, -WATER_LEVEL, 0));
+    if (refl) {
+        M4 rvp = F.proj * F.view * mirror;
+        V3 rc(F.camPos.x, 2 * WATER_LEVEL - F.camPos.y, F.camPos.z);
+        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboPlanar);
+        glViewport(0, 0, RD.pw, RD.ph);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        setCommon(RD.pSky, rc, F.time);
+        setMat(RD.pSky, "uInvVP", mInverse(rvp));
+        bindTexU(RD.pSky, "uSkyAtmo", TU_A, RD.skyAtmo);
+        set3(RD.pSky, "uSunPos", LIGHT.sunPos); set3(RD.pSky, "uSunDisc", LIGHT.sunDisc);
+        set3(RD.pSky, "uMoonDir", LIGHT.moonDir); set3(RD.pSky, "uMoonDisc", LIGHT.moonDisc); set1f(RD.pSky, "uStars", LIGHT.stars);
+        drawFullscreen();
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_CLIP_DISTANCE0);
+        setCommon(RD.pWorld, rc, F.time);
+        setShadowUniforms(RD.pWorld, F.camFwd, 0);
+        setLightUniforms(RD.pWorld);
+        setMat(RD.pWorld, "uVP", rvp);
+        gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 1, 0, -WATER_LEVEL + 0.05f);
+        set1i(RD.pWorld, "uUseAO", 0);
+        bindTexU(RD.pWorld, "uAO", TU_A, RD.whiteTex);
+        set1i(RD.pWorld, "uInlineFog", 1);
+        RD.staticMesh.draw();
+        RD.dynMesh.draw();
+        glDisable(GL_CLIP_DISTANCE0);
+    }
+
+    // ---- 6. main forward pass: PBR world (depth from the prepass) + sky where nothing was drawn
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboMain);
+    glViewport(0, 0, RD.iw, RD.ih);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    setCommon(RD.pWorld, F.camPos, F.time);
+    setShadowUniforms(RD.pWorld, F.camFwd, Q.shadowQ);
+    setLightUniforms(RD.pWorld);
+    setMat(RD.pWorld, "uVP", F.vp);
+    gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 0, 0, 1);
+    set1i(RD.pWorld, "uUseAO", Q.ssao > 0 ? 1 : 0);
+    bindTexU(RD.pWorld, "uAO", TU_A, Q.ssao > 0 ? RD.ao[1] : RD.whiteTex);
+    set2f(RD.pWorld, "uInvRes", 1.f / RD.iw, 1.f / RD.ih);
+    set1i(RD.pWorld, "uInlineFog", 0);
+    set1i(RD.pWorld, "uDebug", getenv("CJ_DEBUG_VIEW") ? atoi(getenv("CJ_DEBUG_VIEW")) : 0);
     RD.staticMesh.draw();
     RD.dynMesh.draw();
-    if (clip) glDisable(GL_CLIP_DISTANCE0);
+    setCommon(RD.pSky, F.camPos, F.time);
+    setMat(RD.pSky, "uInvVP", invVP);
+    bindTexU(RD.pSky, "uSkyAtmo", TU_A, RD.skyAtmo);
+    set3(RD.pSky, "uSunPos", LIGHT.sunPos); set3(RD.pSky, "uSunDisc", LIGHT.sunDisc);
+    set3(RD.pSky, "uMoonDir", LIGHT.moonDir); set3(RD.pSky, "uMoonDisc", LIGHT.moonDisc); set1f(RD.pSky, "uStars", LIGHT.stars);
+    drawFullscreen();
+
+    // ---- 7. screen-space reflections into hdr1
+    glDisable(GL_DEPTH_TEST);
+    glBindTexture(GL_TEXTURE_2D, RD.hdr0);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboHdr1);
+    setCommon(RD.pSSR, F.camPos, F.time);
+    setPostUniforms(RD.pSSR, F.vp, invVP);
+    bindTexU(RD.pSSR, "uColor", TU_A, RD.hdr0);
+    bindTexU(RD.pSSR, "uDepth", TU_B, RD.depth);
+    bindTexU(RD.pSSR, "uReflInfo", TU_C, RD.reflInfo);
+    bindTexU(RD.pSSR, "uSurf", TU_D, RD.surf);
+    set1i(RD.pSSR, "uSteps", Q.ssr);
+    set2f(RD.pSSR, "uRes", (float)RD.iw, (float)RD.ih);
+    drawFullscreen();
+
+    // ---- 8. water (reads the opaque scene for refraction and screen-space reflections)
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, RD.fboMain);
+    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, RD.fboDepthCopy);
+    gl.BlitFramebuffer(0, 0, RD.iw, RD.ih, 0, 0, RD.iw, RD.ih, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboHdr1D);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    setCommon(RD.pWater, F.camPos, F.time);
+    setShadowUniforms(RD.pWater, F.camFwd, 0);
+    setLightUniforms(RD.pWater);
+    setPostUniforms(RD.pWater, F.vp, invVP);
+    set2f(RD.pWater, "uViewport", (float)RD.iw, (float)RD.ih);
+    set2f(RD.pWater, "uPoolCenter", poolCenter.x, poolCenter.z);
+    set1i(RD.pWater, "uHasRefl", refl ? 1 : 0);
+    set1i(RD.pWater, "uSSR", Q.ssr > 0 ? 1 : 0);
+    bindTexU(RD.pWater, "uReflTex", TU_A, RD.planar);
+    bindTexU(RD.pWater, "uScene", TU_B, RD.hdr0);
+    bindTexU(RD.pWater, "uSceneDepth", TU_C, RD.depthCopy);
+    RD.waterMesh.draw();
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+
+    // ---- 9. volumetric fog (half resolution), composited with a depth-aware upsample
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboFog);
+    glViewport(0, 0, RD.fw, RD.fh);
+    setCommon(RD.pFog, F.camPos, F.time);
+    setShadowUniforms(RD.pFog, F.camFwd, 0);
+    setLightUniforms(RD.pFog);
+    setPostUniforms(RD.pFog, F.vp, invVP);
+    bindTexU(RD.pFog, "uDepth", TU_A, RD.depth);
+    set1i(RD.pFog, "uSteps", Q.fogSteps);
+    set1f(RD.pFog, "uMaxDist", Q.fogSteps > 0 ? 220.f : 0.f);
+    set1i(RD.pFog, "uFogLights", Q.fogLights);
+    set1f(RD.pFog, "uFogLightK", 0.06f * (1.f + 2.f * LIGHT.rain));
+    drawFullscreen();
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboHdr1);
+    glViewport(0, 0, RD.iw, RD.ih);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_SRC_ALPHA);
+    setCommon(RD.pFogApply, F.camPos, F.time);
+    setPostUniforms(RD.pFogApply, F.vp, invVP);
+    bindTexU(RD.pFogApply, "uFog", TU_A, RD.fog);
+    bindTexU(RD.pFogApply, "uDepth", TU_B, RD.depth);
+    set2f(RD.pFogApply, "uFogRes", (float)RD.fw, (float)RD.fh);
+    drawFullscreen();
+
+    // ---- 10. particles (soft, lit, premultiplied alpha; emissive sparks are additive)
+    V3 camRight = norm(cross(F.camFwd, V3(0, 1, 0)));
+    V3 camUp = cross(camRight, F.camFwd);
+    buildParticleMesh(camRight, camUp, F.camFwd);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    setCommon(RD.pPart, F.camPos, F.time);
+    setShadowUniforms(RD.pPart, F.camFwd, 0);
+    setLightUniforms(RD.pPart);
+    setPostUniforms(RD.pPart, F.vp, invVP);
+    bindTexU(RD.pPart, "uDepth", TU_A, RD.depth);
+    set2f(RD.pPart, "uInvRes", 1.f / RD.iw, 1.f / RD.ih);
+    streamDraw(RD.partVao, RD.partVbo, RD.partEbo, RD.partVCap, RD.partICap, partVerts, partIdx);
+    glDisable(GL_BLEND);
+
+    // ---- 11. bloom chain
+    gl.UseProgram(RD.pBloomDown);
+    for (int i = 0; i < RD.nBloom; i++) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboBloom[i]);
+        glViewport(0, 0, RD.bw[i], RD.bh[i]);
+        GLuint src = i == 0 ? RD.hdr1 : RD.bloom[i - 1];
+        int sw = i == 0 ? RD.iw : RD.bw[i - 1], sh = i == 0 ? RD.ih : RD.bh[i - 1];
+        bindTexU(RD.pBloomDown, "uSrc", TU_A, src);
+        set2f(RD.pBloomDown, "uSrcTexel", 1.f / sw, 1.f / sh);
+        set1i(RD.pBloomDown, "uKaris", i == 0 ? 1 : 0);
+        drawFullscreen();
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    gl.UseProgram(RD.pBloomUp);
+    for (int i = RD.nBloom - 2; i >= 0; i--) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboBloom[i]);
+        glViewport(0, 0, RD.bw[i], RD.bh[i]);
+        bindTexU(RD.pBloomUp, "uSrc", TU_A, RD.bloom[i + 1]);
+        set2f(RD.pBloomUp, "uSrcTexel", 1.f / RD.bw[i + 1], 1.f / RD.bh[i + 1]);
+        drawFullscreen();
+    }
+    glDisable(GL_BLEND);
+
+    // ---- 12. resolve + tonemap to the output resolution
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboLdr);
+    glViewport(0, 0, F.W, F.H);
+    setCommon(RD.pComposite, F.camPos, F.time);
+    setPostUniforms(RD.pComposite, F.vp, invVP);
+    bindTexU(RD.pComposite, "uHdr", TU_A, RD.hdr1);
+    bindTexU(RD.pComposite, "uBloom", TU_B, RD.nBloom ? RD.bloom[0] : RD.hdr1);
+    bindTexU(RD.pComposite, "uDepth", TU_C, RD.depth);
+    bindTexU(RD.pComposite, "uNrm", TU_D, RD.nrm);
+    set2f(RD.pComposite, "uDstRes", (float)F.W, (float)F.H);
+    set1f(RD.pComposite, "uScale", (float)RD.iw / F.W);
+    set1f(RD.pComposite, "uExposure", LIGHT.exposure);
+    set1f(RD.pComposite, "uBloomStr", RD.nBloom ? LIGHT.bloom : 0.f);
+    setMat(RD.pComposite, "uPrevVP", RD.havePrev ? RD.prevVP : F.vp);
+    float motion = (Q.motion && SET.motionBlur && RD.havePrev) ? clampf((1.f / 120.f) / std::max(F.dt, 1e-3f), 0.f, 1.2f) : 0.f;
+    set1f(RD.pComposite, "uMotion", motion);
+    set3(RD.pComposite, "uWB", LIGHT.wb); set1f(RD.pComposite, "uSat", LIGHT.sat);
+    set1f(RD.pComposite, "uContrast", LIGHT.contrast); set3(RD.pComposite, "uLift", LIGHT.lift);
+    drawFullscreen();
+
+    // ---- 13. FXAA + film to the screen
+    gl.BindFramebuffer(GL_FRAMEBUFFER, RD.outFbo);
+    glViewport(0, 0, F.W, F.H);
+    gl.UseProgram(RD.pFinal);
+    bindTexU(RD.pFinal, "uLdr", TU_A, RD.ldr);
+    set2f(RD.pFinal, "uRes", (float)F.W, (float)F.H);
+    set1i(RD.pFinal, "uFxaa", RD.iw < F.W * 1.4f ? 1 : 0);
+    set1f(RD.pFinal, "uTime", F.time);
+    set1f(RD.pFinal, "uGrain", SET.filmGrain ? 0.018f : 0.f);
+    set1f(RD.pFinal, "uVignette", 0.55f);
+    set1f(RD.pFinal, "uCA", 0.f);
+    drawFullscreen();
+    RD.prevVP = F.vp;
+    RD.havePrev = true;
 }
 
 // ----------------------------------------------------------------------------
@@ -4518,6 +6292,124 @@ static void updateCamera(float dt, const Player& pl) {
 }
 
 // ----------------------------------------------------------------------------
+// Save data (settings + records), menus and gamepad
+// ----------------------------------------------------------------------------
+static bool saveEnabled = true;   // off for scripted screenshot runs
+static std::string savePath() {
+    static std::string path;
+    if (path.empty()) {
+        char* p = SDL_GetPrefPath("OpusSkate", "ConcreteJungle");
+        path = p ? std::string(p) + "save.txt" : std::string("concrete_jungle_save.txt");
+        if (p) SDL_free(p);
+    }
+    return path;
+}
+static void saveGame() {
+    if (!saveEnabled) return;
+    FILE* f = fopen(savePath().c_str(), "w");
+    if (!f) return;
+    fprintf(f, "quality %d\ntod %d\nmusic %.2f\nsfx %.2f\nmotionblur %d\ngrain %d\nfps %d\nfullscreen %d\n", SET.quality, SET.tod,
+            SET.musicVol, SET.sfxVol, SET.motionBlur ? 1 : 0, SET.filmGrain ? 1 : 0, SET.showFps ? 1 : 0, SET.fullscreen ? 1 : 0);
+    fprintf(f, "best %lld\nsession %lld\ncombo %lld\n", REC.bestScore, REC.bestSession, REC.bestCombo);
+    fclose(f);
+}
+static void loadGame() {
+    FILE* f = fopen(savePath().c_str(), "r");
+    if (!f) return;
+    char key[32];
+    double v;
+    while (fscanf(f, "%31s %lf", key, &v) == 2) {
+        std::string k = key;
+        if (k == "quality") SET.quality = (int)clampf((float)v, 0, 3);
+        else if (k == "tod") SET.tod = ((int)v % NUM_TODS + NUM_TODS) % NUM_TODS;
+        else if (k == "music") SET.musicVol = clampf((float)v, 0, 1);
+        else if (k == "sfx") SET.sfxVol = clampf((float)v, 0, 1);
+        else if (k == "motionblur") SET.motionBlur = v != 0;
+        else if (k == "grain") SET.filmGrain = v != 0;
+        else if (k == "fps") SET.showFps = v != 0;
+        else if (k == "fullscreen") SET.fullscreen = v != 0;
+        else if (k == "best") REC.bestScore = (long long)v;
+        else if (k == "session") REC.bestSession = (long long)v;
+        else if (k == "combo") REC.bestCombo = (long long)v;
+    }
+    fclose(f);
+}
+static void applyAudioSettings() { musicVolume = 0.5f * SET.musicVol; sfxVolume = SET.sfxVol; }
+
+struct MenuItem {
+    std::string label;
+    std::function<std::string()> value;   // shown on the right ("< value >" when adjustable)
+    std::function<void(int)> adjust;      // left / right
+    std::function<void()> action;         // confirm
+};
+struct Menu {
+    std::string title;
+    std::vector<MenuItem> items;
+    int sel = 0;
+};
+enum MenuCmd { MC_UP = 0, MC_DOWN, MC_LEFT, MC_RIGHT, MC_OK, MC_BACK };
+
+static void drawMenu(const Menu& m, float cx, float y, float time) {
+    float U = hud.U, w = 620 * U, ih = 36 * U;
+    float h = m.items.size() * ih + 24 * U + (m.title.empty() ? 0 : 46 * U);
+    float x = cx - w * 0.5f;
+    hud.rect(x, y, w, h, Col(8, 10, 16), 0.76f);
+    hud.frameRect(x, y, w, h, 2 * U, hexc(0xffd23a), 0.85f);
+    float iy = y + 12 * U;
+    if (!m.title.empty()) { hud.text(cx, iy + 6 * U, 3 * U, m.title, hexc(0xffd23a), 1, 1); iy += 46 * U; }
+    for (size_t i = 0; i < m.items.size(); i++, iy += ih) {
+        const MenuItem& it = m.items[i];
+        bool s = (int)i == m.sel;
+        if (s) hud.rect(x + 10 * U, iy, w - 20 * U, ih - 6 * U, hexc(0xffd23a), 0.86f + 0.14f * std::sin(time * 6.f));
+        Col tc = s ? Col(18, 18, 22) : Col(236, 236, 230);
+        hud.text(x + 26 * U, iy + 8 * U, 2.2f * U, it.label, tc, 1, 0, !s);
+        if (it.value) {
+            std::string v = it.value();
+            if (it.adjust) v = "< " + v + " >";
+            hud.text(x + w - 26 * U, iy + 8 * U, 2.2f * U, v, s ? Col(18, 18, 22) : hexc(0xffd23a), 1, 2, !s);
+        }
+    }
+}
+static void menuCommand(Menu& m, int cmd) {
+    if (m.items.empty()) return;
+    int n = (int)m.items.size();
+    MenuItem& it = m.items[m.sel];
+    switch (cmd) {
+        case MC_UP: m.sel = (m.sel + n - 1) % n; sfx(SFX_CLACK, 0.5f, 1.4f); break;
+        case MC_DOWN: m.sel = (m.sel + 1) % n; sfx(SFX_CLACK, 0.5f, 1.4f); break;
+        case MC_LEFT: case MC_RIGHT: if (it.adjust) { it.adjust(cmd == MC_LEFT ? -1 : 1); sfx(SFX_MENU, 0.6f); } break;
+        case MC_OK:
+            if (it.action) { sfx(SFX_MENU); it.action(); }
+            else if (it.adjust) { it.adjust(1); sfx(SFX_MENU, 0.6f); }
+            break;
+        default: break;
+    }
+}
+static std::string onOff(bool b) { return b ? "ON" : "OFF"; }
+static std::string percent(float v) { return std::to_string((int)std::lround(v * 100)) + "%"; }
+static void cycleTimeOfDay(int d) {
+    SET.tod = ((SET.tod + d) % NUM_TODS + NUM_TODS) % NUM_TODS;
+    applyTimeOfDay(SET.tod);
+    saveGame();
+}
+static void cycleQuality(int d) {
+    SET.quality = (SET.quality + d + 4) % 4;
+    saveGame();
+}
+// items shared by the title and pause menus
+static MenuItem todItem() { return {"TIME OF DAY", [] { return std::string(TODS[SET.tod].name); }, [](int d) { cycleTimeOfDay(d); }, nullptr}; }
+static MenuItem qualityItem() { return {"GRAPHICS", [] { return std::string(QUALITY[SET.quality].name); }, [](int d) { cycleQuality(d); }, nullptr}; }
+
+static SDL_GameController* pad = nullptr;
+static void openPad() {
+    if (pad) return;
+    for (int i = 0; i < SDL_NumJoysticks() && !pad; i++)
+        if (SDL_IsGameController(i)) pad = SDL_GameControllerOpen(i);
+}
+static bool padButton(SDL_GameControllerButton b) { return pad && SDL_GameControllerGetButton(pad, b); }
+static float padAxis(SDL_GameControllerAxis a) { return pad ? SDL_GameControllerGetAxis(pad, a) / 32767.f : 0.f; }
+
+// ----------------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------------
 enum GameMode { GM_TITLE = 0, GM_PLAY, GM_PAUSE, GM_RESULTS };
@@ -4532,7 +6424,8 @@ static SDL_Scancode keyName(const std::string& k) {
 }
 
 int main(int argc, char** argv) {
-    bool fullscreen = false, mute = false, hideHud = false, noHelp = false, forceTitle = false;
+    bool mute = false, hideHud = false, noHelp = false, forceTitle = false, startPaused = false;
+    int cliTod = -1, cliQuality = -1, cliFull = -1;
     int startHelpPage = -1;
     int winW = 1280, winH = 720;
     std::string shotPath;
@@ -4545,8 +6438,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
-        if (a == "--fullscreen") fullscreen = true;
-        else if (a == "--window") fullscreen = false;
+        if (a == "--fullscreen") cliFull = 1;
+        else if (a == "--window") cliFull = 0;
         else if (a == "--mute") mute = true;
         else if (a == "--res") { std::string r = next(); sscanf(r.c_str(), "%dx%d", &winW, &winH); }
         else if (a == "--shot") shotPath = next();
@@ -4555,10 +6448,14 @@ int main(int argc, char** argv) {
         else if (a == "--nohud") hideHud = true;
         else if (a == "--nohelp") noHelp = true;
         else if (a == "--title") forceTitle = true;
+        else if (a == "--pause") startPaused = true;
         else if (a == "--tricks") startHelpPage = 2;
         else if (a == "--cam") startCam = atoi(next().c_str());
         else if (a == "--pos") { std::string p = next(); sscanf(p.c_str(), "%f,%f,%f", &startPos.x, &startPos.z, &startYaw); startPos.y = 5; }
         else if (a == "--speed") startSpeed = (float)atof(next().c_str());
+        else if (a == "--tod") cliTod = atoi(next().c_str());
+        else if (a == "--quality") cliQuality = atoi(next().c_str());
+        else if (a == "--scale") SET.scaleOverride = (float)atof(next().c_str());
         else if (a == "--keys") {   // e.g. "0-120:W,60-80:SPACE"
             std::string s = next();
             size_t p = 0;
@@ -4572,14 +6469,21 @@ int main(int argc, char** argv) {
                 p = c + 1;
             }
         } else if (a == "--help" || a == "-h") {
-            printf("CONCRETE JUNGLE - options: --fullscreen --mute --res WxH\n");
+            printf("CONCRETE JUNGLE - options: --fullscreen --mute --res WxH --quality 0-3 --tod 0-4 --scale S\n");
             return 0;
         }
     }
     bool shotMode = !shotPath.empty();
     if (shotMode) mute = true;
+    saveEnabled = !shotMode;
+    if (!shotMode) loadGame();
+    if (cliTod >= 0) SET.tod = cliTod % NUM_TODS;
+    if (cliQuality >= 0) SET.quality = std::min(cliQuality, 3);
+    if (cliFull >= 0) SET.fullscreen = cliFull == 1;
+    bool fullscreen = SET.fullscreen && !shotMode;
+    applyAudioSettings();
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -4590,18 +6494,13 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
 #endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
-    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);   // the scene renders into its own HDR targets
     Uint32 wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
     if (shotMode) wflags |= SDL_WINDOW_HIDDEN;
     SDL_Window* win = nullptr;
     SDL_GLContext ctx = nullptr;
     for (int attempt = 0; attempt < 2 && !ctx; attempt++) {
-        if (attempt == 1) {   // retry without multisampling
-            SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
-            SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 0);
-        }
+        if (attempt == 1) SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);   // some drivers insist on a depth buffer
         win = SDL_CreateWindow("Concrete Jungle - NYC Street Skating", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, winW, winH, wflags);
         if (!win) continue;
         ctx = SDL_GL_CreateContext(win);
@@ -4610,10 +6509,11 @@ int main(int argc, char** argv) {
     if (!win || !ctx) { fprintf(stderr, "Could not create an OpenGL 3.3 window: %s\n", SDL_GetError()); return 1; }
     if (!gl.load()) { fprintf(stderr, "Required OpenGL functions are missing.\n"); return 1; }
     SDL_GL_SetSwapInterval(shotMode ? 0 : 1);
-    glEnable(GL_MULTISAMPLE);
 
     initAudio(mute);
+    openPad();
     initRenderer();
+    applyTimeOfDay(SET.tod);
     buildLevel();
     RD.staticMesh.upload(SM, false);
     RD.waterMesh.upload(WM, false);
@@ -4622,6 +6522,7 @@ int main(int argc, char** argv) {
     initNpcs();
     initPigeons();
     initTraffic();
+    P.best = REC.bestScore;
     P.reset(startPos, startYaw);
     P.vel = fwdYaw(startYaw) * startSpeed;
     cam.mode = startCam;
@@ -4631,10 +6532,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Concrete Jungle: %zu static triangles, %zu solids, %zu rails, %zu pedestrians\n", staticTris, world.solids.size(), world.rails.size(), npcs.size());
 
     GameMode mode = forceTitle ? GM_TITLE : (startPlaying || shotMode ? GM_PLAY : (startTitle ? GM_TITLE : GM_PLAY));
-    bool running = true, showFps = false, session = false, newBest = false;
+    bool running = true, session = false, newBest = false;
+    bool& showFps = SET.showFps;
     int helpPage = startHelpPage >= 0 ? startHelpPage : (noHelp ? 0 : 1);   // 0 hidden, 1 controls, 2 trick list
     float helpTimer = 14.f, sessionLeft = 0, time = 0, fps = 60, ambientT = 8.f;
-    long long sessionBest = 0, lastScoreSeen = 0;
+    long long sessionBest = REC.bestSession, lastScoreSeen = 0;
     double acc = 0;
     Uint64 prevCounter = SDL_GetPerformanceCounter();
     Input latched;
@@ -4653,6 +6555,66 @@ int main(int argc, char** argv) {
         newBest = false;
     };
 
+    int menuPage = 0;   // 0 main menu, 1 options, 2 controls / trick list
+    Menu titleMenu, pauseMenu, optionsMenu;
+    auto openPause = [&]() { mode = GM_PAUSE; menuPage = 0; pauseMenu.sel = 0; sfx(SFX_MENU); };
+    auto toggleFullscreen = [&]() {
+        fullscreen = !fullscreen;
+        SET.fullscreen = fullscreen;
+        SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        saveGame();
+    };
+    auto cycleCamera = [&]() {
+        cam.mode = (cam.mode + 1) % 3;
+        popup(cam.mode == 0 ? "CHASE CAM" : cam.mode == 1 ? "HIGH CAM" : "FILMER FISHEYE", Col(220, 220, 220), 0.8f, 1.2f);
+    };
+    titleMenu.items = {
+        {"FREE SKATE", nullptr, nullptr, [&] { mode = GM_PLAY; session = false; helpTimer = 14.f; helpPage = 1; }},
+        {"2 MINUTE SESSION", nullptr, nullptr, [&] { startSession(); }},
+        todItem(),
+        qualityItem(),
+        {"OPTIONS", nullptr, nullptr, [&] { menuPage = 1; optionsMenu.sel = 0; }},
+        {"CONTROLS", nullptr, nullptr, [&] { menuPage = 2; }},
+        {"QUIT", nullptr, nullptr, [&] { running = false; }},
+    };
+    pauseMenu.title = "PAUSED";
+    pauseMenu.items = {
+        {"RESUME", nullptr, nullptr, [&] { mode = GM_PLAY; }},
+        {"RESET SKATER", nullptr, nullptr, [&] { P.reset(SPAWN_POS, SPAWN_YAW); cam.yaw = SPAWN_YAW; mode = GM_PLAY; }},
+        todItem(),
+        qualityItem(),
+        {"OPTIONS", nullptr, nullptr, [&] { menuPage = 1; optionsMenu.sel = 0; }},
+        {"TRICK LIST", nullptr, nullptr, [&] { menuPage = 2; }},
+        {"QUIT TO TITLE", nullptr, nullptr, [&] { mode = GM_TITLE; session = false; menuPage = 0; titleMenu.sel = 0; }},
+    };
+    optionsMenu.title = "OPTIONS";
+    optionsMenu.items = {
+        {"MUSIC VOLUME", [] { return percent(SET.musicVol); }, [](int d) { SET.musicVol = clampf(SET.musicVol + d * 0.1f, 0, 1); applyAudioSettings(); saveGame(); }, nullptr},
+        {"SOUND FX VOLUME", [] { return percent(SET.sfxVol); }, [](int d) { SET.sfxVol = clampf(SET.sfxVol + d * 0.1f, 0, 1); applyAudioSettings(); saveGame(); }, nullptr},
+        {"MOTION BLUR", [] { return onOff(SET.motionBlur); }, [](int) { SET.motionBlur = !SET.motionBlur; saveGame(); }, nullptr},
+        {"FILM GRAIN", [] { return onOff(SET.filmGrain); }, [](int) { SET.filmGrain = !SET.filmGrain; saveGame(); }, nullptr},
+        {"SHOW FPS", [] { return onOff(SET.showFps); }, [](int) { SET.showFps = !SET.showFps; saveGame(); }, nullptr},
+        {"FULLSCREEN", [&] { return onOff(fullscreen); }, [&](int) { toggleFullscreen(); }, nullptr},
+        {"BACK", nullptr, nullptr, [&] { menuPage = 0; }},
+    };
+    auto handleMenu = [&](int c) {
+        if (mode == GM_TITLE) {
+            if (menuPage == 0) { if (c != MC_BACK) menuCommand(titleMenu, c); }
+            else if (menuPage == 1) { if (c == MC_BACK) { menuPage = 0; sfx(SFX_MENU, 0.6f); } else menuCommand(optionsMenu, c); }
+            else if (c == MC_BACK || c == MC_OK) { menuPage = 0; sfx(SFX_MENU, 0.6f); }
+        } else if (mode == GM_PAUSE) {
+            if (menuPage == 0) { if (c == MC_BACK) { mode = GM_PLAY; sfx(SFX_MENU, 0.6f); } else menuCommand(pauseMenu, c); }
+            else if (menuPage == 1) { if (c == MC_BACK) { menuPage = 0; sfx(SFX_MENU, 0.6f); } else menuCommand(optionsMenu, c); }
+            else if (c == MC_BACK || c == MC_OK) { menuPage = 0; sfx(SFX_MENU, 0.6f); }
+        } else if (mode == GM_RESULTS) {
+            if (c == MC_OK) { startSession(); sfx(SFX_MENU); }
+            else if (c == MC_BACK) { mode = GM_PLAY; session = false; }
+        }
+    };
+    int stickDir = -1;
+    float stickRepeat = 0;
+    if (startPaused) mode = GM_PAUSE;
+
     while (running) {
         Uint64 now = SDL_GetPerformanceCounter();
         float frameDt = (float)((now - prevCounter) / (double)SDL_GetPerformanceFrequency());
@@ -4663,27 +6625,70 @@ int main(int argc, char** argv) {
         time += frameDt;
 
         SDL_Event e;
+        std::vector<int> cmds;   // menu navigation this frame
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
-            if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-                SDL_Scancode sc = e.key.keysym.scancode;
-                if (sc == SDL_SCANCODE_F11) {
-                    fullscreen = !fullscreen;
-                    SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+            if (e.type == SDL_CONTROLLERDEVICEADDED) openPad();
+            if (e.type == SDL_CONTROLLERDEVICEREMOVED && pad && e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad))) {
+                SDL_GameControllerClose(pad);
+                pad = nullptr;
+                openPad();
+                if (mode == GM_PLAY) openPause();
+            }
+            if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                int b = e.cbutton.button;
+                if (mode == GM_PLAY) {
+                    switch (b) {
+                        case SDL_CONTROLLER_BUTTON_A: latched.olliePress = true; break;
+                        case SDL_CONTROLLER_BUTTON_X: latched.flipPress = true; break;
+                        case SDL_CONTROLLER_BUTTON_B: latched.grabPress = true; break;
+                        case SDL_CONTROLLER_BUTTON_Y: latched.grindPress = true; break;
+                        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: latched.manualPress = true; break;
+                        case SDL_CONTROLLER_BUTTON_START: openPause(); break;
+                        case SDL_CONTROLLER_BUTTON_BACK: cycleCamera(); break;
+                        default: break;
+                    }
+                } else {
+                    switch (b) {
+                        case SDL_CONTROLLER_BUTTON_DPAD_UP: cmds.push_back(MC_UP); break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: cmds.push_back(MC_DOWN); break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: cmds.push_back(MC_LEFT); break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: cmds.push_back(MC_RIGHT); break;
+                        case SDL_CONTROLLER_BUTTON_A: case SDL_CONTROLLER_BUTTON_START: cmds.push_back(MC_OK); break;
+                        case SDL_CONTROLLER_BUTTON_B: case SDL_CONTROLLER_BUTTON_BACK: cmds.push_back(MC_BACK); break;
+                        default: break;
+                    }
                 }
-                if (mode == GM_TITLE) {
-                    if (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER || sc == SDL_SCANCODE_SPACE) { mode = GM_PLAY; session = false; sfx(SFX_MENU); helpTimer = 14.f; helpPage = 1; }
-                    else if (sc == SDL_SCANCODE_T) { startSession(); sfx(SFX_MENU); }
-                    else if (sc == SDL_SCANCODE_ESCAPE) running = false;
-                } else if (mode == GM_PLAY) {
+            }
+            if (e.type == SDL_KEYDOWN) {
+                SDL_Scancode sc = e.key.keysym.scancode;
+                bool rpt = e.key.repeat != 0;
+                if (mode != GM_PLAY) {   // menus (arrow keys auto-repeat)
                     switch (sc) {
-                        case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_P: mode = GM_PAUSE; sfx(SFX_MENU); break;
+                        case SDL_SCANCODE_UP: case SDL_SCANCODE_W: cmds.push_back(MC_UP); break;
+                        case SDL_SCANCODE_DOWN: case SDL_SCANCODE_S: cmds.push_back(MC_DOWN); break;
+                        case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: cmds.push_back(MC_LEFT); break;
+                        case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: cmds.push_back(MC_RIGHT); break;
+                        case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE: if (!rpt) cmds.push_back(MC_OK); break;
+                        case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE: if (!rpt) cmds.push_back(MC_BACK); break;
+                        case SDL_SCANCODE_P: if (!rpt && mode == GM_PAUSE) cmds.push_back(MC_BACK); break;
+                        case SDL_SCANCODE_T: if (!rpt && mode == GM_TITLE && menuPage == 0) { startSession(); sfx(SFX_MENU); } break;
+                        default: break;
+                    }
+                }
+                if (rpt) continue;
+                if (sc == SDL_SCANCODE_F11) toggleFullscreen();
+                if (mode == GM_PLAY) {
+                    switch (sc) {
+                        case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_P: openPause(); break;
                         case SDL_SCANCODE_H: case SDL_SCANCODE_F1: helpPage = (helpPage + 1) % 3; helpTimer = 1e9f; break;
                         case SDL_SCANCODE_M: musicOn = !musicOn; popup(musicOn ? "MUSIC ON" : "MUSIC OFF", Col(220, 220, 220), 0.8f, 1.2f); break;
-                        case SDL_SCANCODE_V: cam.mode = (cam.mode + 1) % 3; popup(cam.mode == 0 ? "CHASE CAM" : cam.mode == 1 ? "HIGH CAM" : "FILMER FISHEYE", Col(220, 220, 220), 0.8f, 1.2f); break;
+                        case SDL_SCANCODE_V: cycleCamera(); break;
+                        case SDL_SCANCODE_N: cycleTimeOfDay(1); popup(TODS[SET.tod].name, hexc(0xffd23a), 0.9f, 1.4f); break;
+                        case SDL_SCANCODE_G: cycleQuality(1); popup(std::string("GRAPHICS: ") + QUALITY[SET.quality].name, Col(220, 220, 220), 0.8f, 1.4f); break;
                         case SDL_SCANCODE_R: P.reset(SPAWN_POS, SPAWN_YAW); cam.yaw = SPAWN_YAW; break;
                         case SDL_SCANCODE_T: startSession(); break;
-                        case SDL_SCANCODE_F3: showFps = !showFps; break;
+                        case SDL_SCANCODE_F3: showFps = !showFps; saveGame(); break;
                         case SDL_SCANCODE_SPACE: latched.olliePress = true; break;
                         case SDL_SCANCODE_J: case SDL_SCANCODE_Z: latched.flipPress = true; break;
                         case SDL_SCANCODE_K: case SDL_SCANCODE_X: latched.grabPress = true; break;
@@ -4691,16 +6696,16 @@ int main(int argc, char** argv) {
                         case SDL_SCANCODE_I: case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT: latched.manualPress = true; break;
                         default: break;
                     }
-                } else if (mode == GM_PAUSE) {
-                    if (sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_P || sc == SDL_SCANCODE_RETURN) mode = GM_PLAY;
-                    else if (sc == SDL_SCANCODE_Q) { mode = GM_TITLE; session = false; }
-                    else if (sc == SDL_SCANCODE_R) { P.reset(SPAWN_POS, SPAWN_YAW); cam.yaw = SPAWN_YAW; mode = GM_PLAY; }
-                } else if (mode == GM_RESULTS) {
-                    if (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER) startSession();
-                    else if (sc == SDL_SCANCODE_ESCAPE) { mode = GM_PLAY; session = false; }
                 }
             }
         }
+        if (mode != GM_PLAY && pad) {   // the left stick drives the menus too, with auto-repeat
+            float lx = padAxis(SDL_CONTROLLER_AXIS_LEFTX), ly = padAxis(SDL_CONTROLLER_AXIS_LEFTY);
+            int d = ly < -0.6f ? MC_UP : ly > 0.6f ? MC_DOWN : lx < -0.6f ? MC_LEFT : lx > 0.6f ? MC_RIGHT : -1;
+            if (d != stickDir) { stickDir = d; stickRepeat = 0.4f; if (d >= 0) cmds.push_back(d); }
+            else if (d >= 0 && (stickRepeat -= frameDt) <= 0) { stickRepeat = 0.12f; cmds.push_back(d); }
+        }
+        for (int c : cmds) handleMenu(c);
 
         // ---------------------------------------------------------------- input
         const Uint8* ks = SDL_GetKeyboardState(nullptr);
@@ -4721,6 +6726,18 @@ int main(int argc, char** argv) {
         in.grab = held(SDL_SCANCODE_K, SDL_SCANCODE_X);
         in.grind = held(SDL_SCANCODE_L, SDL_SCANCODE_C);
         in.manual = held(SDL_SCANCODE_I, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RSHIFT);
+        if (pad) {
+            float lx = padAxis(SDL_CONTROLLER_AXIS_LEFTX), ly = padAxis(SDL_CONTROLLER_AXIS_LEFTY);
+            in.up |= ly < -0.45f || padButton(SDL_CONTROLLER_BUTTON_DPAD_UP);
+            in.down |= ly > 0.45f || padButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+            in.left |= lx < -0.45f || padButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            in.right |= lx > 0.45f || padButton(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+            in.ollie |= padButton(SDL_CONTROLLER_BUTTON_A);
+            in.flip |= padButton(SDL_CONTROLLER_BUTTON_X);
+            in.grab |= padButton(SDL_CONTROLLER_BUTTON_B);
+            in.grind |= padButton(SDL_CONTROLLER_BUTTON_Y);
+            in.manual |= padButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER) || padButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        }
         if (!script.empty()) {   // scripted presses
             in.olliePress |= in.ollie && !lastIn.ollie;
             in.flipPress |= in.flip && !lastIn.flip;
@@ -4755,6 +6772,8 @@ int main(int argc, char** argv) {
                     mode = GM_RESULTS;
                     newBest = P.score > sessionBest;
                     sessionBest = std::max(sessionBest, P.score);
+                    REC.bestSession = std::max(REC.bestSession, sessionBest);
+                    saveGame();
                     sfx(SFX_BIGCOMBO);
                 }
             }
@@ -4785,134 +6804,92 @@ int main(int argc, char** argv) {
             aud.water = mode == GM_PLAY ? std::max(0.f, w) * 0.8f : 0.f;
             if (mode != GM_PLAY) { aud.roll = aud.grind = aud.wind = 0; }
         }
+        if (LIGHT.rain > 0 && mode != GM_PAUSE) spawnRain(frameDt, cam.pos, LIGHT.rain);
+        aud.rain = LIGHT.rain * (mode == GM_PAUSE ? 0.4f : 1.f);
         updateParticles(mode == GM_PAUSE ? 0.f : frameDt, cam.pos);
 
         // ---------------------------------------------------------------- render
         int W, H;
         SDL_GL_GetDrawableSize(win, &W, &H);
-        resizeReflection(W, H);
-        float aspect = (float)W / std::max(1, H);
-        M4 proj = mPerspective(cam.fov * PI / 180.f, aspect, 0.1f, 1500.f);
-        M4 view = mLookAt(cam.pos, cam.look, V3(0, 1, 0));
-        M4 vp = proj * view;
-        V3 camFwd = norm(cam.look - cam.pos);
+        W = std::max(W, 1); H = std::max(H, 1);
+        bool renderNow = !shotMode || frame >= shotFrames - 2;   // screenshots only need the last frames rendered
+        if (renderNow) {
+            float aspect = (float)W / H;
+            M4 proj = mPerspective(cam.fov * PI / 180.f, aspect, CAM_NEAR, CAM_FAR);
+            M4 view = mLookAt(cam.pos, cam.look, V3(0, 1, 0));
+            V3 camFwd = norm(cam.look - cam.pos);
 
-        DM.clear();
-        {   // draw the skater interpolated between physics ticks
-            V3 simPos = P.pos;
-            float alpha = mode == GM_PLAY ? (float)(acc / (1.0 / 120.0)) : 1.f;
-            if (P.state != ST_BAIL && len(P.pos - P.prevPos) < 1.f) P.pos = lerp3(P.prevPos, P.pos, sat(alpha));
-            drawSkater(DM, P, in);
-            P.pos = simPos;
-        }
-        drawNpcs(DM, cam.pos);
-        drawPigeons(DM, cam.pos);
-        drawTraffic(DM, cam.pos);
-        drawSignals(DM);
-        drawLetters(DM, P, time);
-        RD.dynMesh.upload(DM, true);
-
-        V3 focus = mode == GM_TITLE ? V3(14, 0, -26) : P.pos;
-        M4 lightVP = lightMatrix(focus + camFwd * 25.f);
-        // shadow pass
-        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.shadowFbo);
-        glViewport(0, 0, RD.shadowRes, RD.shadowRes);
-        glClear(GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_CULL_FACE);
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(1.6f, 3.0f);
-        gl.UseProgram(RD.pShadow);
-        setMat(RD.pShadow, "uLightVP", lightVP);
-        RD.staticMesh.draw();
-        RD.dynMesh.draw();
-        glDisable(GL_POLYGON_OFFSET_FILL);
-
-        // planar reflection of the city in the river
-        bool refl = cam.pos.z < 25.f || camFwd.z < -0.3f;
-        if (refl) {
-            gl.BindFramebuffer(GL_FRAMEBUFFER, RD.reflFbo);
-            glViewport(0, 0, RD.reflW, RD.reflH);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            M4 mirror = mTranslate(V3(0, WATER_LEVEL, 0)) * mScale(V3(1, -1, 1)) * mTranslate(V3(0, -WATER_LEVEL, 0));
-            M4 rvp = proj * view * mirror;
-            V3 rc(cam.pos.x, 2 * WATER_LEVEL - cam.pos.y, cam.pos.z);
-            drawSceneGeometry(rvp, lightVP, rc, time, true);
-        }
-        // main pass
-        if (shotMode && !RD.mainFbo) {
-            RD.mainTex = makeTex(W, H, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST, nullptr);
-            RD.mainDepth = makeTex(W, H, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_NEAREST, nullptr);
-            gl.GenFramebuffers(1, &RD.mainFbo);
-            gl.BindFramebuffer(GL_FRAMEBUFFER, RD.mainFbo);
-            gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, RD.mainTex, 0);
-            gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, RD.mainDepth, 0);
-        }
-        gl.BindFramebuffer(GL_FRAMEBUFFER, RD.mainFbo);
-        glViewport(0, 0, W, H);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        drawSceneGeometry(vp, lightVP, cam.pos, time, false);
-        // water
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDepthMask(GL_FALSE);
-        setCommon(RD.pWater, cam.pos, time);
-        setMat(RD.pWater, "uVP", vp);
-        setMat(RD.pWater, "uLightVP", lightVP);
-        gl.Uniform2f(U_(RD.pWater, "uViewport"), (float)W, (float)H);
-        gl.Uniform2f(U_(RD.pWater, "uPoolCenter"), 28.f, -34.5f);
-        gl.Uniform1i(U_(RD.pWater, "uHasRefl"), refl ? 1 : 0);
-        gl.ActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, RD.reflTex);
-        gl.Uniform1i(U_(RD.pWater, "uReflTex"), 0);
-        RD.waterMesh.draw();
-        // particles
-        V3 camRight = norm(cross(camFwd, V3(0, 1, 0)));
-        V3 camUp = cross(camRight, camFwd);
-        buildParticleMesh(camRight, camUp);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        setCommon(RD.pPart, cam.pos, time);
-        setMat(RD.pPart, "uVP", vp);
-        streamDraw(RD.partVao, RD.partVbo, RD.partEbo, RD.partVCap, RD.partICap, partVerts, partIdx);
-        glDepthMask(GL_TRUE);
-        // HUD
-        glDisable(GL_DEPTH_TEST);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        hud.begin((float)W, (float)H);
-        hud.vignette(0.55f);
-        if (!hideHud) {
-            if (mode == GM_TITLE) drawTitle(time);
-            else {
-                drawGameHud(P, time, sessionLeft, session, mode == GM_PLAY ? helpPage : 0, 1.f, vp, cam.pos, showFps, fps);
-                if (mode == GM_PAUSE) drawPause();
-                if (mode == GM_RESULTS) drawResults(P.score, sessionBest, newBest, time);
+            DM.clear();
+            {   // draw the skater interpolated between physics ticks
+                V3 simPos = P.pos;
+                float alpha = mode == GM_PLAY ? (float)(acc / (1.0 / 120.0)) : 1.f;
+                if (P.state != ST_BAIL && len(P.pos - P.prevPos) < 1.f) P.pos = lerp3(P.prevPos, P.pos, sat(alpha));
+                drawSkater(DM, P, in);
+                P.pos = simPos;
             }
-        }
-        gl.UseProgram(RD.pHud);
-        gl.Uniform2f(U_(RD.pHud, "uScreen"), (float)W, (float)H);
-        gl.ActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, RD.fontTex);
-        gl.Uniform1i(U_(RD.pHud, "uFont"), 0);
-        streamDraw(RD.hudVao, RD.hudVbo, RD.hudEbo, RD.hudVCap, RD.hudICap, hud.v, hud.idx);
-        glDisable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
+            drawNpcs(DM, cam.pos);
+            drawPigeons(DM, cam.pos);
+            drawTraffic(DM, cam.pos);
+            drawSignals(DM);
+            drawLetters(DM, P, time);
+            RD.dynMesh.upload(DM, true);
+            updateDynLights();
 
-        if (shotMode && frame >= shotFrames) {
-            std::vector<uint8_t> px((size_t)W * H * 3);
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            gl.BindFramebuffer(GL_FRAMEBUFFER, RD.mainFbo);
-            glReadBuffer(RD.mainFbo ? GL_COLOR_ATTACHMENT0 : GL_BACK);
-            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px.data());
-            FILE* f = fopen(shotPath.c_str(), "wb");
-            if (f) {
-                fprintf(f, "P6\n%d %d\n255\n", W, H);
-                for (int y = H - 1; y >= 0; y--) fwrite(&px[(size_t)y * W * 3], 1, (size_t)W * 3, f);
-                fclose(f);
+            FrameInfo fi;
+            fi.view = view; fi.proj = proj; fi.vp = proj * view;
+            fi.camPos = cam.pos; fi.camFwd = camFwd;
+            fi.fovDeg = cam.fov; fi.aspect = aspect; fi.time = time; fi.dt = frameDt;
+            fi.W = W; fi.H = H; fi.shot = shotMode;
+            renderFrame(fi, V3(28.f, 0.f, -34.5f));
+
+            // HUD
+            gl.BindFramebuffer(GL_FRAMEBUFFER, RD.outFbo);
+            glViewport(0, 0, W, H);
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            hud.begin((float)W, (float)H);
+            if (!hideHud) {
+                float U = hud.U;
+                if (mode == GM_TITLE) {
+                    drawTitle(time);
+                    float my = hud.H * 0.33f;
+                    if (menuPage == 0) drawMenu(titleMenu, hud.W * 0.5f, my, time);
+                    else if (menuPage == 1) drawMenu(optionsMenu, hud.W * 0.5f, my, time);
+                    else drawHelpPanel(hud.W * 0.5f - helpPanelW(1.5f * U) / 2, hud.H * 0.3f, 1, 1.5f);
+                } else {
+                    drawGameHud(P, time, sessionLeft, session, mode == GM_PLAY ? helpPage : 0, 1.f, fi.vp, cam.pos, showFps, fps);
+                    if (mode == GM_PAUSE) {
+                        drawPause();
+                        if (menuPage == 0) drawMenu(pauseMenu, hud.W * 0.5f, hud.H * 0.16f, time);
+                        else if (menuPage == 1) drawMenu(optionsMenu, hud.W * 0.5f, hud.H * 0.16f, time);
+                        else drawTrickPanel(hud.W * 0.5f - (90 * 6 * 1.5f * U + 24 * U) / 2, hud.H * 0.18f, 1);
+                    }
+                    if (mode == GM_RESULTS) drawResults(P.score, sessionBest, newBest, time);
+                }
             }
-            static const char* SN[] = {"RIDE", "AIR", "GRIND", "MANUAL", "BAIL"};
-            printf("shot frame %d pos(%.2f %.2f %.2f) state=%s score=%lld combo=%s\n", frame, P.pos.x, P.pos.y, P.pos.z, SN[P.state], P.score, P.combo.text(80).c_str());
-            running = false;
+            gl.UseProgram(RD.pHud);
+            gl.Uniform2f(U_(RD.pHud, "uScreen"), (float)W, (float)H);
+            bindTexU(RD.pHud, "uFont", 0, RD.fontTex);
+            streamDraw(RD.hudVao, RD.hudVbo, RD.hudEbo, RD.hudVCap, RD.hudICap, hud.v, hud.idx);
+            glDisable(GL_BLEND);
+
+            if (shotMode && frame >= shotFrames) {
+                std::vector<uint8_t> px((size_t)W * H * 3);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                gl.BindFramebuffer(GL_FRAMEBUFFER, RD.outFbo);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+                FILE* f = fopen(shotPath.c_str(), "wb");
+                if (f) {
+                    fprintf(f, "P6\n%d %d\n255\n", W, H);
+                    for (int y = H - 1; y >= 0; y--) fwrite(&px[(size_t)y * W * 3], 1, (size_t)W * 3, f);
+                    fclose(f);
+                }
+                static const char* SN[] = {"RIDE", "AIR", "GRIND", "MANUAL", "BAIL"};
+                printf("shot frame %d pos(%.2f %.2f %.2f) state=%s score=%lld combo=%s\n", frame, P.pos.x, P.pos.y, P.pos.z, SN[P.state], P.score, P.combo.text(80).c_str());
+                running = false;
+            }
         }
         SDL_GL_SwapWindow(win);
         frame++;

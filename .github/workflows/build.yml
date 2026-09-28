@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Fetch SDL2 (MinGW development package)
+        run: |
+          curl -sSL -o sdl2.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-devel-2.30.9-mingw.tar.gz
+          tar xzf sdl2.tar.gz
+      - name: Build skate.exe
+        run: |
+          S=SDL2-2.30.9/x86_64-w64-mingw32
+          x86_64-w64-mingw32-g++ -O2 -std=c++17 skate.cpp -o skate.exe -I$S/include -I$S/include/SDL2 -L$S/lib \
+            -lmingw32 -lSDL2main -lSDL2 -lopengl32 -mwindows -static-libgcc -static-libstdc++
+          mkdir -p ConcreteJungle
+          cp skate.exe $S/bin/SDL2.dll README.md ConcreteJungle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConcreteJungle-windows-x64
+          path: ConcreteJungle/
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDL2
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+      - name: Build
+        run: g++ -O2 -std=c++17 -Wall -Wextra skate.cpp -o skate $(sdl2-config --cflags --libs) -lGL
