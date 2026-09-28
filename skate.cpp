@@ -1535,7 +1535,7 @@ void main(){
 // Resolve (supersampling or camera motion blur), bloom, exposure, ACES filmic tonemap, grading
 static const char* COMPOSITE_FS = R"(
 in vec2 vUV; uniform sampler2D uHdr; uniform sampler2D uBloom; uniform sampler2D uDepth; uniform sampler2D uNrm;
-uniform vec2 uDstRes; uniform float uScale; uniform float uExposure; uniform float uBloomStr;
+uniform vec2 uDstRes; uniform float uScale; uniform float uExposure; uniform float uBloomStr; uniform float uBloomLevels; uniform float uMenuBlur;
 uniform mat4 uPrevVP; uniform float uMotion;
 uniform vec3 uWB; uniform float uSat; uniform float uContrast; uniform vec3 uLift;
 out vec4 oCol;
@@ -1580,7 +1580,9 @@ void main(){
     }
   }
   vec3 c = acc / wsum;
-  c = mix(c, textureLod(uBloom, uv, 0.0).rgb, uBloomStr);
+  vec3 bloom = textureLod(uBloom, uv, 0.0).rgb / uBloomLevels;
+  c = mix(c, bloom, uBloomStr);
+  c = mix(c, bloom * 0.8, uMenuBlur);   // soft backdrop behind menus
   c = aces(c * uExposure * uWB);
   float l = luma(c);
   c = max(mix(vec3(l), c, uSat), 0.0);
@@ -5976,6 +5978,7 @@ struct FrameInfo {
     float fovDeg = 60, aspect = 1, time = 0, dt = 1 / 60.f;
     int W = 1, H = 1;
     bool shot = false;
+    float menuBlur = 0;   // 0..1: blur the scene behind a menu
 };
 
 static void renderFrame(const FrameInfo& F, V3 poolCenter) {
@@ -5998,12 +6001,12 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     set3(RD.pSkyLut, "uAtmoMoon", LIGHT.atmoMoon); set1f(RD.pSkyLut, "uAtmoMoonI", LIGHT.atmoMoonI);
     set3(RD.pSkyLut, "uGlow", LIGHT.glow);
     drawFullscreen();
-    glBindTexture(GL_TEXTURE_2D, RD.skyEnv);
-    gl.GenerateMipmap(GL_TEXTURE_2D);
 
     // ---- 2. shadow cascades
     computeCascades(F.view, F.fovDeg, F.aspect);
     gl.BindFramebuffer(GL_FRAMEBUFFER, RD.shadowFbo);
+    bindTex(TU_SKYENV, GL_TEXTURE_2D, RD.skyEnv);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
     glViewport(0, 0, RD.shadowRes, RD.shadowRes);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -6118,9 +6121,9 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
 
     // ---- 7. screen-space reflections into hdr1
     glDisable(GL_DEPTH_TEST);
-    glBindTexture(GL_TEXTURE_2D, RD.hdr0);
-    gl.GenerateMipmap(GL_TEXTURE_2D);
     gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboHdr1);
+    bindTex(TU_A, GL_TEXTURE_2D, RD.hdr0);
+    gl.GenerateMipmap(GL_TEXTURE_2D);
     setCommon(RD.pSSR, F.camPos, F.time);
     setPostUniforms(RD.pSSR, F.vp, invVP);
     bindTexU(RD.pSSR, "uColor", TU_A, RD.hdr0);
@@ -6229,6 +6232,8 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     set1f(RD.pComposite, "uScale", (float)RD.iw / F.W);
     set1f(RD.pComposite, "uExposure", LIGHT.exposure);
     set1f(RD.pComposite, "uBloomStr", RD.nBloom ? LIGHT.bloom : 0.f);
+    set1f(RD.pComposite, "uBloomLevels", (float)std::max(RD.nBloom, 1));
+    set1f(RD.pComposite, "uMenuBlur", RD.nBloom ? F.menuBlur : 0.f);
     setMat(RD.pComposite, "uPrevVP", RD.havePrev ? RD.prevVP : F.vp);
     float motion = (Q.motion && SET.motionBlur && RD.havePrev) ? clampf((1.f / 120.f) / std::max(F.dt, 1e-3f), 0.f, 1.2f) : 0.f;
     set1f(RD.pComposite, "uMotion", motion);
@@ -6840,6 +6845,9 @@ int main(int argc, char** argv) {
             fi.camPos = cam.pos; fi.camFwd = camFwd;
             fi.fovDeg = cam.fov; fi.aspect = aspect; fi.time = time; fi.dt = frameDt;
             fi.W = W; fi.H = H; fi.shot = shotMode;
+            static float menuBlur = 0;
+            menuBlur = damp(menuBlur, (mode == GM_PAUSE || mode == GM_RESULTS || (mode == GM_TITLE && menuPage != 0)) ? 0.85f : 0.f, 8.f, frameDt);
+            fi.menuBlur = hideHud ? 0.f : menuBlur;
             renderFrame(fi, V3(28.f, 0.f, -34.5f));
 
             // HUD
