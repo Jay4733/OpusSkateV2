@@ -585,6 +585,10 @@ float fbm(vec2 p){ float s=0.0,a=0.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*
 float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 vec3 toLin(vec3 c){ return pow(max(c, vec3(0.0)), vec3(2.2)); }
 float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// (1 - x)^5 for Schlick Fresnel. The clamp matters: when the view and light directions coincide,
+// rounding pushes x a hair above 1 and pow() of a negative base is undefined (NaN on most GPUs).
+float schlick5(float x){ float m = clamp(1.0 - x, 0.0, 1.0), m2 = m * m; return m2 * m2 * m; }
+vec3 safeHdr(vec3 c){ return any(isnan(c)) || any(isinf(c)) ? vec3(0.0) : min(c, vec3(30000.0)); }
 vec2 skyUV(vec3 d){
   float el = asin(clamp(d.y, -1.0, 1.0));
   return vec2(atan(d.x, d.z) * (0.5 / PI) + 0.5, 0.5 + 0.5 * sign(el) * sqrt(abs(el) / (0.5 * PI)));
@@ -937,7 +941,7 @@ void glassPane(vec2 id, vec2 lc, vec2 cp, vec3 room, float seedBase, int kind, v
   emit = roomInterior(cp, rd, room, seed, kind, lit);
   alb = vec3(0.0); isGlass = 1.0;
   rough = 0.025 + 0.08 * hash12(vec2(seed, 2.2));
-  f0 = kind == 1 ? 0.07 : 0.04;
+  f0 = kind == 1 ? 0.22 : 0.04;   // office curtain walls use reflective coated glass
 }
 
 void main(){
@@ -999,7 +1003,7 @@ void main(){
     vec2 f = fract(q), id = floor(q);
     vec2 e = min(f, 1.0 - f) * vec2(1.6, 3.4);
     if(min(e.x, e.y) < 0.05){ alb = toLin(vec3(0.58, 0.6, 0.63)); metal = 1.0; rough = 0.32; }
-    else if(f.y < 0.24){ alb = toLin(vec3(0.07, 0.09, 0.11)); rough = 0.1; f0 = 0.06; }
+    else if(f.y < 0.24){ alb = toLin(vec3(0.07, 0.09, 0.11)); rough = 0.08; f0 = 0.25; }
     else glassPane(vec2(floor(uv.x / 4.8), id.y), vec2(0.5), vec2(mod(uv.x, 4.8), (f.y - 0.2) * 3.4), vec3(4.8, 3.0, 9.0), seedBase, 1, n, T, alb, rough, emit, isGlass, f0);
   } else if(m == 5){                                                 // asphalt
     alb *= 0.72 + 0.42 * fbm(uv * 0.9);
@@ -1119,7 +1123,7 @@ void main(){
   vec3 Hh = normalize(uSunDir + V);
   float NdotL = max(ndl, 0.0), NdotH = max(dot(N, Hh), 0.0);
   float dd = NdotH * NdotH * (a2 - 1.0) + 1.0;
-  vec3 Fs = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, Hh), 0.0), 5.0);
+  vec3 Fs = F0 + (1.0 - F0) * schlick5(dot(V, Hh));
   vec3 spec = a2 / (PI * dd * dd) * gv * (NdotL / (NdotL * (1.0 - kk) + kk)) * Fs / max(4.0 * NdotV * NdotL, 1e-4);
   vec3 col = (diffC * dif + spec * PI * NdotL) * uSunCol * sh;
   if(trans > 0.0) col += diffC * uSunCol * trans * pow(max(dot(-V, uSunDir), 0.0), 4.0) * mix(0.3, 1.0, sh);
@@ -1128,11 +1132,12 @@ void main(){
   col += diffC * mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ;
   vec3 R = reflect(-V, N);
   vec3 env = skyEnv(R, rough * 7.0);
-  vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdotV, 5.0);
+  vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0) * schlick5(NdotV);
   float specOcc = clamp(pow(NdotV + occ, exp2(-16.0 * rough - 1.0)) - 1.0 + occ, 0.0, 1.0);
   vec3 envSpec = Fr * env * specOcc;
   col += envSpec;
   col += isGlass > 0.5 ? emit * (1.0 - Fr) : emit;
+  vec3 dbgL = vec3(0.0); float dbgMax = 0.0; int dbgIdx = -1;
   for(int i = 0; i < uNumLights; i++){
     vec3 L; float at = lightAtten(i, vPos, L);
     if(at <= 0.0) continue;
@@ -1142,9 +1147,14 @@ void main(){
     vec3 H2 = normalize(L + V);
     float nh = max(dot(N, H2), 0.0), nlc = max(nl, 0.0);
     float d2 = nh * nh * (a2 - 1.0) + 1.0;
-    vec3 Fl = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H2), 0.0), 5.0);
+    vec3 Fl = F0 + (1.0 - F0) * schlick5(dot(V, H2));
     vec3 sl = a2 / (PI * d2 * d2) * gv * (nlc / (nlc * (1.0 - kk) + kk)) * Fl / max(4.0 * NdotV * nlc, 1e-4);
-    col += (diffC * nlw + sl * PI * nlc) * uLCol[i].rgb * at;
+    vec3 contrib = (diffC * nlw + sl * PI * nlc) * uLCol[i].rgb * at;
+    if(uDebug == 8) contrib = diffC * nlw * uLCol[i].rgb * at;
+    if(uDebug == 9) contrib = sl * PI * nlc * uLCol[i].rgb * at;
+    col += contrib;
+    dbgL += contrib;
+    if(luma(contrib) > dbgMax){ dbgMax = luma(contrib); dbgIdx = i; }
   }
   if(uInlineFog == 1) col = applyFog(col, vPos);
   if(uDebug == 1) col = vec3(sh);
@@ -1152,7 +1162,9 @@ void main(){
   else if(uDebug == 3) col = alb;
   else if(uDebug == 4){ int c = cascadeOf(dot(vPos - uCamPos, uCamFwd)); col = c == 0 ? vec3(1,0.2,0.2) : (c == 1 ? vec3(0.2,1,0.2) : (c == 2 ? vec3(0.2,0.4,1) : vec3(1,1,0.2))); col *= 0.3 + 0.7 * sh; }
   else if(uDebug == 5) col = N * 0.5 + 0.5;
-  oCol = vec4(min(col, vec3(30000.0)), 1.0);
+  else if(uDebug == 6 || uDebug == 8 || uDebug == 9) col = dbgL;
+  else if(uDebug == 7) col = dbgIdx < 0 ? vec3(0.0) : vec3(hash12(vec2(float(dbgIdx), 1.0)), hash12(vec2(float(dbgIdx), 2.0)), hash12(vec2(float(dbgIdx), 3.0))) * min(dbgMax * 20.0, 1.0);
+  oCol = vec4(safeHdr(col), 1.0);
   float ssrW = 1.0 - smoothstep(0.2, 0.45, rough);
   oRefl = vec4(envSpec * ssrW, luma(Fr) * specOcc * ssrW);
   oSurf = vec4(N * 0.5 + 0.5, rough);
@@ -1251,10 +1263,10 @@ void main(){
   float az = (uv.x - 0.5) * 2.0 * PI, s = uv.y * 2.0 - 1.0, el = sign(s) * s * s * 0.5 * PI;
   vec3 d = vec3(sin(az) * cos(el), sin(el), cos(az) * cos(el));
   vec3 dh = normalize(vec3(d.x, max(d.y, 0.002), d.z));
-  vec3 c = uGlow * pow(1.0 - dh.y, 5.0);
+  vec3 c = uGlow * schlick5(dh.y);
   if(uAtmoSunI > 0.0) c += scatter(dh, uAtmoSun, uAtmoSunI);
   if(uAtmoMoonI > 0.0) c += scatter(dh, uAtmoMoon, uAtmoMoonI) * vec3(0.7, 0.82, 1.0);
-  if(d.y < 0.0) c = mix(c, uGroundCol * 1.1 + uFogCol * 0.3, smoothstep(0.0, 0.3, -d.y));
+  if(d.y < 0.0) c = mix(c, uGroundCol * 1.8 + uFogCol * 0.45, smoothstep(0.0, 0.3, -d.y));   // below the horizon: the lit city
   oAtmo = vec4(c, 1.0);
   vec4 cl = clouds(dh, false);
   oEnv = vec4(mix(c, cl.rgb, d.y < 0.0 ? 0.0 : cl.a), 1.0);
@@ -1311,7 +1323,7 @@ void main(){
   vec3 V = normalize(uCamPos - vPos);
   float NdotV = max(dot(n, V), 0.0);
   vec3 R = reflect(-V, n);
-  float fr = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
+  float fr = 0.02 + 0.98 * schlick5(NdotV);
   vec2 suv = gl_FragCoord.xy / uViewport;
   vec3 Rs = vec3(R.x, abs(R.y), R.z);
   vec3 refl = skyEnv(Rs, 0.0);
@@ -1342,7 +1354,7 @@ void main(){
   }
   if(vKind == 0){ float foam = smoothstep(0.72, 0.9, fbm(vPos.xz*0.6 + vec2(t*0.2, 0.0))); col += (uSkyUp + uSunCol * 0.5) * foam * 0.06; }
   if(vKind == 2) col = mix(below, col, alpha);
-  fragColor = vec4(min(col, vec3(30000.0)), 1.0);
+  fragColor = vec4(safeHdr(col), 1.0);
 }
 )";
 
@@ -2140,8 +2152,7 @@ static void ledge(float cx, float cz, float rot, float hx, float hz, float y0, f
 
 // A clump of leaves: an ellipsoid whose normals bend towards the canopy's outward direction,
 // so the whole crown shades as one soft volume instead of a pile of balls.
-static void leafClump(V3 c, V3 rad, V3 crownC, V3 crownR, Col col) {
-    const int SEG = 9, RINGS = 6;
+static void leafClump(V3 c, V3 rad, V3 crownC, V3 crownR, Col col, int SEG = 9, int RINGS = 6) {
     uint32_t base = (uint32_t)SM.v.size();
     for (int i = 0; i <= RINGS; i++)
         for (int j = 0; j <= SEG; j++) {
@@ -2177,7 +2188,7 @@ static void tree(float x, float z, float y0, float scale = 1.f) {
         SM.capsule(top - V3(0, 0.3f * scale, 0), tip, 0.07f * scale, 0.035f * scale, V3(0, 1, 0), bark, MAT_BARK, 1.f, 0.5f, 6);
     }
     Col g0 = hexc(0x365f24), g1 = hexc(0x6b8c33);
-    for (int k = 0; k < 30; k++) {
+    for (int k = 0; k < 24; k++) {
         V3 d;
         do d = V3(r.range(-1, 1), r.range(-1, 1), r.range(-1, 1)); while (len(d) > 1.f);
         float l = len(d);
@@ -2185,7 +2196,7 @@ static void tree(float x, float z, float y0, float scale = 1.f) {
         V3 c = crownC + mulv(d, crownR) * 0.78f;
         float rad = r.range(0.5f, 0.78f) * scale;
         Col col = mixc(g0, g1, sat(r.f() * 0.8f + (d.y * 0.5f + 0.5f) * 0.35f));
-        leafClump(c, V3(rad, rad * 0.85f, rad), crownC, crownR, col);
+        leafClump(c, V3(rad, rad * 0.85f, rad), crownC, crownR, col, 8, 5);
     }
     // low iron tree-pit guard (grindable, NYC classic)
     float g = 0.8f, gy = y0 + 0.42f;
@@ -2198,7 +2209,7 @@ static void tree(float x, float z, float y0, float scale = 1.f) {
     world.addBox(x, z, 0, g, g, y0, gy - 0.05f, SURF_METAL, false);
 }
 
-static void streetLamp(float x, float z, float y0, float yaw) {
+static void streetLamp(float x, float z, float y0, float yaw, bool solid = true) {
     SM.cylinder(frame(x, y0, z, 0), 0.11f, 0.6f, 8, hexc(0x2f3a33), MAT_METAL);
     SM.cylinder(frame(x, y0, z, 0), 0.07f, 6.6f, 8, hexc(0x3a463e), MAT_METAL, true, 0.05f);
     V3 top(x, y0 + 6.6f, z);
@@ -2207,7 +2218,7 @@ static void streetLamp(float x, float z, float y0, float yaw) {
     M4 hf = mTranslate(arm + V3(0, -0.05f, 0)) * mRotY(yaw);
     SM.box(hf, V3(0.22f, 0.08f, 0.45f), hexc(0x3a463e), MAT_METAL);
     SM.box(hf * mTranslate(V3(0, -0.09f, 0.05f)), V3(0.16f, 0.02f, 0.3f), hexc(0xfff1c0), MAT_EMISSIVE);
-    world.addBox(x, z, 0, 0.12f, 0.12f, y0, y0 + 6.6f, SURF_METAL, false);
+    if (solid) world.addBox(x, z, 0, 0.12f, 0.12f, y0, y0 + 6.6f, SURF_METAL, false);
     PointLight l;
     l.pos = arm + V3(0, -0.3f, 0); l.col = V3(1.f, 0.8f, 0.56f) * 60.f; l.radius = 20.f;
     l.dir = V3(0, -1, 0); l.cosOuter = 0.15f; l.cosInner = 0.55f; l.group = LG_LAMP;
@@ -2471,9 +2482,9 @@ static void fireEscape(V3 o, V3 r, V3 n, float w, int floors) {
 // ----------------------------------------------------------------------------
 static const float SH = 0.15f;   // sidewalk height
 
-static void building(float x0, float z0, float x1, float z1, float h, int style, Col col, uint32_t seed, bool roofStuff = true) {
+static void building(float x0, float z0, float x1, float z1, float h, int style, Col col, uint32_t seed, bool roofStuff = true, bool solid = true) {
     uint8_t mat = style == 1 ? MAT_STONEWIN : (style == 2 ? MAT_GLASSWALL : MAT_WINDOWS);
-    world.addBox((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0, (x1 - x0) * 0.5f, (z1 - z0) * 0.5f, 0, h, SURF_CONCRETE, true);
+    if (solid) world.addBox((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0, (x1 - x0) * 0.5f, (z1 - z0) * 0.5f, 0, h, SURF_CONCRETE, true);
     // Neighbouring and overlapping buildings share wall planes; a small unique inset per building keeps
     // those walls from being exactly coplanar (which z-fights into flickering triangle-shaped patches).
     float e = 0.01f + 0.035f * (hash32(seed * 2654435761u + 17u) & 0xFFFF) / 65535.f;
@@ -2544,27 +2555,27 @@ static void stripeQuad(V3 a, V3 dirLong, V3 dirWide, float L, float W, Col c) {
 
 static void buildStreets() {
     V3 up(0, 1, 0);
-    SM.quadN(V3(-600, 0, 600), V3(600, 0, 600), V3(600, 0, RIVER_EDGE_Z), V3(-600, 0, RIVER_EDGE_Z), up, C_ASPHALT, MAT_ASPHALT);
+    SM.quadN(V3(-1600, 0, 1600), V3(1600, 0, 1600), V3(1600, 0, RIVER_EDGE_Z), V3(-1600, 0, RIVER_EDGE_Z), up, C_ASPHALT, MAT_ASPHALT);
     // sidewalk slabs (curbs are grindable)
-    slab(-200, -62, -9, -7, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 2 | 4 | 8);
-    slab(9, -62, 200, -7, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 1 | 4 | 8);
-    slab(-200, 7, -9, 200, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 2 | 4);
-    slab(9, 7, 200, 200, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 1 | 4);
-    slab(-600, RIVER_EDGE_Z, 600, -74, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 8);
+    slab(-1400, -62, -9, -7, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 2 | 4 | 8);
+    slab(9, -62, 1400, -7, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 1 | 4 | 8);
+    slab(-1400, 7, -9, 1400, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 2 | 4);
+    slab(9, 7, 1400, 1400, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 1 | 4);
+    slab(-1400, RIVER_EDGE_Z, 1400, -74, SH, C_SIDEWALK, MAT_SIDEWALK, SURF_SIDEWALK, 8);
     // road markings
     Col white = hexc(0xdedbd2), yel = hexc(0xe0b416);
     float y = 0.012f;
-    for (float z = -60; z < 200; z += 6) {
+    for (float z = -60; z < 1400; z += 6) {
         if (z > -12 && z < 12) continue;
         stripeQuad(V3(-2.3f, y, z), V3(0, 0, 1), V3(1, 0, 0), 3, 0.14f, white);
         stripeQuad(V3(2.2f, y, z), V3(0, 0, 1), V3(1, 0, 0), 3, 0.14f, white);
     }
-    for (float x = -200; x < 200; x += 6) {
+    for (float x = -1400; x < 1400; x += 6) {
         if (x > -14 && x < 14) continue;
         stripeQuad(V3(x, y, -0.07f), V3(1, 0, 0), V3(0, 0, 1), 3, 0.14f, white);
     }
-    stripeQuad(V3(-600, y, -68.2f), V3(1, 0, 0), V3(0, 0, 1), 1200, 0.12f, yel);
-    stripeQuad(V3(-600, y, -67.9f), V3(1, 0, 0), V3(0, 0, 1), 1200, 0.12f, yel);
+    stripeQuad(V3(-1400, y, -68.2f), V3(1, 0, 0), V3(0, 0, 1), 2800, 0.12f, yel);
+    stripeQuad(V3(-1400, y, -67.9f), V3(1, 0, 0), V3(0, 0, 1), 2800, 0.12f, yel);
     // crosswalks
     for (int side = -1; side <= 1; side += 2) {
         for (float x = -8.5f; x < 8.5f; x += 1.1f) stripeQuad(V3(x, y, side > 0 ? 8.0f : -11.0f), V3(0, 0, 1), V3(1, 0, 0), 3.0f, 0.55f, white);
@@ -2623,7 +2634,9 @@ static void buildNW() {
     facadeRow(V3(-14, 0, -12), V3(1, 0, 0), 45, 16, 11, true, 12, 30, -1);
     facadeRow(V3(-69.5f, 0, -12), V3(0, 0, 1), 55.5f, 16, 12, true, 12, 26, -1);
     facadeRow(V3(-14, 0, -57), V3(0, 0, -1), 55.5f, 16, 13, true, 12, 24, -1);
-    building(-200, -57, -69.5f, -12, 22, 0, hexc(0x7a4a3a), 14);
+    facadeRow(V3(-170, 0, -12), V3(0, 0, 1), 100.5f, 16, 101, true, 12, 24, -1);
+    facadeRow(V3(-69.5f, 0, -57), V3(0, 0, -1), 100.5f, 16, 102, true, 12, 22, -1);
+    building(-170, -41, -69.5f, -28, 18, 0, hexc(0x7a4a3a), 14, false);
     building(-70, -45, -26, -24, 14, 0, hexc(0x6a3a2e), 15, false);   // block interior filler
     subwayEntrance(-11.4f, -30.5f);
     tree(-10.3f, -45, SH); tree(-10.3f, -18, SH); tree(-30, -8.1f, SH); tree(-52, -8.1f, SH);
@@ -2860,10 +2873,11 @@ static void buildCourt() {
 static void buildSW() {
     facadeRow(V3(-52, 0, 12), V3(0, 0, -1), 17.5f, 16, 31, true, 12, 24, -1);
     facadeRow(V3(-14, 0, 90), V3(1, 0, 0), 40, 16, 32, true, 12, 28, -1);
-    building(-200, 12, -69.5f, 200, 20, 0, hexc(0x7d4b3b), 33);
+    facadeRow(V3(-69.5f, 0, 12), V3(0, 0, -1), 130.5f, 16, 103, true, 12, 22, -1);
+    building(-200, 28, -69.5f, 200, 20, 0, hexc(0x7d4b3b), 33);
     building(-69.5f, 28, -52, 200, 18, 1, hexc(0xbfb6a4), 34);
     building(-52, 50, -30, 200, 16, 0, hexc(0x6f4638), 35, false);
-    building(-30, 90, -14, 200, 24, 0, hexc(0x8a5a44), 36);
+    facadeRow(V3(-14, 0, 200), V3(1, 0, 0), 110, 16, 104, true, 12, 30, -1);
     hydrant(-9.9f, 20, SH, true, PI / 2);          // open hydrant spraying across the avenue
     hydrant(-30, 7.6f, SH, false);
     tree(-10.3f, 32, SH); tree(-10.3f, 58, SH); tree(-56, 8.1f, SH);
@@ -2918,11 +2932,12 @@ static void brownstone(float z0, int i) {
 
 static void buildSE() {
     for (int i = 0; i < 7; i++) brownstone(30.f + i * 6.f, i);
-    building(16, 72, 30, 200, 20, 0, hexc(0x6e4a3a), 70);
+    facadeRow(V3(16, 0, 72), V3(-1, 0, 0), 128, 14, 105, true, 12, 24, -1);
     facadeRow(V3(16, 0, 12), V3(-1, 0, 0), 18, 14, 71, true, 12, 20, 0);
     facadeRow(V3(30, 0, 12), V3(0, 0, -1), 14, 18, 72, true, 12, 20, 0);
     building(30, 45, 200, 200, 32, 1, hexc(0xb8ae9c), 73);
-    building(69.5f, 12, 200, 45, 26, 0, hexc(0x7a4b3c), 74);
+    facadeRow(V3(200, 0, 12), V3(0, 0, -1), 130.5f, 16, 106, true, 12, 26, 0);
+    building(69.5f, 28, 200, 45, 24, 0, hexc(0x7a4b3c), 74);
     // construction site behind a plywood fence, sidewalk shed over the sidewalk
     Col ply = hexc(0x2d5a8a);
     auto fenceSeg = [&](float xa, float xb) {
@@ -3006,15 +3021,17 @@ static void parkedCars() {
 
 static void buildPromenade() {
     float top = SH;
-    overlay(-600, -86.6f, 600, -76.4f, top + 0.01f, hexc(0x8b6d4e), MAT_WOOD);
-    world.addBox(0, -81.5f, 0, 600, 5.1f, -0.3f, top, SURF_WOOD);
+    overlay(-1400, -86.6f, 1400, -76.4f, top + 0.01f, hexc(0x8b6d4e), MAT_WOOD);
+    world.addBox(0, -81.5f, 0, 1400, 5.1f, -0.3f, top, SURF_WOOD);
     // seawall + granite coping + railing
-    SM.quadOut(V3(-600, top, RIVER_EDGE_Z), V3(600, top, RIVER_EDGE_Z), V3(600, WATER_LEVEL - 3, RIVER_EDGE_Z), V3(-600, WATER_LEVEL - 3, RIVER_EDGE_Z),
+    SM.quadOut(V3(-1400, top, RIVER_EDGE_Z), V3(1400, top, RIVER_EDGE_Z), V3(1400, WATER_LEVEL - 3, RIVER_EDGE_Z), V3(-1400, WATER_LEVEL - 3, RIVER_EDGE_Z),
                V3(0, 0, -1), hexc(0x6f6a62), MAT_CONCRETE);
-    SM.boxAA(V3(-600, top, RIVER_EDGE_Z), V3(600, top + 0.12f, RIVER_EDGE_Z + 0.5f), hexc(0x9a958c), MAT_GRANITE);
-    handrail(V3(-200, top + 1.05f, RIVER_EDGE_Z + 0.25f), V3(200, top + 1.05f, RIVER_EDGE_Z + 0.25f), true, hexc(0x2b3a33), 2.0f);
-    SM.limb(V3(-200, top + 0.55f, RIVER_EDGE_Z + 0.25f), V3(200, top + 0.55f, RIVER_EDGE_Z + 0.25f), 0.035f, 0.035f, V3(0, 1, 0), hexc(0x2b3a33), MAT_METAL);
-    for (int i = -3; i <= 3; i++) {    // benches facing the river
+    SM.boxAA(V3(-1400, top, RIVER_EDGE_Z), V3(1400, top + 0.12f, RIVER_EDGE_Z + 0.5f), hexc(0x9a958c), MAT_GRANITE);
+    handrail(V3(-400, top + 1.05f, RIVER_EDGE_Z + 0.25f), V3(400, top + 1.05f, RIVER_EDGE_Z + 0.25f), true, hexc(0x2b3a33), 2.0f);
+    for (int sd = -1; sd <= 1; sd += 2)   // beyond the playable stretch: a lighter railing (no posts every 2 m)
+        SM.limb(V3(sd * 400.f, top + 1.05f, RIVER_EDGE_Z + 0.25f), V3(sd * 1400.f, top + 1.05f, RIVER_EDGE_Z + 0.25f), 0.06f, 0.06f, V3(0, 1, 0), hexc(0x2b3a33), MAT_METAL);
+    SM.limb(V3(-1400, top + 0.55f, RIVER_EDGE_Z + 0.25f), V3(1400, top + 0.55f, RIVER_EDGE_Z + 0.25f), 0.035f, 0.035f, V3(0, 1, 0), hexc(0x2b3a33), MAT_METAL);
+    for (int i = -10; i <= 10; i++) {    // benches facing the river
         if (i == 0) continue;
         float x = i * 18.f, z = -84.3f;
         Col seat = hexc(0x8a6038), frame_ = hexc(0x22302a);
@@ -3024,8 +3041,8 @@ static void buildPromenade() {
         world.solids[si].noGround = true;
         addRailW(V3(x - 1.1f, top + 0.46f, z - 0.28f), V3(x + 1.1f, top + 0.46f, z - 0.28f), RK_WOOD);
     }
-    for (float x = -64; x <= 64; x += 16) streetLamp(x, -75.2f, top, PI);
-    for (float x = -56; x <= 56; x += 16) if (std::fabs(x) > 10) tree(x, -75.6f, top, 0.85f);
+    for (float x = -192; x <= 192; x += 16) streetLamp(x, -75.2f, top, PI);
+    for (float x = -184; x <= 184; x += 16) if (std::fabs(x) > 10) tree(x, -75.6f, top, 0.85f);
     pigeonSpots.push_back(V3(-20, top, -81));
     pigeonSpots.push_back(V3(30, top, -82));
     letterPos.push_back(V3(40, top + 1.05f + 0.85f, RIVER_EDGE_Z + 0.25f));   // 'E' above the river railing
@@ -3033,7 +3050,7 @@ static void buildPromenade() {
     npcPaths.push_back({{V3(68, top, -82.6f), V3(-68, top, -82.6f)}, false});
     // river
     const int NX = 48, NZ = 24;
-    float rx0 = -700, rx1 = 700, rz0 = -900, rz1 = RIVER_EDGE_Z;
+    float rx0 = -1600, rx1 = 1600, rz0 = -1300, rz1 = RIVER_EDGE_Z;
     uint32_t base = (uint32_t)WM.v.size();
     for (int j = 0; j <= NZ; j++)
         for (int i = 0; i <= NX; i++) {
@@ -3057,14 +3074,14 @@ static void buildSkyline() {
         if (r.chance(0.08f)) h = r.range(60, 110);
         building(x, z, x + w, z + d, h, r.chance(0.3f) ? 1 : 0, hexc(cols[r.irange(0, 6)]), r.next(), false);
     }
-    SM.quadN(V3(-700, 0.5f, -420), V3(700, 0.5f, -420), V3(700, 0.5f, -900), V3(-700, 0.5f, -900), V3(0, 1, 0), hexc(0x5a574f), MAT_CONCRETE);
-    SM.quadOut(V3(-700, 0.5f, -420), V3(700, 0.5f, -420), V3(700, WATER_LEVEL - 2, -420), V3(-700, WATER_LEVEL - 2, -420), V3(0, 0, 1), hexc(0x5a574f), MAT_CONCRETE);
+    SM.quadN(V3(-1600, 0.5f, -420), V3(1600, 0.5f, -420), V3(1600, 0.5f, -1300), V3(-1600, 0.5f, -1300), V3(0, 1, 0), hexc(0x5a574f), MAT_CONCRETE);
+    SM.quadOut(V3(-1600, 0.5f, -420), V3(1600, 0.5f, -420), V3(1600, WATER_LEVEL - 2, -420), V3(-1600, WATER_LEVEL - 2, -420), V3(0, 0, 1), hexc(0x5a574f), MAT_CONCRETE);
     // Manhattan: a ring of towers behind the block
     for (int i = 0; i < 150; i++) {
         float a = r.range(-PI * 0.62f, PI * 0.62f);
         float rad = r.range(230, 520);
         float x = std::sin(a) * rad * 1.3f, z = std::cos(a) * rad;
-        if (z < 60 && std::fabs(x) < 220) continue;
+        if (z < 60 || std::fabs(x) < 70) continue;   // keep the avenue, cross street and river clear
         float w = r.range(18, 40), d = r.range(18, 40), h = r.range(35, 150);
         int style = r.irange(0, 2);
         building(x - w / 2, z - d / 2, x + w / 2, z + d / 2, h, style, hexc(cols[r.irange(0, 6)]), r.next(), false);
@@ -3081,17 +3098,50 @@ static void buildSkyline() {
         SM.cylinder(frame(x, 215, z, 0), 5, 30, 8, hexc(0xd8d0c0), MAT_METAL, true, 0.4f);
         SM.cylinder(frame(x, 245, z, 0), 0.6f, 35, 6, hexc(0xb0b0b0), MAT_METAL, true, 0.1f);
     }
-    // suspension bridge over the river to the west
+    // suspension bridge over the river to the west: main span between two towers, granite anchorages on
+    // both shores where the cables tie down, and approach viaducts carrying the road on into each city
     {
-        float bx = -190, deckY = 38;
+        const float bx = -190, deckY = 38, anchorN = -60, anchorS = -460;
         float tz[2] = {-170, -350};
-        Col stone = hexc(0x9a8c78);
+        Col stone = hexc(0x9a8c78), steel = hexc(0x4a4a4a), cable = hexc(0x55504a);
         for (float z : tz) {
             for (int s = -1; s <= 1; s += 2) SM.boxAA(V3(bx + s * 9 - 3, WATER_LEVEL, z - 4), V3(bx + s * 9 + 3, 88, z + 4), stone, MAT_GRANITE);
             SM.boxAA(V3(bx - 12, 70, z - 4), V3(bx + 12, 80, z + 4), stone, MAT_GRANITE);
             SM.boxAA(V3(bx - 12, deckY - 4, z - 4), V3(bx + 12, deckY, z + 4), stone, MAT_GRANITE);
         }
-        SM.boxAA(V3(bx - 11, deckY - 1.5f, -600), V3(bx + 11, deckY + 0.5f, -60), hexc(0x4a4a4a), MAT_METAL);
+        // deck with stiffening girders along both edges
+        SM.boxAA(V3(bx - 11, deckY - 1.5f, anchorS), V3(bx + 11, deckY + 0.5f, anchorN), steel, MAT_METAL);
+        for (int s = -1; s <= 1; s += 2)
+            SM.boxAA(V3(bx + s * 11 - 0.4f, deckY - 4.5f, anchorS), V3(bx + s * 11 + 0.4f, deckY + 1.2f, anchorN), hexc(0x3d3f42), MAT_METAL);
+        // anchorages: massive stepped masonry blocks
+        for (int end = 0; end < 2; end++) {
+            float z0 = end == 0 ? anchorN - 2 : anchorS - 30, z1 = end == 0 ? anchorN + 36 : anchorS + 10;
+            float base = end == 0 ? 0.f : 0.5f;
+            SM.boxAA(V3(bx - 16, base, z0), V3(bx + 16, deckY - 1.5f, z1), stone, MAT_GRANITE);
+            SM.boxAA(V3(bx - 14, deckY - 1.5f, z0 + 3), V3(bx + 14, deckY + 7, z1 - 3), shade(stone, 0.92f), MAT_GRANITE);
+            SM.boxAA(V3(bx - 16.5f, deckY + 7, z0 + 2), V3(bx + 16.5f, deckY + 8.2f, z1 - 2), shade(stone, 1.05f), MAT_GRANITE);
+        }
+        // approach viaducts: the road leaves the anchorage and descends on twin-column piers
+        auto viaduct = [&](float zFrom, float zTo, float yFrom, float yTo, const std::vector<float>& piers) {
+            float dz = zTo - zFrom;
+            const int N = 12;
+            for (int i = 0; i < N; i++) {
+                float t0 = (float)i / N, t1 = (float)(i + 1) / N;
+                float za = zFrom + dz * t0, zb = zFrom + dz * t1;
+                float ya = lerpf(yFrom, yTo, smooth01(t0)), yb = lerpf(yFrom, yTo, smooth01(t1));
+                M4 F = mBasis(V3(1, 0, 0), norm(V3(0, yb - ya, zb - za)), norm(cross(V3(1, 0, 0), norm(V3(0, yb - ya, zb - za)))), V3(bx, (ya + yb) * 0.5f, (za + zb) * 0.5f));
+                float half = len(V3(0, yb - ya, zb - za)) * 0.5f + 0.05f;
+                SM.box(F * mTranslate(V3(0, 0, -0.5f)), V3(11, half, 1.0f), steel, MAT_METAL);
+                for (int s = -1; s <= 1; s += 2) SM.box(F * mTranslate(V3(s * 10.8f, 0, 0.3f)), V3(0.4f, half, 0.6f), hexc(0x3d3f42), MAT_METAL);
+            }
+            for (float pz : piers) {
+                float t = sat((pz - zFrom) / dz), py = lerpf(yFrom, yTo, smooth01(t)) - 1.5f;
+                for (int s = -1; s <= 1; s += 2) SM.boxAA(V3(bx + s * 7 - 1.1f, 0, pz - 1.1f), V3(bx + s * 7 + 1.1f, py, pz + 1.1f), stone, MAT_CONCRETE);
+                SM.boxAA(V3(bx - 11, py - 1.4f, pz - 1.3f), V3(bx + 11, py, pz + 1.3f), stone, MAT_CONCRETE);
+            }
+        };
+        viaduct(anchorN + 36, 85, deckY + 0.5f, 17, {-18.f, 18.f, 40.f, 62.f});
+        viaduct(anchorS - 30, -640, deckY + 0.5f, 8, {-515.f, -545.f, -575.f, -605.f});
         for (int s = -1; s <= 1; s += 2) {
             float cx = bx + s * 9;
             auto cableY = [&](float z) {
@@ -3100,14 +3150,146 @@ static void buildSkyline() {
                 float t = (z - tz[1]) / (tz[0] - tz[1]);
                 return 88 - 4 * (88 - deckY - 6) * t * (1 - t);
             };
-            float prev = -560;
-            for (float z = -560 + 10; z <= -60; z += 10) {
-                SM.limb(V3(cx, cableY(prev), prev), V3(cx, cableY(z), z), 0.9f, 0.9f, V3(1, 0, 0), hexc(0x55504a), MAT_METAL);
-                if (z < -65 && z > -555) SM.limb(V3(cx, deckY, z), V3(cx, cableY(z), z), 0.15f, 0.15f, V3(1, 0, 0), hexc(0x55504a), MAT_METAL);
+            float prev = anchorS;
+            for (float z = anchorS + 10; z <= anchorN; z += 10) {
+                SM.limb(V3(cx, cableY(prev), prev), V3(cx, cableY(z), z), 0.9f, 0.9f, V3(1, 0, 0), cable, MAT_METAL);
+                if (z < anchorN - 5 && z > anchorS + 5) SM.limb(V3(cx, deckY, z), V3(cx, cableY(z), z), 0.15f, 0.15f, V3(1, 0, 0), cable, MAT_METAL);
                 prev = z;
             }
         }
     }
+}
+
+// Lightweight tree for the far background
+static void farTree(float x, float z, float y0) {
+    Rng r((uint32_t)(x * 131 + z * 71 + 999));
+    V3 top(x, y0 + 2.6f, z);
+    SM.capsule(V3(x, y0, z), top, 0.14f, 0.09f, V3(1, 0, 0), hexc(0x4a3c30), MAT_BARK, 1.f, 0.3f, 6);
+    V3 crownC = top + V3(0, 1.25f, 0), crownR(1.75f, 1.35f, 1.75f);
+    for (int k = 0; k < 8; k++) {
+        V3 d(r.range(-1, 1), r.range(-0.6f, 1), r.range(-1, 1));
+        float rad = r.range(0.8f, 1.1f);
+        leafClump(crownC + mulv(norm(d), crownR) * 0.55f, V3(rad, rad * 0.85f, rad), crownC, crownR, mixc(hexc(0x365f24), hexc(0x6b8c33), r.f()), 6, 4);
+    }
+}
+
+// Background buildings lining a street past the detailed blocks: windowed facades (rooms behind every
+// window), a shopfront with its interior and a sign on most ground floors, now and then an alley or a
+// tower. Render only: nothing out here can be reached.
+static void farRow(V3 left, V3 out, float length, float maxDepth, uint32_t seed) {
+    V3 up(0, 1, 0), r = cross(up, out);
+    Rng rng(seed);
+    static const uint32_t bricks[] = {0x8e4a36, 0x7a3b2c, 0xa0664a, 0x9c7a5a, 0x6e4535, 0xb08560, 0x8a5a44, 0x5e3a2e};
+    static const uint32_t stones[] = {0xc8bfae, 0xb5ad9f, 0xd6ccb8, 0x9e978b, 0x8899aa};
+    static const uint32_t signs[] = {0xb3201b, 0xf2c318, 0x1f6b3a, 0x1d3f8f, 0x151515, 0xf0efe8, 0x7d1d4a, 0xe06a12};
+    float x = 0;
+    while (x < length - 4) {
+        if (rng.chance(0.07f)) { x += rng.range(6.f, 10.f); continue; }   // alley
+        float w = std::min(rng.range(9.f, 22.f), length - x);
+        float depth = rng.range(14.f, maxDepth);
+        V3 p0 = left + r * x, p1 = left + r * (x + w), back = out * -depth;
+        V3 mn(std::min({p0.x, p1.x, p0.x + back.x, p1.x + back.x}), 0, std::min({p0.z, p1.z, p0.z + back.z, p1.z + back.z}));
+        V3 mx(std::max({p0.x, p1.x, p0.x + back.x, p1.x + back.x}), 0, std::max({p0.z, p1.z, p0.z + back.z, p1.z + back.z}));
+        int style = rng.chance(0.62f) ? 0 : (rng.chance(0.75f) ? 1 : 2);
+        float h = 4.8f + 3.3f * rng.irange(2, style == 2 ? 16 : 9) + 0.4f;
+        if (rng.chance(0.06f)) { style = rng.chance(0.5f) ? 2 : 1; h = rng.range(70.f, 140.f); }   // an occasional tower
+        Col col = style == 0 ? hexc(bricks[rng.irange(0, 7)]) : hexc(stones[rng.irange(0, 4)]);
+        building(mn.x, mn.z, mx.x, mx.z, h, style, col, rng.next(), rng.chance(0.2f), false);
+        if (rng.chance(0.85f)) {
+            V3 g0 = p0 + r * 0.7f + out * 0.08f, g1 = p1 - r * 0.7f + out * 0.08f;
+            SM.quadN(g0 + up * 0.6f, g1 + up * 0.6f, g1 + up * 3.4f, g0 + up * 3.4f, out, Col(255, 255, 255), MAT_SHOPGLASS);
+            SM.box(mBasis(r, up, out, (p0 + p1) * 0.5f + up * 4.1f + out * 0.14f), V3(w * 0.5f - 0.9f, 0.34f, 0.06f), hexc(signs[rng.irange(0, 7)]),
+                   rng.chance(0.4f) ? MAT_EMISSIVE : MAT_PAINTED);
+            if (rng.chance(0.4f)) {   // awning
+                V3 a0 = p0 + r * 0.5f + up * 3.5f + out * 0.1f, a1 = p1 - r * 0.5f + up * 3.5f + out * 0.1f;
+                Col ac = hexc(signs[rng.irange(0, 7)]);
+                SM.quadOut(a0, a1, a1 + out * 1.3f - up * 0.6f, a0 + out * 1.3f - up * 0.6f, up + out, ac, MAT_AWNING);
+                SM.quadOut(a0, a1, a1 + out * 1.3f - up * 0.6f, a0 + out * 1.3f - up * 0.6f, (up + out) * -1.f, shade(ac, 0.6f), MAT_AWNING);
+            }
+        }
+        x += w;
+    }
+}
+
+// Past the edges of the skateable block the city keeps going: street furniture, parked cars and
+// pedestrians continue down every street, and landmark buildings close the long street views.
+static void buildOutskirts() {
+    Rng r(8080);
+    Col cab = hexc(0xf2c318);
+    static const uint32_t carCols[] = {0x1b1b1d, 0x7a1f22, 0x9ca3a8, 0x274a78, 0x2e4a2e, 0xd8d4c8, 0x5a3a2a};
+    auto carsAlong = [&](V3 a, V3 b, float yaw) {   // a row of parked cars with random gaps
+        V3 d = b - a;
+        float L = len(d);
+        for (float t = 0; t < L; t += 6.8f) {
+            int type = r.chance(0.35f) ? 0 : r.irange(1, 3);
+            Col c = type == 0 ? cab : hexc(carCols[r.irange(0, 6)]);
+            if (r.chance(0.3f)) continue;
+            V3 p = a + d * (t / L);
+            parkedCar(p.x, p.z, yaw, type, c);
+        }
+    };
+    // avenue north of the block
+    for (float z = 73; z < 196; z += 24) streetLamp(-9.7f, z, SH, PI / 2);
+    for (float z = 70; z < 196; z += 24) streetLamp(9.7f, z, SH, -PI / 2);
+    for (float z = 84; z < 196; z += 26) tree(-10.3f, z, SH);
+    for (float z = 97; z < 196; z += 26) tree(10.3f, z, SH);
+    carsAlong(V3(-7.7f, 0, 76), V3(-7.7f, 0, 196), 0);
+    carsAlong(V3(7.7f, 0, 62), V3(7.7f, 0, 196), 0);
+    hydrant(-9.9f, 130, SH, false); hydrant(9.9f, 108, SH, false);
+    // cross street west and east
+    for (int side = -1; side <= 1; side += 2) {
+        float sx = (float)side;
+        for (float x = 80; x < 198; x += 24) streetLamp(sx * x, -7.6f, SH, 0);
+        for (float x = 92; x < 198; x += 24) streetLamp(sx * x, 7.6f, SH, PI);
+        for (float x = 74; x < 198; x += 26) { tree(sx * x, -8.1f, SH); tree(sx * (x + 13), 8.1f, SH); }
+        carsAlong(V3(sx * 72, 0, -5.7f), V3(sx * 196, 0, -5.7f), PI / 2);
+        carsAlong(V3(sx * 72, 0, 5.7f), V3(sx * 196, 0, 5.7f), PI / 2);
+        hydrant(sx * 115, -7.6f, SH, false);
+        // Water Street
+        for (float x = 76; x < 170; x += 24) streetLamp(sx * x, -59.3f, SH, PI);
+        carsAlong(V3(sx * 64, 0, -63.8f), V3(sx * 168, 0, -63.8f), PI / 2);
+        pigeonSpots.push_back(V3(sx * 120, SH, -9.5f));
+    }
+    // ...and on to the horizon: background blocks, lamps, trees and cars down every street
+    V3 X(1, 0, 0), Z(0, 0, 1);
+    farRow(V3(-210, 0, 12), Z * -1.f, 1190, 22, 201);      // cross street west, north side
+    farRow(V3(-1400, 0, -12), Z, 1190, 22, 202);           // cross street west, south side
+    farRow(V3(1400, 0, 12), Z * -1.f, 1200, 22, 203);      // cross street east, north side
+    farRow(V3(200, 0, -12), Z, 1200, 22, 204);             // cross street east, south side
+    farRow(V3(-14, 0, 1400), X, 1200, 30, 205);            // avenue north, west side
+    farRow(V3(16, 0, 200), X * -1.f, 1200, 30, 206);       // avenue north, east side
+    farRow(V3(-210, 0, -57), Z * -1.f, 1190, 22, 207);     // Water Street west
+    farRow(V3(1400, 0, -57), Z * -1.f, 1200, 22, 208);     // Water Street east
+    for (float d = 210; d < 1400; d += 32) {
+        for (int sd = -1; sd <= 1; sd += 2) {
+            streetLamp(sd * d, -7.6f, SH, 0, false);
+            streetLamp(sd * (d + 16), 7.6f, SH, PI, false);
+            streetLamp(sd * (d + 8), -59.3f, SH, PI, false);
+            streetLamp(-9.7f, d + (sd > 0 ? 16.f : 0.f), SH, PI / 2, false);
+            streetLamp(9.7f, d + (sd > 0 ? 0.f : 16.f), SH, -PI / 2, false);
+        }
+        if ((int)d % 64 < 32) {
+            farTree(-d - 10, -8.1f, SH); farTree(d + 10, 8.1f, SH);
+            farTree(-10.3f, d + 24, SH); farTree(10.3f, d + 8, SH);
+        }
+    }
+    for (float d = 204; d < 560; d += 6.8f) {   // parked cars thin out with distance
+        for (int sd = -1; sd <= 1; sd += 2) {
+            float keep = 0.75f - (d - 200) / 700.f;
+            if (r.chance(keep)) carGeom(SM, frame(sd * d, 0, sd > 0 ? 5.7f : -5.7f, PI / 2), r.chance(0.35f) ? 0 : r.irange(1, 3), r.chance(0.35f) ? cab : hexc(carCols[r.irange(0, 6)]));
+            if (r.chance(keep)) carGeom(SM, frame(sd > 0 ? 7.7f : -7.7f, 0, d, 0), r.chance(0.35f) ? 0 : r.irange(1, 3), r.chance(0.35f) ? cab : hexc(carCols[r.irange(0, 6)]));
+        }
+    }
+    // pedestrians out on the far sidewalks
+    npcPaths.push_back({{V3(-12.8f, SH, 70), V3(-12.8f, SH, 192)}, false});
+    npcPaths.push_back({{V3(11.2f, SH, 70), V3(11.2f, SH, 192)}, false});
+    npcPaths.push_back({{V3(-70, SH, -10.2f), V3(-190, SH, -10.2f)}, false});
+    npcPaths.push_back({{V3(-70, SH, 10.4f), V3(-190, SH, 10.4f)}, false});
+    npcPaths.push_back({{V3(70, SH, 10.2f), V3(190, SH, 10.2f)}, false});
+    npcPaths.push_back({{V3(60, SH, -10.0f), V3(190, SH, -10.0f)}, false});
+    npcPaths.push_back({{V3(-70, SH, -59.8f), V3(-165, SH, -59.8f)}, false});
+    npcPaths.push_back({{V3(-190, SH, -80.5f), V3(-70, SH, -80.5f)}, false});
+    npcPaths.push_back({{V3(70, SH, -80.5f), V3(190, SH, -80.5f)}, false});
 }
 
 static V3 SPAWN_POS(3.0f, 0.0f, 22.0f);
@@ -3122,6 +3304,7 @@ static void buildLevel() {
     buildSE();
     parkedCars();
     buildPromenade();
+    buildOutskirts();
     buildSkyline();
     letterPos.insert(letterPos.begin(), V3(28, SH + 5.4f, -34.5f));   // 'S' high above the fountain spout
     // order the letters S K A T E
@@ -4545,20 +4728,25 @@ static void updatePigeons(float dt, const Player& pl) {
     if (flock) sfx(SFX_PIGEONS, 0.7f);
 }
 static void drawPigeons(MeshBuilder& mb, V3 cam) {
-    Col body = hexc(0x7d8088), head = hexc(0x4f5a5e), wing = hexc(0x8f939a);
+    Col body = hexc(0x7d8088), head = hexc(0x4f5a5e), neck = hexc(0x4a6a60), wing = hexc(0x8f939a), tail = hexc(0x3f464a), beak = hexc(0x2a2624), legs = hexc(0xb05a50);
     for (auto& p : pigeons) {
         if (p.state == 2 || len(p.pos - cam) > 70.f) continue;
         M4 F = mTranslate(p.pos) * mRotY(p.yaw);
         float bob = p.state == 0 ? std::max(0.f, std::sin(p.peck * 5.f)) * 0.05f : 0;
-        mb.box(F * mTranslate(V3(0, 0.1f, 0)), V3(0.055f, 0.055f, 0.11f), body, MAT_CLOTH);
-        mb.box(F * mTranslate(V3(0, 0.17f - bob, 0.1f + bob * 0.5f)), V3(0.035f, 0.035f, 0.04f), head, MAT_CLOTH);
-        mb.box(F * mTranslate(V3(0, 0.1f, -0.14f)), V3(0.04f, 0.012f, 0.05f), head, MAT_CLOTH);
+        mb.sphere(F * mTranslate(V3(0, 0.11f, -0.01f)) * mRotX(0.25f), V3(0.058f, 0.058f, 0.11f), 8, 5, body, MAT_CLOTH);
+        mb.sphere(F * mTranslate(V3(0, 0.15f - bob * 0.5f, 0.07f + bob * 0.3f)), V3(0.036f, 0.04f, 0.036f), 7, 4, neck, MAT_PAINTED);
+        mb.sphere(F * mTranslate(V3(0, 0.185f - bob, 0.1f + bob * 0.5f)), V3(0.028f, 0.028f, 0.032f), 7, 4, head, MAT_CLOTH);
+        mb.box(F * mTranslate(V3(0, 0.18f - bob, 0.135f + bob * 0.5f)), V3(0.006f, 0.006f, 0.012f), beak, MAT_PLAIN);
+        mb.box(F * mTranslate(V3(0, 0.12f, -0.14f)) * mRotX(-0.2f), V3(0.035f, 0.008f, 0.05f), tail, MAT_CLOTH);
         if (p.state == 1) {
             float a = std::sin(p.flap) * 0.9f;
             for (int s = -1; s <= 1; s += 2)
-                mb.box(F * mTranslate(V3(s * 0.05f, 0.12f, 0)) * mRotZ(s * a) * mTranslate(V3(s * 0.13f, 0, 0)), V3(0.13f, 0.008f, 0.07f), wing, MAT_CLOTH);
+                mb.sphere(F * mTranslate(V3(s * 0.05f, 0.13f, 0)) * mRotZ(s * a) * mTranslate(V3(s * 0.13f, 0, 0)), V3(0.13f, 0.01f, 0.065f), 7, 3, wing, MAT_CLOTH);
         } else {
-            for (int s = -1; s <= 1; s += 2) mb.box(F * mTranslate(V3(s * 0.05f, 0.11f, -0.02f)), V3(0.012f, 0.04f, 0.09f), wing, MAT_CLOTH);
+            for (int s = -1; s <= 1; s += 2) {
+                mb.sphere(F * mTranslate(V3(s * 0.045f, 0.12f, -0.03f)) * mRotX(0.2f), V3(0.018f, 0.04f, 0.095f), 7, 4, wing, MAT_CLOTH);
+                mb.limb(xPoint(F, V3(s * 0.02f, 0.0f, 0)), xPoint(F, V3(s * 0.02f, 0.07f, 0)), 0.008f, 0.008f, V3(1, 0, 0), legs, MAT_PLAIN);
+            }
         }
     }
 }
@@ -4585,10 +4773,10 @@ static void initTraffic() {
     Rng r(555);
     Col cols[] = {hexc(0xf2c318), hexc(0xf2c318), hexc(0xf2c318), hexc(0x1b1b1d), hexc(0x7a1f22), hexc(0x9ca3a8), hexc(0x274a78), hexc(0xd8d4c8)};
     for (int l = 0; l < 4; l++)
-        for (int k = 0; k < 3; k++) {
+        for (int k = 0; k < 7; k++) {
             Car c;
             c.lane = l;
-            c.x = -120.f + k * 80.f + r.range(-10, 10);
+            c.x = -560.f + k * 170.f + r.range(-20, 20);
             c.speed = c.target = r.range(8.f, 11.f);
             c.col = cols[r.irange(0, 7)];
             c.type = c.col.r == 0xf2 ? 0 : r.irange(1, 3);
@@ -4625,7 +4813,7 @@ static void updateTraffic(float dt, Player& pl) {
         c.brake = want < c.speed - 0.2f ? 1.f : 0.f;
         c.speed = approach(c.speed, want, acc * dt);
         c.x += c.speed * L.dir * dt;
-        if (c.x * L.dir > 140.f) c.x = -140.f * L.dir;
+        if (c.x * L.dir > 620.f) c.x = -620.f * L.dir;
         // hit the skater?
         if (pl.state != ST_BAIL && pl.pos.y < 1.6f) {
             float dx = std::fabs(pl.pos.x - c.x), dz = std::fabs(pl.pos.z - L.z);
@@ -4642,7 +4830,7 @@ static void updateTraffic(float dt, Player& pl) {
 static void drawTraffic(MeshBuilder& mb, V3 cam) {
     for (auto& c : cars) {
         const Lane& L = LANES[c.lane];
-        if (std::fabs(c.x - cam.x) > 150) continue;
+        if (std::fabs(c.x - cam.x) > 650) continue;
         carGeom(mb, frame(c.x, 0, L.z, L.dir > 0 ? PI / 2 : -PI / 2), c.type, c.col, c.brake);
     }
 }
@@ -4684,6 +4872,12 @@ static void updateDynLights() {
         l.radius = 7.f; l.dir = fwdYaw(t.yaw); l.cosOuter = -0.2f; l.cosInner = 0.3f; l.group = LG_SIGNAL;
         dynLights.push_back(l);
     }
+}
+static void addPlayerFill(V3 camPos, V3 skater) {
+    PointLight f;
+    f.pos = lerp3(camPos, skater + V3(0, 1.2f, 0), 0.35f) + V3(0, 0.8f, 0);
+    f.col = V3(0.62f, 0.7f, 0.9f) * 1.6f; f.radius = 9.f; f.group = LG_SIGNAL;
+    dynLights.push_back(f);
 }
 static void drawLetters(MeshBuilder& mb, const Player& pl, float time) {
     static const char L[5] = {'S', 'K', 'A', 'T', 'E'};
@@ -5668,7 +5862,7 @@ static float renderScale(int W, int H) {
 // Pick the strongest lights around the camera for this frame
 static void gatherLights(V3 cam, V3 camFwd, int maxLights) {
     frameLights.clear();
-    if (LIGHT.lamps <= 0.f) return;
+    if (LIGHT.lamps <= 0.f || getenv("CJ_DEBUG_NOLIGHTS")) return;
     std::vector<std::pair<float, PointLight>> cand;
     auto consider = [&](const PointLight& l) {
         V3 d = l.pos - cam;
@@ -5685,6 +5879,8 @@ static void gatherLights(V3 cam, V3 camFwd, int maxLights) {
     size_t n = std::min(cand.size(), (size_t)maxLights);
     std::partial_sort(cand.begin(), cand.begin() + n, cand.end(), [](const std::pair<float, PointLight>& a, const std::pair<float, PointLight>& b) { return a.first > b.first; });
     for (size_t i = 0; i < n; i++) frameLights.push_back(cand[i].second);
+    if (getenv("CJ_DEBUG_LIGHTLIST"))
+        for (auto& l : frameLights) fprintf(stderr, "light g%d pos %.1f %.2f %.1f r %.1f col %.1f %.1f %.1f\n", l.group, l.pos.x, l.pos.y, l.pos.z, l.radius, l.col.x, l.col.y, l.col.z);
 }
 
 // ----------------------------------------------------------------------------
@@ -6036,6 +6232,13 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     ensureTargets(F.W, F.H, F.shot);
     M4 invVP = mInverse(F.vp);
     gatherLights(F.camPos, F.camFwd, Q.lights);
+    if (getenv("CJ_DEBUG_LIGHTLIST"))
+        for (auto& l : frameLights) {
+            const float* m = F.vp.m;
+            V3 p = l.pos;
+            float cx = m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12], cy = m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13], cw = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
+            if (cw > 0) fprintf(stderr, "screen %.0f %.0f  g%d pos %.1f %.2f %.1f\n", (cx / cw * 0.5f + 0.5f) * F.W, (0.5f - cy / cw * 0.5f) * F.H, l.group, p.x, p.y, p.z);
+        }
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
 
@@ -6241,7 +6444,7 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     setPostUniforms(RD.pPart, F.vp, invVP);
     bindTexU(RD.pPart, "uDepth", TU_A, RD.depth);
     set2f(RD.pPart, "uInvRes", 1.f / RD.iw, 1.f / RD.ih);
-    streamDraw(RD.partVao, RD.partVbo, RD.partEbo, RD.partVCap, RD.partICap, partVerts, partIdx);
+    if (!getenv("CJ_DEBUG_NOPARTICLES")) streamDraw(RD.partVao, RD.partVbo, RD.partEbo, RD.partVCap, RD.partICap, partVerts, partIdx);
     glDisable(GL_BLEND);
 
     // ---- 11. bloom chain
@@ -6899,6 +7102,7 @@ int main(int argc, char** argv) {
             drawLetters(DM, P, time);
             RD.dynMesh.upload(DM, true);
             updateDynLights();
+            if (mode != GM_TITLE) addPlayerFill(cam.pos, P.state == ST_BAIL ? P.bodyPos : P.pos);
 
             FrameInfo fi;
             fi.view = view; fi.proj = proj; fi.vp = proj * view;
