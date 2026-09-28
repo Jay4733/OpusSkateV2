@@ -1404,7 +1404,7 @@ void main(){
     float diff = c.w - sceneZ;
     occ += step(0.02, diff) * clamp(rad / max(diff, 1e-3) - 0.5, 0.0, 1.0);
   }
-  oAO = pow(clamp(1.0 - occ / float(uSamples), 0.0, 1.0), 1.7);
+  oAO = pow(clamp(1.0 - occ / float(uSamples), 0.0, 1.0), 2.2);
 }
 )";
 static const char* AOBLUR_FS = R"(
@@ -1547,6 +1547,35 @@ vec3 aces(vec3 x){
   return clamp(OUT * (a / b), 0.0, 1.0);
 }
 vec3 fetchHdr(vec2 uv){ vec3 c = textureLod(uHdr, uv, 0.0).rgb; return any(isnan(c)) ? vec3(0.0) : min(c, vec3(30000.0)); }
+// Lens flare and glare from a visible sun: xy = sun position (uv), z = strength. Occlusion from the depth buffer.
+uniform vec3 uFlare;
+vec3 lensFlare(vec2 uv){
+  if(uFlare.z <= 0.0) return vec3(0.0);
+  float vis = 0.0;
+  for(int i = 0; i < 16; i++){
+    vec2 p = uFlare.xy + (vec2(float(i % 4), float(i / 4)) - 1.5) * 0.01;
+    if(p.x > 0.0 && p.x < 1.0 && p.y > 0.0 && p.y < 1.0) vis += step(0.99999, textureLod(uDepth, p, 0.0).r);
+  }
+  vis /= 16.0;
+  if(vis <= 0.0) return vec3(0.0);
+  float asp = uDstRes.x / uDstRes.y;
+  vec2 d = (uv - uFlare.xy) * vec2(asp, 1.0);
+  float r = length(d);
+  vec3 f = vec3(1.0, 0.86, 0.66) * (exp(-r * 9.0) * 0.5 + exp(-r * 30.0) * 1.2);             // glare
+  float ang = atan(d.y, d.x);
+  f += vec3(1.0, 0.9, 0.75) * pow(abs(cos(ang * 3.0 + 0.4)), 60.0) * exp(-r * 5.0) * 0.35;    // starburst
+  vec2 axis = vec2(0.5) - uFlare.xy;
+  const float POS[5] = float[5](0.45, 0.8, 1.15, 1.5, 1.9);
+  const float SIZE[5] = float[5](0.035, 0.06, 0.025, 0.09, 0.05);
+  vec3 COL[5] = vec3[5](vec3(0.4, 0.7, 1.0), vec3(1.0, 0.6, 0.3), vec3(0.5, 1.0, 0.6), vec3(0.8, 0.4, 1.0), vec3(1.0, 0.8, 0.4));
+  for(int i = 0; i < 5; i++){
+    vec2 g = (uv - (uFlare.xy + axis * POS[i])) * vec2(asp, 1.0);
+    float gd = length(g);
+    f += COL[i] * (smoothstep(SIZE[i], SIZE[i] * 0.75, gd) * 0.06 + smoothstep(SIZE[i] * 1.02, SIZE[i], gd) * smoothstep(SIZE[i] * 0.9, SIZE[i], gd) * 0.05);
+  }
+  float edge = smoothstep(0.0, 0.08, min(min(uFlare.x, 1.0 - uFlare.x), min(uFlare.y, 1.0 - uFlare.y)) + 0.04);
+  return f * uFlare.z * vis * edge;
+}
 void main(){
   vec2 uv = gl_FragCoord.xy / uDstRes;
   vec2 vel = vec2(0.0);
@@ -1583,7 +1612,7 @@ void main(){
   vec3 bloom = textureLod(uBloom, uv, 0.0).rgb / uBloomLevels;
   c = mix(c, bloom, uBloomStr);
   c = mix(c, bloom * 0.8, uMenuBlur);   // soft backdrop behind menus
-  c = aces(c * uExposure * uWB);
+  c = aces((c * uExposure + lensFlare(uv)) * uWB);
   float l = luma(c);
   c = max(mix(vec3(l), c, uSat), 0.0);
   c = pow(c, vec3(1.0 / 2.2));
@@ -1952,7 +1981,7 @@ struct PointLight {
 static std::vector<PointLight> staticLights, dynLights, frameLights;
 
 // palette
-static const Col C_ASPHALT = hexc(0x46464a), C_SIDEWALK = hexc(0xa9a59c), C_CURB = hexc(0x8f8b84);
+static const Col C_ASPHALT = hexc(0x55555a), C_SIDEWALK = hexc(0xa9a59c), C_CURB = hexc(0x8f8b84);
 static const Col C_GRANITE = hexc(0x8d8a86), C_IRON = hexc(0x1e2220), C_STEEL = hexc(0x9aa0a6);
 static const Col C_WOOD = hexc(0x8a6a48), C_PLYWOOD = hexc(0xc49a62), C_YELLOW = hexc(0xf2c318), C_WHITE = hexc(0xeeeeea);
 
@@ -3374,11 +3403,10 @@ struct Player {
         // pop straight up (popping along a ramp normal would bleed forward speed on kickers)
         if (vel.y < 0 && !fromRail) vel.y *= 0.5f;
         vel += V3(0, 1, 0) * v;
-        if (!fromRail && n.y < 0.6f) qpAir = true;
+        qpAir = !fromRail && n.y < 0.6f;   // popping off a steep transition: vert air
         fromManual = false;
         state = ST_AIR;
         airT = 0;
-        qpAir = false;
         trickThisAir = false;
         crouching = false;
         crouchT = 0;
@@ -4093,18 +4121,39 @@ static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit&
 
 // Skateboard in board space: deck top centre at origin, nose +Z
 static void drawBoard(MeshBuilder& mb, const M4& B) {
-    Col grip = hexc(0x222222), deck = hexc(0xd8402a), truck = hexc(0xb8bcc0), wheel = hexc(0xf0ead8);
-    mb.box(B * mTranslate(V3(0, -0.009f, 0)), V3(0.105f, 0.009f, 0.3f), deck, MAT_PAINTED, 63, &grip);
-    for (int sg = -1; sg <= 1; sg += 2) {
-        M4 K = B * mTranslate(V3(0, -0.009f, sg * 0.3f)) * mRotX(-sg * 0.33f) * mTranslate(V3(0, 0, sg * 0.075f));
-        mb.box(K, V3(0.1f, 0.009f, 0.078f), deck, MAT_PAINTED, 63, &grip);
-        mb.box(B * mTranslate(V3(0, -0.04f, sg * 0.22f)), V3(0.02f, 0.022f, 0.035f), truck, MAT_METAL);
-        mb.box(B * mTranslate(V3(0, -0.062f, sg * 0.22f)), V3(0.085f, 0.012f, 0.014f), truck, MAT_METAL);
-        for (int sx = -1; sx <= 1; sx += 2)
-            mb.cylinder(B * mTranslate(V3(sx * 0.07f, -0.07f, sg * 0.22f)) * mRotZ(PI / 2), 0.028f, 0.032f, 8, wheel, MAT_PLAIN, true);
+    Col grip = hexc(0x1d1d1f), graphic = hexc(0xd8402a), ply = hexc(0xd8b48a), truck = hexc(0xb8bcc0), wheel = hexc(0xf0ead8);
+    // deck outline: straight middle, round nose and tail kicked up ~30 degrees
+    const float HW = 0.105f, MID = 0.3f, T = 0.012f;
+    std::vector<float> zs;
+    for (int i = 0; i <= 6; i++) zs.push_back(-MID - HW * std::sin(PI * 0.5f * (1.f - i / 6.f)));
+    for (int i = 1; i < 6; i++) zs.push_back(-MID + 2 * MID * i / 6.f);
+    for (int i = 0; i <= 6; i++) zs.push_back(MID + HW * std::sin(PI * 0.5f * i / 6.f));
+    auto halfW = [&](float z) { float a = std::fabs(z) - MID; return a <= 0 ? HW : HW * std::sqrt(std::max(0.f, 1.f - (a / HW) * (a / HW))); };
+    auto kick = [&](float z) { float a = std::fabs(z) - 0.25f; return a > 0 ? a * 0.58f : 0.f; };
+    V3 up = xDir(B, V3(0, 1, 0));
+    for (size_t i = 0; i + 1 < zs.size(); i++) {
+        float z0 = zs[i], z1 = zs[i + 1], w0 = halfW(z0), w1 = halfW(z1), y0 = kick(z0), y1 = kick(z1);
+        V3 t00 = xPoint(B, V3(-w0, y0, z0)), t01 = xPoint(B, V3(w0, y0, z0)), t10 = xPoint(B, V3(-w1, y1, z1)), t11 = xPoint(B, V3(w1, y1, z1));
+        V3 b00 = xPoint(B, V3(-w0, y0 - T, z0)), b01 = xPoint(B, V3(w0, y0 - T, z0)), b10 = xPoint(B, V3(-w1, y1 - T, z1)), b11 = xPoint(B, V3(w1, y1 - T, z1));
+        mb.quadOut(t00, t01, t11, t10, up, grip, MAT_RUBBER);
+        mb.quadOut(b00, b01, b11, b10, up * -1.f, graphic, MAT_PAINTED);
+        mb.quadOut(t01, t11, b11, b01, xDir(B, V3(1, 0, 0)), ply, MAT_PLAIN);
+        mb.quadOut(t00, t10, b10, b00, xDir(B, V3(-1, 0, 0)), ply, MAT_PLAIN);
     }
-    // stripe on the bottom
-    mb.box(B * mTranslate(V3(0, -0.0185f, 0)), V3(0.02f, 0.0005f, 0.26f), hexc(0xf0e8d0), MAT_PLAIN, 8);
+    mb.box(B * mTranslate(V3(0, -T - 0.0006f, 0)), V3(0.03f, 0.0005f, 0.22f), hexc(0xf0e8d0), MAT_PAINTED, 8);   // graphic stripe
+    for (int sg = -1; sg <= 1; sg += 2) {
+        float tz = sg * 0.22f;
+        mb.box(B * mTranslate(V3(0, -T - 0.006f, tz)), V3(0.032f, 0.006f, 0.045f), truck, MAT_METAL);           // baseplate
+        mb.box(B * mTranslate(V3(0, -T - 0.026f, tz + sg * 0.01f)), V3(0.018f, 0.02f, 0.022f), truck, MAT_METAL);  // kingpin block
+        mb.box(B * mTranslate(V3(0, -0.058f, tz)), V3(0.07f, 0.013f, 0.016f), truck, MAT_METAL);                   // hanger
+        mb.limb(xPoint(B, V3(-0.1f, -0.066f, tz)), xPoint(B, V3(0.1f, -0.066f, tz)), 0.008f, 0.008f, up, truck, MAT_METAL);   // axle
+        mb.box(B * mTranslate(V3(0, -T - 0.018f, tz - sg * 0.012f)), V3(0.012f, 0.008f, 0.008f), hexc(0xe04a2a), MAT_RUBBER); // bushing
+        for (int sx = -1; sx <= 1; sx += 2) {
+            M4 Wm = B * mTranslate(V3(sx * 0.066f, -0.066f, tz)) * mRotZ(-sx * PI / 2);
+            mb.cylinder(Wm, 0.027f, 0.034f, 14, wheel, MAT_RUBBER, true);
+            mb.cylinder(Wm * mTranslate(V3(0, 0.0345f, 0)), 0.011f, 0.001f, 8, hexc(0x333333), MAT_METAL, true);    // bearing
+        }
+    }
 }
 
 static Outfit PLAYER_OUTFIT;
@@ -5462,7 +5511,7 @@ static const TimeOfDay TODS[] = {
     // name           sun el/az   moon el/az   cloud  fog     fall   fogSun size    expo  bloom lit   emit lamps wet rain stars  white balance              sat    con   lift
     {"GOLDEN HOUR",   16, -46,    -30, 120,    0.40f, 0.0022f, 0.030f, 0.55f, 0.012f, 0.68f, 0.05f, 0.14f, 1.2f, 0.f, 0, 0, 0, V3(1.03f, 1.0f, 0.95f), 1.06f, 1.04f, V3(0.012f, 0.008f, 0.0f)},
     {"MIDDAY",        62, -30,    -30, 120,    0.30f, 0.0016f, 0.030f, 0.35f, 0.010f, 0.36f, 0.04f, 0.08f, 1.0f, 0.f, 0, 0, 0, V3(1.0f, 1.0f, 1.0f),    1.04f, 1.05f, V3(0.0f, 0.004f, 0.01f)},
-    {"SUNSET",        3.2f, -54,  -30, 120,    0.50f, 0.0045f, 0.025f, 0.8f,  0.016f, 1.35f, 0.06f, 0.32f, 1.8f, 0.45f, 0, 0, 0, V3(1.04f, 0.98f, 0.93f), 1.1f, 1.05f, V3(0.02f, 0.01f, 0.02f)},
+    {"SUNSET",        3.2f, -142, -30, 120,    0.50f, 0.0045f, 0.025f, 0.8f,  0.016f, 1.35f, 0.06f, 0.32f, 1.8f, 0.45f, 0, 0, 0, V3(1.04f, 0.98f, 0.93f), 1.1f, 1.05f, V3(0.02f, 0.01f, 0.02f)},
     {"NIGHT",         -24, -46,   36, 150,     0.28f, 0.0040f, 0.035f, 0.5f,  0.02f,  5.0f,  0.08f, 0.5f,  0.6f, 0.5f, 0, 0, 1, V3(0.95f, 0.98f, 1.06f), 1.1f, 1.06f, V3(0.004f, 0.008f, 0.02f)},
     {"RAINY NIGHT",   -24, -46,   36, 150,     0.96f, 0.0110f, 0.030f, 0.4f,  0.06f,  5.5f,  0.09f, 0.55f, 0.6f, 0.5f, 1, 1, 0, V3(0.95f, 0.98f, 1.05f), 1.05f, 1.07f, V3(0.004f, 0.01f, 0.02f)},
 };
@@ -6049,7 +6098,7 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
         setPostUniforms(RD.pSSAO, F.vp, invVP);
         bindTexU(RD.pSSAO, "uDepth", TU_A, RD.depth);
         bindTexU(RD.pSSAO, "uNrm", TU_B, RD.nrm);
-        set1f(RD.pSSAO, "uRadius", 0.55f);
+        set1f(RD.pSSAO, "uRadius", 0.8f);
         set1i(RD.pSSAO, "uSamples", Q.ssao);
         drawFullscreen();
         gl.BindFramebuffer(GL_FRAMEBUFFER, RD.fboAo[1]);
@@ -6237,6 +6286,17 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     setMat(RD.pComposite, "uPrevVP", RD.havePrev ? RD.prevVP : F.vp);
     float motion = (Q.motion && SET.motionBlur && RD.havePrev) ? clampf((1.f / 120.f) / std::max(F.dt, 1e-3f), 0.f, 1.2f) : 0.f;
     set1f(RD.pComposite, "uMotion", motion);
+    {   // sun position on screen for the lens flare
+        float strength = 0;
+        V3 sp = F.camPos + LIGHT.sunPos * 1000.f;
+        const float* m = F.vp.m;
+        float cx = m[0] * sp.x + m[4] * sp.y + m[8] * sp.z + m[12], cy = m[1] * sp.x + m[5] * sp.y + m[9] * sp.z + m[13];
+        float cw = m[3] * sp.x + m[7] * sp.y + m[11] * sp.z + m[15];
+        float disc = std::max({LIGHT.sunDisc.x, LIGHT.sunDisc.y, LIGHT.sunDisc.z});
+        if (cw > 0 && disc > 0 && LIGHT.sunPos.y > -0.02f) strength = std::min(1.f, disc / 8000.f) * (1.f - sat((LIGHT.cloud - 0.6f) / 0.3f));
+        float u = cw > 0 ? cx / cw * 0.5f + 0.5f : -1.f, v = cw > 0 ? cy / cw * 0.5f + 0.5f : -1.f;
+        gl.Uniform3f(U_(RD.pComposite, "uFlare"), u, v, strength);
+    }
     set3(RD.pComposite, "uWB", LIGHT.wb); set1f(RD.pComposite, "uSat", LIGHT.sat);
     set1f(RD.pComposite, "uContrast", LIGHT.contrast); set3(RD.pComposite, "uLift", LIGHT.lift);
     drawFullscreen();
