@@ -44,6 +44,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <map>
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -335,7 +336,8 @@ enum Mat : uint8_t {
     MAT_PLAIN = 0, MAT_BRICK, MAT_WINDOWS, MAT_STONEWIN, MAT_GLASSWALL, MAT_ASPHALT, MAT_SIDEWALK,
     MAT_EMISSIVE, MAT_WOOD, MAT_METAL, MAT_FOLIAGE, MAT_FENCE, MAT_SHOPGLASS, MAT_PAVERS, MAT_AWNING,
     MAT_SKIN, MAT_COURT, MAT_CONCRETE, MAT_GRANITE, MAT_CLOTH, MAT_PAINTED, MAT_WATER, MAT_ROOF, MAT_BRICKBANK,
-    MAT_ROADPAINT, MAT_CARPAINT, MAT_CARGLASS, MAT_RUBBER, MAT_BARK, MAT_BARS
+    MAT_ROADPAINT, MAT_CARPAINT, MAT_CARGLASS, MAT_RUBBER, MAT_BARK, MAT_BARS,
+    MAT_SHELF, MAT_TILE   // stocked shelves and glossy tile floors (shop interiors)
 };
 
 struct Vtx {
@@ -540,6 +542,87 @@ struct GpuMesh {
         if (!count) return;
         gl.BindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+        gl.BindVertexArray(0);
+    }
+};
+
+// Six clip planes of a view-projection matrix, used to skip geometry that cannot be seen
+struct Frustum {
+    float p[6][4];
+    void set(const M4& vp) {
+        const float* m = vp.m;
+        auto row = [&](int r, int c) { return m[c * 4 + r]; };
+        for (int c = 0; c < 4; c++) {
+            p[0][c] = row(3, c) + row(0, c);   // left
+            p[1][c] = row(3, c) - row(0, c);   // right
+            p[2][c] = row(3, c) + row(1, c);   // bottom
+            p[3][c] = row(3, c) - row(1, c);   // top
+            p[4][c] = row(3, c) + row(2, c);   // near
+            p[5][c] = row(3, c) - row(2, c);   // far
+        }
+    }
+    bool visible(V3 mn, V3 mx) const {
+        for (int i = 0; i < 6; i++) {
+            const float* q = p[i];
+            float x = q[0] > 0 ? mx.x : mn.x, y = q[1] > 0 ? mx.y : mn.y, z = q[2] > 0 ? mx.z : mn.z;
+            if (q[0] * x + q[1] * y + q[2] * z + q[3] < 0) return false;
+        }
+        return true;
+    }
+};
+
+// The static city, sorted into square chunks so each pass only draws what its camera or light can reach
+struct StaticMesh {
+    GpuMesh gpu;
+    struct Chunk { int first = 0, count = 0; V3 mn, mx; };
+    std::vector<Chunk> chunks;
+    int lastDrawn = 0;
+    void build(MeshBuilder& mb, float cell = 48.f) {
+        std::map<long long, std::vector<uint32_t>> groups;
+        size_t nt = mb.idx.size() / 3;
+        for (size_t t = 0; t < nt; t++) {
+            const Vtx* a = &mb.v[mb.idx[t * 3]];
+            const Vtx* b = &mb.v[mb.idx[t * 3 + 1]];
+            const Vtx* c = &mb.v[mb.idx[t * 3 + 2]];
+            float ex = std::max({a->p[0], b->p[0], c->p[0]}) - std::min({a->p[0], b->p[0], c->p[0]});
+            float ez = std::max({a->p[2], b->p[2], c->p[2]}) - std::min({a->p[2], b->p[2], c->p[2]});
+            long long key = -1;   // very large triangles (ground, roads, far walls) are always drawn
+            if (std::max(ex, ez) < 70.f) {
+                long long cx = (long long)std::floor((a->p[0] + b->p[0] + c->p[0]) / (3.f * cell));
+                long long cz = (long long)std::floor((a->p[2] + b->p[2] + c->p[2]) / (3.f * cell));
+                key = (cx + 4096) * 8192 + (cz + 4096);
+            }
+            auto& g = groups[key];
+            g.push_back(mb.idx[t * 3]); g.push_back(mb.idx[t * 3 + 1]); g.push_back(mb.idx[t * 3 + 2]);
+        }
+        std::vector<uint32_t> out;
+        out.reserve(mb.idx.size());
+        chunks.clear();
+        for (auto& kv : groups) {
+            Chunk ch;
+            ch.first = (int)out.size();
+            ch.mn = V3(1e30f, 1e30f, 1e30f); ch.mx = V3(-1e30f, -1e30f, -1e30f);
+            for (uint32_t i : kv.second) {
+                const Vtx& v = mb.v[i];
+                ch.mn = V3(std::min(ch.mn.x, v.p[0]), std::min(ch.mn.y, v.p[1]), std::min(ch.mn.z, v.p[2]));
+                ch.mx = V3(std::max(ch.mx.x, v.p[0]), std::max(ch.mx.y, v.p[1]), std::max(ch.mx.z, v.p[2]));
+                out.push_back(i);
+            }
+            ch.count = (int)kv.second.size();
+            chunks.push_back(ch);
+        }
+        mb.idx = out;
+        gpu.upload(mb, false);
+    }
+    void draw(const Frustum* f) {
+        if (!gpu.count) return;
+        gl.BindVertexArray(gpu.vao);
+        lastDrawn = 0;
+        for (const Chunk& c : chunks) {
+            if (f && !f->visible(c.mn, c.mx)) continue;
+            glDrawElements(GL_TRIANGLES, c.count, GL_UNSIGNED_INT, (void*)((size_t)c.first * sizeof(uint32_t)));
+            lastDrawn++;
+        }
         gl.BindVertexArray(0);
     }
 };
@@ -799,7 +882,7 @@ void main(){
 
 static const char* WORLD_FS_MAIN = R"(
 in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat;
-uniform sampler2D uAO; uniform int uUseAO; uniform vec2 uInvRes; uniform int uInlineFog; uniform int uDebug;
+uniform sampler2D uAO; uniform int uUseAO; uniform vec2 uInvRes; uniform int uInlineFog; uniform int uDebug; uniform float uIntGlow;
 layout(location=0) out vec4 oCol; layout(location=1) out vec4 oRefl; layout(location=2) out vec4 oSurf;
 
 float brickH(vec2 b, vec2 sc){
@@ -948,6 +1031,8 @@ void main(){
   vec3 n = normalize(vNrm);
   if(!gl_FrontFacing) n = -n;
   int m = vMat;
+  bool interior = m >= 32;          // shop interiors: room light instead of sun and sky
+  if(interior) m -= 32;
   if((m == 11 || m == 29) && fenceCut(vPos, n, m)) discard;
   bool horiz = abs(n.y) > 0.6;
   vec2 uv; vec3 T, B;
@@ -1080,6 +1165,29 @@ void main(){
   else if(m == 26){ rough = 0.05; f0 = 0.06; alb *= 0.3; porous = 0.0; }
   else if(m == 27){ rough = 0.8; alb *= 0.9 + 0.2 * vnoise(uv * 30.0); } // rubber, grip tape
   else if(m == 28){ alb *= 0.7 + 0.5 * vnoise(vec2(uv.x * 18.0, uv.y * 2.5)); rough = 0.9; }  // bark
+  else if(m == 30){                                                  // shelves stocked with goods
+    vec2 g = uv / vec2(0.13, 0.3) + vec2(seedBase * 3.1, 0.0);
+    vec2 gi = floor(g), gf = fract(g);
+    float aa = 1.0 - smoothstep(0.3, 0.7, max(fwidth(g.x), fwidth(g.y)));
+    float prodH = 0.5 + 0.45 * hash12(gi + 11.0);
+    bool isProd = gf.y > 0.1 && gf.y < prodH && gf.x > 0.07 && gf.x < 0.93;
+    vec3 pc = product(gi + seedBase);
+    float label = 1.0 - smoothstep(0.0, 0.05, abs(gf.y - prodH * 0.55) - prodH * 0.16);
+    vec3 shelf = gf.y <= 0.1 ? toLin(vec3(0.2, 0.17, 0.14)) : toLin(vec3(0.05, 0.05, 0.055));
+    vec3 goods = pc * mix(1.0, 1.45, label);
+    alb = mix(pc * 0.45, isProd ? goods : shelf, aa);
+    rough = isProd ? 0.42 : 0.7;
+    ao = isProd ? 1.0 : mix(0.6, 0.35, aa);
+  } else if(m == 31){                                                // glossy checker tile
+    vec2 t = vPos.xz / 0.45; vec2 ti = floor(t), tf = fract(t);
+    float chk = mod(ti.x + ti.y, 2.0);
+    vec2 fwt = fwidth(t);
+    float aa = 1.0 - smoothstep(0.2, 0.5, max(fwt.x, fwt.y));
+    float grout = mix(1.0, smoothstep(0.0, 0.035, min(min(tf.x, 1.0 - tf.x), min(tf.y, 1.0 - tf.y))), aa);
+    alb = mix(alb, alb * 0.1, chk * aa + 0.5 * (1.0 - aa));
+    alb = mix(toLin(vec3(0.32)), alb, grout);
+    rough = 0.3; f0 = 0.05; ao = mix(0.7, 1.0, grout);
+  }
 
   // ---- bump mapping: procedural height, finite differences along the surface axes
   vec3 N = n;
@@ -1114,7 +1222,7 @@ void main(){
   vec3 diffC = alb * (1.0 - metal);
   float ndlG = dot(n, uSunDir);
   float ndl = dot(N, uSunDir);
-  float sh = (ndlG > -0.3 || wrap > 0.0) ? shadowSoft(vPos, n, max(ndlG, 0.0)) : 0.0;
+  float sh = interior ? 0.0 : ((ndlG > -0.3 || wrap > 0.0) ? shadowSoft(vPos, n, max(ndlG, 0.0)) : 0.0);
   float dif = clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
   float rs = max(rough, 0.035);
   float a2 = rs * rs * rs * rs;
@@ -1129,9 +1237,11 @@ void main(){
   if(trans > 0.0) col += diffC * uSunCol * trans * pow(max(dot(-V, uSunDir), 0.0), 4.0) * mix(0.3, 1.0, sh);
   float ssao = uUseAO == 1 ? texture(uAO, gl_FragCoord.xy * uInvRes).r : 1.0;
   float occ = ao * ssao;
-  col += diffC * mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ;
+  float ambK = interior ? 0.14 : 1.0;
+  col += diffC * mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ * ambK;
+  if(interior) col += diffC * uIntGlow * occ * (0.7 + 0.3 * N.y) * vec3(1.0, 0.93, 0.82);
   vec3 R = reflect(-V, N);
-  vec3 env = skyEnv(R, rough * 7.0);
+  vec3 env = skyEnv(R, rough * 7.0) * ambK;
   vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0) * schlick5(NdotV);
   float specOcc = clamp(pow(NdotV + occ, exp2(-16.0 * rough - 1.0)) - 1.0 + occ, 0.0, 1.0);
   vec3 envSpec = Fr * env * specOcc;
@@ -1181,6 +1291,7 @@ void main(){ vPos = aPos; vMat = int(aMat+0.5); gl_Position = uLightVP * vec4(aP
 static const char* SHADOW_FS = R"(#version 330 core
 in vec3 vPos; flat in int vMat;
 void main(){
+  if(vMat >= 32) discard;    // shop interiors sit inside closed walls
   if(vMat == 11){            // chain-link casts a diamond shadow
     vec2 q = vec2(vPos.x + vPos.z, vPos.y) * 14.0;
     vec2 r = vec2(q.x + q.y, q.x - q.y);
@@ -1280,16 +1391,16 @@ layout(location=1) in vec3 aNrm;
 layout(location=2) in vec3 aCol;
 layout(location=3) in float aMat;
 uniform mat4 uVP; uniform float uTime;
-out vec3 vPos; out vec3 vCol; flat out int vKind;
+out vec3 vPos; out vec3 vCol; out vec3 vNrm; flat out int vKind;
 void main(){
   vec3 p = aPos; vKind = int(aMat+0.5);
   if(vKind == 0) p.y += 0.12*sin(p.x*0.35 + uTime*1.3) + 0.08*sin(p.z*0.5 - uTime*1.7 + p.x*0.2);
-  vPos = p; vCol = aCol;
+  vPos = p; vCol = aCol; vNrm = aNrm;
   gl_Position = uVP * vec4(p, 1.0);
 }
 )";
 static const char* WATER_FS_MAIN = R"(
-in vec3 vPos; in vec3 vCol; flat in int vKind;
+in vec3 vPos; in vec3 vCol; in vec3 vNrm; flat in int vKind;
 uniform sampler2D uReflTex; uniform sampler2D uScene; uniform sampler2D uSceneDepth;
 uniform vec2 uViewport; uniform int uHasRefl; uniform vec2 uPoolCenter; uniform int uSSR;
 out vec4 fragColor;
@@ -1305,6 +1416,33 @@ vec2 waveGrad(vec2 p, float t, float k){
   return g;
 }
 void main(){
+  if(vKind == 3){        // shop window glass: see the room behind it, with the street reflected on top
+    vec3 n = normalize(vNrm);
+    vec3 V = normalize(uCamPos - vPos);
+    if(dot(n, V) < 0.0) n = -n;
+    float NdotV = max(dot(n, V), 0.02);
+    vec3 R = reflect(-V, n);
+    float fr = 0.075 + 0.925 * schlick5(NdotV);
+    vec2 suv = gl_FragCoord.xy / uViewport;
+    float camD = length(uCamPos - vPos);
+    vec3 refl = skyEnv(R, 2.5);
+    if(uSSR == 1 && camD < 150.0){
+      vec2 huv;
+      if(traceSSR(uSceneDepth, vPos + n * 0.03, R, 30, ign(gl_FragCoord.xy), huv)){
+        vec2 e = smoothstep(0.0, 0.08, huv) * smoothstep(1.0, 0.92, huv);
+        refl = mix(refl, textureLod(uScene, huv, 0.0).rgb, e.x * e.y);
+      }
+    }
+    vec2 uvw = abs(n.x) > abs(n.z) ? vec2(vPos.z, vPos.y) : vec2(vPos.x, vPos.y);
+    float dirt = smoothstep(0.52, 0.85, fbm(uvw * 1.9 + 3.0)) * 0.55 + vnoise(uvw * 45.0) * 0.05;
+    vec3 behind = textureLod(uScene, suv, 0.0).rgb * toLin(vCol) * (1.0 - 0.25 * dirt);
+    vec3 col = mix(behind, refl, clamp(fr + dirt * 0.12, 0.0, 1.0));
+    col += (uSkyUp * 0.35 + uSunCol * 0.05) * dirt * 0.12;
+    vec3 H = normalize(uSunDir + V);
+    col += uSunCol * pow(max(dot(n, H), 0.0), 500.0) * 12.0 * shadowFast(vPos);
+    fragColor = vec4(safeHdr(col), 1.0);
+    return;
+  }
   float t = uTime;
   vec2 g;
   float alpha = 1.0;
@@ -1721,6 +1859,7 @@ enum Surf { SURF_ASPHALT = 0, SURF_CONCRETE, SURF_WOOD, SURF_METAL, SURF_BRICK, 
 
 static const float WATER_LEVEL = -1.9f;     // river surface
 static const float RIVER_EDGE_Z = -88.f;    // seawall line (north)
+static const float EXT = 400.f;            // how far down the streets you can skate before the road is blocked off
 static const float STEP_UP = 0.19f;         // curbs are auto-climbed, stairs are not
 
 struct Solid {
@@ -1796,10 +1935,10 @@ struct World {
     std::vector<Gap> gaps;
     std::vector<Pool> pools;
     // uniform grid for solids
-    static constexpr float GX0 = -170, GZ0 = -200, CELL = 4;
-    static constexpr int GW = 85, GH = 95;
+    static constexpr float GX0 = -470, GZ0 = -150, CELL = 4;
+    static constexpr int GW = 235, GH = 150;
     std::vector<std::vector<int>> grid;
-    float minX = -69.f, maxX = 69.f, minZ = -100.f, maxZ = 69.f;   // playable bounds
+    float minX = -EXT - 14.f, maxX = EXT + 14.f, minZ = -100.f, maxZ = EXT + 14.f;   // playable bounds (the road closures sit just inside)
 
     int addSolid(const Solid& s) {
         solids.push_back(s);
@@ -2363,8 +2502,419 @@ static void signBoard(V3 pos, V3 right, V3 up, V3 out, float w, float h, const s
     SM.text3D(txt, o, right, up, px, fg, neon ? MAT_EMISSIVE : MAT_PLAIN);
 }
 
+static const float SH = 0.15f;   // sidewalk height
+
+// ----------------------------------------------------------------------------
+// Shop interiors. Every storefront is a real furnished room behind its window. A room is built in the
+// shop's own frame: x along the facade (0..w), y up, z outward, so the room lies at z < 0. Interior
+// surfaces carry the interior flag (material + 32): the shader lights them with room light instead of
+// sun and sky, and they cast no shadows.
+// ----------------------------------------------------------------------------
+static const uint8_t INT_FLAG = 32;
+static void shopPerson(const M4& M, uint32_t seed, int pose);   // defined once the character code exists
+
+enum ShopKind { SK_GROCERY = 0, SK_DINER, SK_CAFE, SK_SALON, SK_RETAIL, SK_LAUNDRO, SK_SKATE, SK_RECORDS, SK_PAWN, SK_BANK };
+static int shopKindOf(const std::string& n) {
+    struct K { const char* name; int kind; };
+    static const K T[] = {
+        {"DELI", SK_GROCERY}, {"99 CENT", SK_GROCERY}, {"LIQUOR", SK_GROCERY}, {"PHARMACY", SK_GROCERY}, {"BODEGA", SK_GROCERY},
+        {"PIZZA", SK_DINER}, {"CHINESE", SK_DINER}, {"DINER", SK_DINER}, {"CHICKEN", SK_DINER},
+        {"BAGELS", SK_CAFE}, {"INTERNET", SK_CAFE}, {"CAFE", SK_CAFE},
+        {"NAIL", SK_SALON}, {"BARBER", SK_SALON}, {"TATTOO", SK_SALON},
+        {"LAUNDROMAT", SK_LAUNDRO}, {"SKATE", SK_SKATE}, {"RECORDS", SK_RECORDS},
+        {"PAWN", SK_PAWN}, {"PAGERS", SK_PAWN}, {"CHECK", SK_BANK}};
+    for (const K& k : T) if (n.find(k.name) != std::string::npos) return k.kind;
+    return SK_RETAIL;
+}
+
+struct Room {
+    M4 F;
+    float w, D, fy, cy;
+    Rng r;
+    Room(const M4& f, float w_, float D_, uint32_t seed) : F(f), w(w_), D(D_), fy(SH + 0.004f), cy(4.35f), r(seed) {}
+    static uint8_t im(uint8_t m) { return (uint8_t)(m + INT_FLAG); }
+    void box(float x0, float y0, float z0, float x1, float y1, float z1, Col c, uint8_t mat, int faces = 63) const {
+        if (x1 < x0) std::swap(x0, x1);
+        if (z1 < z0) std::swap(z0, z1);
+        SM.box(F * mTranslate(V3((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (z0 + z1) * 0.5f)),
+               V3((x1 - x0) * 0.5f, (y1 - y0) * 0.5f, (z1 - z0) * 0.5f), c, im(mat), faces);
+    }
+    void quad(V3 a, V3 b, V3 c, V3 d, V3 n, Col col, uint8_t mat) const {
+        SM.quadN(xPoint(F, a), xPoint(F, b), xPoint(F, c), xPoint(F, d), norm(xDir(F, n)), col, im(mat));
+    }
+    void cyl(float cx, float y0, float cz, float rad, float h, Col c, uint8_t mat, int seg = 12, float rTop = -1.f) const {
+        SM.cylinder(F * mTranslate(V3(cx, y0, cz)), rad, h, seg, c, im(mat), true, rTop);
+    }
+    void disc(float cx, float cy_, float cz, float rad, float th, Col c, uint8_t mat) const {   // round plate facing the window
+        SM.cylinder(F * mTranslate(V3(cx, cy_, cz)) * mRotX(PI * 0.5f), rad, th, 14, c, im(mat), true, -1.f);
+    }
+    void ball(float cx, float cy_, float cz, float rad, Col c, uint8_t mat) const {
+        SM.sphere(F * mTranslate(V3(cx, cy_, cz)), V3(rad, rad, rad), 10, 6, c, im(mat));
+    }
+    float text(const std::string& s, float x, float y, float z, float px, Col c) const {   // glowing lettering facing the window
+        return SM.text3D(s, xPoint(F, V3(x, y, z)), xDir(F, V3(1, 0, 0)), xDir(F, V3(0, 1, 0)), px, c, im(MAT_EMISSIVE));
+    }
+    void person(float x, float z, float yaw, int pose) const {
+        shopPerson(F * mTranslate(V3(x, fy, z)) * mRotY(yaw + PI * 0.5f), r.s * 2654435761u + (uint32_t)(x * 100.f), pose);
+    }
+    void shell(Col wall, Col ceil, Col fl, uint8_t flMat) const {
+        const float x0 = 0.12f, x1 = w - 0.12f, z0 = -D, z1 = -0.05f;
+        quad(V3(x0, fy, z1), V3(x1, fy, z1), V3(x1, fy, z0), V3(x0, fy, z0), V3(0, 1, 0), fl, flMat);
+        quad(V3(x0, cy, z0), V3(x1, cy, z0), V3(x1, cy, z1), V3(x0, cy, z1), V3(0, -1, 0), ceil, MAT_PLAIN);
+        quad(V3(x0, fy, z0), V3(x1, fy, z0), V3(x1, cy, z0), V3(x0, cy, z0), V3(0, 0, 1), wall, MAT_PLAIN);
+        quad(V3(x0, fy, z1), V3(x0, fy, z0), V3(x0, cy, z0), V3(x0, cy, z1), V3(1, 0, 0), wall, MAT_PLAIN);
+        quad(V3(x1, fy, z0), V3(x1, fy, z1), V3(x1, cy, z1), V3(x1, cy, z0), V3(-1, 0, 0), wall, MAT_PLAIN);
+        Col base = shade(wall, 0.55f);   // skirting
+        box(x0, fy, z0 + 0.01f, x1, fy + 0.12f, z0 + 0.04f, base, MAT_PAINTED, 16);
+        box(x0 + 0.01f, fy, z0, x0 + 0.04f, fy + 0.12f, z1, base, MAT_PAINTED, 1);
+        box(x1 - 0.04f, fy, z0, x1 - 0.01f, fy + 0.12f, z1, base, MAT_PAINTED, 2);
+    }
+    void panels(Col c, int n) const {    // recessed ceiling lights down the middle of the room
+        for (int i = 0; i < n; i++) {
+            float z = -D * (i + 0.7f) / (n + 0.4f);
+            box(w * 0.5f - 0.3f, cy - 0.05f, z - 0.6f, w * 0.5f + 0.3f, cy - 0.004f, z + 0.6f, c, MAT_EMISSIVE, 63 & ~4);
+        }
+    }
+    // stocked shelving unit. faces: 1 +z (window side), 2 -z, 4 +x, 8 -x
+    void shelf(float xa, float xb, float za, float zb, float y1, int faces) const {
+        if (xb < xa) std::swap(xa, xb);
+        if (zb < za) std::swap(za, zb);
+        box(xa, fy, za, xb, y1, zb, hexc(0x3a3129), MAT_WOOD);
+        float ya = fy + 0.1f, yb = y1 - 0.08f, e = 0.004f, in = 0.04f;
+        Col wh(255, 255, 255);
+        if (faces & 1) quad(V3(xa + in, ya, zb + e), V3(xb - in, ya, zb + e), V3(xb - in, yb, zb + e), V3(xa + in, yb, zb + e), V3(0, 0, 1), wh, MAT_SHELF);
+        if (faces & 2) quad(V3(xb - in, ya, za - e), V3(xa + in, ya, za - e), V3(xa + in, yb, za - e), V3(xb - in, yb, za - e), V3(0, 0, -1), wh, MAT_SHELF);
+        if (faces & 4) quad(V3(xb + e, ya, zb - in), V3(xb + e, ya, za + in), V3(xb + e, yb, za + in), V3(xb + e, yb, zb - in), V3(1, 0, 0), wh, MAT_SHELF);
+        if (faces & 8) quad(V3(xa - e, ya, za + in), V3(xa - e, ya, zb - in), V3(xa - e, yb, zb - in), V3(xa - e, yb, za + in), V3(-1, 0, 0), wh, MAT_SHELF);
+    }
+    // waist-high bin or table whose top is stocked (records, folded clothes)
+    void bin(float xa, float xb, float za, float zb, float h, Col body) const {
+        if (xb < xa) std::swap(xa, xb);
+        if (zb < za) std::swap(za, zb);
+        box(xa, fy, za, xb, h, zb, body, MAT_WOOD, 63 & ~4);
+        quad(V3(xa + 0.04f, h + 0.003f, zb - 0.04f), V3(xb - 0.04f, h + 0.003f, zb - 0.04f), V3(xb - 0.04f, h + 0.003f, za + 0.04f), V3(xa + 0.04f, h + 0.003f, za + 0.04f),
+             V3(0, 1, 0), Col(255, 255, 255), MAT_SHELF);
+    }
+    void counter(float xa, float xb, float za, float zb, float h, Col body, Col top) const {
+        if (xb < xa) std::swap(xa, xb);
+        if (zb < za) std::swap(za, zb);
+        box(xa, fy, za, xb, h - 0.05f, zb, body, MAT_PAINTED);
+        box(xa - 0.04f, h - 0.05f, za - 0.04f, xb + 0.04f, h, zb + 0.04f, top, MAT_PAINTED);
+    }
+    void table(float cx, float cz, float rad, float h, Col top, Col base) const {
+        cyl(cx, fy, cz, 0.22f, 0.03f, base, MAT_METAL, 10);
+        cyl(cx, fy, cz, 0.04f, h - 0.03f, base, MAT_METAL, 6);
+        cyl(cx, h - 0.03f, cz, rad, 0.03f, top, MAT_PAINTED, 14);
+    }
+    void chair(float cx, float cz, float dx, float dz, Col c) const {   // (dx,dz): the way the seat faces
+        box(cx - 0.2f, 0.43f, cz - 0.2f, cx + 0.2f, 0.47f, cz + 0.2f, c, MAT_PAINTED);
+        for (int i = 0; i < 4; i++) {
+            float lx = cx + ((i & 1) ? 0.17f : -0.17f), lz = cz + ((i & 2) ? 0.17f : -0.17f);
+            box(lx - 0.015f, fy, lz - 0.015f, lx + 0.015f, 0.43f, lz + 0.015f, hexc(0x2a2a2a), MAT_METAL);
+        }
+        float bx = cx - dx * 0.19f, bz = cz - dz * 0.19f;
+        float hx = dz != 0 ? 0.2f : 0.015f, hz = dx != 0 ? 0.2f : 0.015f;
+        box(bx - hx, 0.47f, bz - hz, bx + hx, 0.92f, bz + hz, c, MAT_PAINTED);
+    }
+    void stool(float cx, float cz, Col c) const {
+        cyl(cx, fy, cz, 0.15f, 0.03f, hexc(0x9a9ea2), MAT_METAL, 8);
+        cyl(cx, fy, cz, 0.025f, 0.62f, hexc(0x9a9ea2), MAT_METAL, 6);
+        cyl(cx, 0.62f, cz, 0.17f, 0.06f, c, MAT_PAINTED, 12);
+    }
+    void board(float cx, float cy_, float z, float wd, float ht, const std::vector<std::string>& lines, Col fg, Col bg) const {   // menu / price board on the back wall
+        box(cx - wd * 0.5f, cy_ - ht * 0.5f, z, cx + wd * 0.5f, cy_ + ht * 0.5f, z + 0.05f, bg, MAT_PAINTED, 63 & ~32);
+        float px = std::min(ht / (lines.size() * 9.f + 2.f), wd / 30.f);
+        for (size_t i = 0; i < lines.size(); i++) {
+            float tw = textWidth3D(lines[i], px);
+            text(lines[i], cx - tw * 0.5f, cy_ + ht * 0.5f - px * (9.f * (i + 1)), z + 0.055f, px, fg);
+        }
+    }
+    void pendant(float x, float z, float y, Col c) const {
+        box(x - 0.006f, y, z - 0.006f, x + 0.006f, cy, z + 0.006f, hexc(0x1a1a1a), MAT_METAL);
+        cyl(x, y - 0.16f, z, 0.05f, 0.16f, hexc(0x2a2a2a), MAT_METAL, 10, 0.2f);
+        ball(x, y - 0.15f, z, 0.07f, c, MAT_EMISSIVE);
+    }
+};
+
+static void shopInterior(V3 o, V3 r, V3 n, float w, float depth, const std::string& name, float doorX, float doorW) {
+    (void)doorW;
+    V3 up(0, 1, 0);
+    uint32_t seed = hash32((uint32_t)(int)std::floor(o.x * 7.3f) * 73856093u ^ (uint32_t)(int)std::floor(o.z * 5.1f) * 19349663u ^ 0x9e3779b9u);
+    float D = std::max(5.5f, std::min(depth - 2.2f, 8.4f + (float)(seed & 255) / 255.f * 1.2f));
+    Room R(mBasis(r, up, n, o), w, D, seed);
+    bool doorLeft = doorX < w * 0.5f;
+    float wallX = doorLeft ? w - 0.12f : 0.12f, dir = doorLeft ? -1.f : 1.f;   // the wall opposite the door and the way into the room from it
+    float faceYaw = dir > 0 ? PI * 0.5f : -PI * 0.5f;                            // facing along dir
+    int faceBits = dir > 0 ? 4 : 8;                                              // stocked face towards the room, on a unit against that wall
+    int kind = shopKindOf(name);
+    Col lightCol;
+    float lightI = 11.f;
+    // window reveal: the wall has some thickness
+    {
+        Col jamb = hexc(0x5b5048);
+        R.quad(V3(0.5f, 0, 0), V3(0.5f, 0, -0.32f), V3(0.5f, 3.5f, -0.32f), V3(0.5f, 3.5f, 0), V3(1, 0, 0), jamb, MAT_CONCRETE);
+        R.quad(V3(w - 0.5f, 0, -0.32f), V3(w - 0.5f, 0, 0), V3(w - 0.5f, 3.5f, 0), V3(w - 0.5f, 3.5f, -0.32f), V3(-1, 0, 0), jamb, MAT_CONCRETE);
+        R.quad(V3(0.5f, 3.5f, 0), V3(0.5f, 3.5f, -0.32f), V3(w - 0.5f, 3.5f, -0.32f), V3(w - 0.5f, 3.5f, 0), V3(0, -1, 0), jamb, MAT_CONCRETE);
+    }
+    static const uint32_t pastel[] = {0xe9e4d2, 0xd7e4dc, 0xe6d6cf, 0xd6dce8, 0xe8dfc4, 0xdccfe2};
+    switch (kind) {
+    case SK_GROCERY: {
+        lightCol = Col(224, 240, 255); lightI = 12.f;
+        R.shell(hexc(pastel[R.r.irange(0, 5)]), hexc(0xf2f2ee), hexc(0xd9d2bf), MAT_TILE);
+        R.panels(hexc(0xeef4ff), 3);
+        int nf = std::max(2, (int)((w - 0.4f) / 1.05f));
+        float fw = (w - 0.4f) / nf;
+        for (int i = 0; i < nf; i++) {   // refrigerated cases across the back wall
+            float x0 = 0.2f + i * fw;
+            R.box(x0 + 0.02f, R.fy, -D, x0 + fw - 0.02f, 2.15f, -D + 0.75f, hexc(0xc9ced2), MAT_METAL);
+            R.quad(V3(x0 + 0.08f, 0.3f, -D + 0.756f), V3(x0 + fw - 0.08f, 0.3f, -D + 0.756f), V3(x0 + fw - 0.08f, 2.0f, -D + 0.756f), V3(x0 + 0.08f, 2.0f, -D + 0.756f),
+                   V3(0, 0, 1), Col(255, 255, 255), MAT_SHELF);
+            R.box(x0 + 0.05f, 2.15f, -D + 0.03f, x0 + fw - 0.05f, 2.23f, -D + 0.7f, hexc(0xbfe8ff), MAT_EMISSIVE, 63 & ~4);
+        }
+        R.shelf(wallX, wallX + dir * 0.4f, -3.6f, -D + 0.8f, 1.95f, faceBits);
+        int aisles = w > 6.2f ? 2 : 1;
+        for (int a = 0; a < aisles; a++) {
+            float ax = aisles == 2 ? w * (0.33f + 0.3f * a) : w * 0.5f;
+            R.shelf(ax - 0.22f, ax + 0.22f, -3.3f, -D + 1.7f, 1.65f, 1 | 2 | 4 | 8);
+            R.box(ax - 0.5f, 2.3f, -3.3f, ax + 0.5f, 2.6f, -3.25f, hexc(0x1d3f8f), MAT_EMISSIVE, 16);   // aisle sign
+        }
+        float cx = wallX + dir * 1.15f;
+        R.counter(cx - 0.35f, cx + 0.35f, -1.0f, -3.1f, 1.02f, hexc(0x8a5a36), hexc(0xd8d0c0));
+        R.box(cx - 0.18f, 1.02f, -1.7f, cx + 0.18f, 1.22f, -1.3f, hexc(0x222222), MAT_PLAIN);   // register
+        R.box(cx - 0.3f, 1.02f, -2.4f, cx + 0.3f, 1.4f, -2.2f, hexc(0xc21f1f), MAT_PAINTED);     // candy rack
+        R.shelf(wallX, wallX + dir * 0.25f, -1.0f, -3.1f, 2.2f, faceBits);
+        R.text("LOTTO  LOTTO", w * 0.5f - textWidth3D("LOTTO  LOTTO", 0.06f) * 0.5f, 2.55f, -D + 0.03f, 0.06f, hexc(0xffcf30));
+        if (R.r.chance(0.75f)) R.person(wallX + dir * 0.55f, -2.0f, faceYaw, 0);
+        break;
+    }
+    case SK_DINER: {
+        lightCol = Col(255, 205, 140); lightI = 11.f;
+        static const uint32_t walls[] = {0xc9412e, 0xe6c26a, 0x2f7f5a, 0xd9d0b8};
+        Col wc = hexc(walls[R.r.irange(0, 3)]);
+        R.shell(wc, hexc(0xf0ead8), hexc(0xd8d0bc), MAT_TILE);
+        R.panels(hexc(0xfff0d0), 3);
+        float cx = wallX + dir * 1.45f;
+        R.counter(cx - 0.36f, cx + 0.36f, -1.7f, -D + 1.2f, 1.06f, hexc(0x7a2a1e), hexc(0xe6e2d8));
+        for (float z = -2.3f; z > -D + 1.5f; z -= 0.85f) R.stool(cx + dir * 0.62f, z, hexc(0xb52a22));
+        // kitchen side of the counter: back bar, warm pass-through, menu
+        R.shelf(wallX, wallX + dir * 0.55f, -1.7f, -D + 1.2f, 1.1f, faceBits);
+        R.box(wallX, 1.5f, -D + 1.5f, wallX + dir * 0.3f, 2.1f, -D + 3.5f, hexc(0xffd9a0), MAT_EMISSIVE, 63);   // pass-through window
+        static const char* menus[5][4] = {{"CHEESE SLICE 1.25", "PEPPERONI 1.50", "SICILIAN 1.75", "SODA 1.00"}, {"LO MEIN 4.50", "GENERAL TSOS 5.25", "FRIED RICE 3.75", "WONTON SOUP 2.50"},
+                                          {"3 PC COMBO 3.99", "WINGS 2.99", "BISCUIT 0.99", "LEMONADE 1.25"}, {"EGGS ANY STYLE 2.99", "BURGER DELUXE 4.25", "PANCAKES 3.49", "COFFEE 0.75"}, {"SLICE 1.25", "HERO 3.50", "CALZONE 3.00", "SODA 1.00"}};
+        int mk = name.find("PIZZA") != std::string::npos ? 0 : (name.find("CHINESE") != std::string::npos ? 1 : (name.find("CHICKEN") != std::string::npos ? 2 : (name.find("DINER") != std::string::npos ? 3 : 4)));
+        // menu board hangs on the back wall (readable through the window)
+        R.board(w * 0.5f, 2.55f, -D + 0.02f, std::min(w - 1.2f, 3.4f), 1.35f, {menus[mk][0], menus[mk][1], menus[mk][2], menus[mk][3]}, hexc(0xffe28a), hexc(0x1b1512));
+        // booths along the door side
+        float bx = doorLeft ? 0.12f : w - 0.12f;
+        float sgn = doorLeft ? 1.f : -1.f;
+        for (int b = 0; b < 3; b++) {
+            float z = -2.2f - b * 2.0f;
+            if (z < -D + 1.2f) break;
+            R.box(bx, R.fy, z - 0.7f, bx + sgn * 0.55f, 0.95f, z + 0.7f, hexc(0xa02a24), MAT_PAINTED);   // bench seat + high back
+            R.box(bx + sgn * 0.3f, R.fy + 0.45f, z - 0.7f, bx + sgn * 0.55f, 1.1f, z + 0.7f, hexc(0xa02a24), MAT_PAINTED);
+            R.table(bx + sgn * 1.1f, z, 0.38f, 0.76f, hexc(0xeeeae0), hexc(0x30302f));
+            R.box(bx + sgn * 1.0f, 0.76f, z - 0.05f, bx + sgn * 1.14f, 0.83f, z + 0.05f, hexc(0xd9d9d0), MAT_PLAIN);   // napkins / bottle
+        }
+        R.pendant(w * 0.5f, -1.2f, 3.3f, hexc(0xffd9a0)); R.pendant(w * 0.5f, -3.6f, 3.3f, hexc(0xffd9a0));
+        if (R.r.chance(0.85f)) R.person(wallX + dir * 0.85f, -3.7f, faceYaw, 2);
+        if (R.r.chance(0.5f)) R.person(cx + dir * 0.62f, -3.15f, -faceYaw, 3);
+        break;
+    }
+    case SK_CAFE: {
+        lightCol = Col(255, 190, 120); lightI = 8.f;
+        bool net = name.find("INTERNET") != std::string::npos;
+        R.shell(hexc(net ? 0xcfd5dc : 0xd8c4a0), hexc(0x4a3a2c), hexc(0x6b4a2e), MAT_WOOD);
+        R.panels(hexc(0xffe0b0), 2);
+        // bar at the back with espresso machine and cup shelves
+        R.counter(0.5f, w - 0.5f, -D + 1.6f, -D + 0.9f, 1.05f, hexc(0x3a281c), hexc(0xb8a48a));
+        R.box(w * 0.5f - 0.4f, 1.05f, -D + 1.15f, w * 0.5f + 0.4f, 1.5f, -D + 1.45f, hexc(0xb8bcc2), MAT_METAL);
+        R.shelf(0.3f, w - 0.3f, -D, -D + 0.3f, 2.1f, 1);
+        R.person(w * 0.5f + 0.9f, -D + 0.5f, 0, 0);
+        R.text(net ? "ONLINE 24 HRS" : "FRESH COFFEE", w * 0.5f - textWidth3D(net ? "ONLINE 24 HRS" : "FRESH COFFEE", 0.05f) * 0.5f, 2.55f, -D + 0.34f, 0.05f, hexc(0xffd8a0));
+        if (net) {
+            for (int rw = 0; rw < 2; rw++)
+                for (int c = 0; c < std::max(2, (int)(w / 2.0f)); c++) {   // rows of desks with glowing monitors
+                    float x = 0.9f + c * 1.6f, z = -2.6f - rw * 2.4f;
+                    if (x > w - 0.8f || z < -D + 2.2f) continue;
+                    R.box(x - 0.55f, R.fy, z - 0.3f, x + 0.55f, 0.74f, z + 0.3f, hexc(0x3a3d42), MAT_PAINTED);
+                    R.box(x - 0.24f, 0.74f, z - 0.16f, x + 0.24f, 1.14f, z - 0.1f, hexc(0x141414), MAT_PLAIN);
+                    R.box(x - 0.21f, 0.79f, z - 0.098f, x + 0.21f, 1.1f, z - 0.093f, hexc(0x4aa8ff), MAT_EMISSIVE, 16);
+                    R.chair(x, z + 0.55f, 0, -1, hexc(0x24262b));
+                }
+        } else {
+            for (int t = 0; t < 4; t++) {
+                float x = w * (0.28f + 0.44f * (t & 1)), z = -2.4f - (t >> 1) * 2.4f;
+                if (z < -D + 2.2f) continue;
+                R.table(x, z, 0.4f, 0.74f, hexc(0xd4c4a4), hexc(0x2a2a2a));
+                R.chair(x - 0.62f, z, 1, 0, hexc(0x8a3a24)); R.chair(x + 0.62f, z, -1, 0, hexc(0x8a3a24));
+                R.box(x - 0.08f, 0.77f, z - 0.05f, x + 0.08f, 0.87f, z + 0.05f, hexc(0xf0f0f0), MAT_PLAIN);   // cup
+            }
+            R.pendant(w * 0.3f, -2.4f, 3.2f, hexc(0xffc890)); R.pendant(w * 0.7f, -2.4f, 3.2f, hexc(0xffc890)); R.pendant(w * 0.5f, -4.8f, 3.2f, hexc(0xffc890));
+        }
+        break;
+    }
+    case SK_SALON: {
+        bool barber = name.find("BARBER") != std::string::npos, tattoo = name.find("TATTOO") != std::string::npos;
+        lightCol = tattoo ? Col(255, 120, 120) : Col(255, 235, 235); lightI = 10.f;
+        R.shell(tattoo ? hexc(0x2a2a30) : (barber ? hexc(0xe4e0d8) : hexc(0xf0d4dc)), hexc(0xf4f4f0), tattoo ? hexc(0x30302f) : hexc(0xe6e2da), MAT_TILE);
+        R.panels(tattoo ? hexc(0xffb0b0) : hexc(0xfff4f4), 3);
+        // stations along the wall: mirror, shelf, chair
+        int ns = std::min(3, (int)((D - 2.5f) / 2.1f));
+        for (int i = 0; i < ns; i++) {
+            float z = -2.4f - i * 2.1f;
+            R.quad(V3(wallX + dir * 0.03f, 1.0f, z + 0.7f), V3(wallX + dir * 0.03f, 1.0f, z - 0.7f), V3(wallX + dir * 0.03f, 2.5f, z - 0.7f), V3(wallX + dir * 0.03f, 2.5f, z + 0.7f),
+                   V3(dir, 0, 0), hexc(0xb8d0e0), MAT_CARGLASS);
+            R.counter(wallX, wallX + dir * 0.38f, z - 0.75f, z + 0.75f, 0.95f, hexc(0x2a2a2e), hexc(0xd8d8d8));
+            R.cyl(wallX + dir * 1.15f, R.fy, z, 0.28f, 0.1f, hexc(0x2a2a2a), MAT_METAL, 10);
+            R.cyl(wallX + dir * 1.15f, R.fy + 0.1f, z, 0.05f, 0.35f, hexc(0xb8bcc2), MAT_METAL, 8);
+            R.box(wallX + dir * 1.15f - 0.28f, 0.45f, z - 0.3f, wallX + dir * 1.15f + 0.28f, 0.6f, z + 0.3f, hexc(barber ? 0x8a1a1a : 0x2a2a2a), MAT_PAINTED);
+            R.box(wallX + dir * 1.15f + dir * 0.18f, 0.6f, z - 0.3f, wallX + dir * 1.15f + dir * 0.3f, 1.35f, z + 0.3f, hexc(barber ? 0x8a1a1a : 0x2a2a2a), MAT_PAINTED);
+            R.person(wallX + dir * 1.78f, z, faceYaw + PI, 0);                          // the barber / nail tech
+            if (R.r.chance(0.55f)) R.person(wallX + dir * 1.12f, z, faceYaw + PI, 1);   // a customer in the chair
+        }
+        if (barber) {   // striped pole beside the window
+            for (int k = 0; k < 8; k++) R.cyl(doorLeft ? w - 0.5f : 0.5f, 1.0f + k * 0.16f, -0.5f, 0.09f, 0.16f, k & 1 ? hexc(0xc0201b) : hexc(0xf0f0f0), MAT_PAINTED, 10);
+        }
+        if (tattoo) for (int k = 0; k < 12; k++)   // flash sheets on the back wall
+            R.quad(V3(0.6f + (k % 6) * (w - 1.2f) / 6.f, 1.2f + (k / 6) * 0.9f, -D + 0.02f), V3(0.6f + (k % 6) * (w - 1.2f) / 6.f + 0.6f, 1.2f + (k / 6) * 0.9f, -D + 0.02f),
+                   V3(0.6f + (k % 6) * (w - 1.2f) / 6.f + 0.6f, 1.95f + (k / 6) * 0.9f, -D + 0.02f), V3(0.6f + (k % 6) * (w - 1.2f) / 6.f, 1.95f + (k / 6) * 0.9f, -D + 0.02f),
+                   V3(0, 0, 1), hexc(R.r.chance(0.5f) ? 0xe8d8b0 : 0xd8b0b0), MAT_PAINTED);
+        // waiting bench + magazine table by the door side wall
+        float bx = doorLeft ? 0.12f : w - 0.12f, sgn = doorLeft ? 1.f : -1.f;
+        R.box(bx, R.fy, -D + 1.0f, bx + sgn * 0.5f, 0.45f, -D + 3.0f, hexc(0x3a3a44), MAT_PAINTED);
+        R.box(bx, 0.45f, -D + 1.0f, bx + sgn * 0.14f, 0.95f, -D + 3.0f, hexc(0x3a3a44), MAT_PAINTED);
+        R.text(tattoo ? "INK" : (barber ? "CUTS 8" : "NAILS"), w * 0.5f - 0.3f, 2.7f, -D + 0.03f, 0.07f, hexc(tattoo ? 0xff4040 : 0xff60b0));
+        break;
+    }
+    case SK_LAUNDRO: {
+        lightCol = Col(205, 232, 255); lightI = 13.f;
+        R.shell(hexc(0xdde6ee), hexc(0xf4f8fa), hexc(0xb4bcc4), MAT_TILE);
+        R.panels(hexc(0xf0f8ff), 4);
+        for (int side = 0; side < 2; side++) {   // washers down both side walls, dryers stacked on the back wall
+            float wx = side ? 0.12f : w - 0.12f, sg = side ? 1.f : -1.f;
+            for (float z = -1.6f; z > -D + 0.5f; z -= 0.82f) {
+                if (side == (doorLeft ? 0 : 1) && z > -2.6f) continue;   // keep the doorway clear
+                R.box(wx, R.fy, z - 0.38f, wx + sg * 0.72f, 1.0f, z + 0.38f, hexc(0xe8ecee), MAT_METAL);
+                R.disc(wx + sg * 0.72f, 0.55f, z, 0.25f, 0.02f, hexc(0x1c2a3a), MAT_CARGLASS);
+                R.box(wx + sg * 0.05f, 1.0f, z - 0.36f, wx + sg * 0.7f, 1.08f, z + 0.36f, hexc(0x9aa0a8), MAT_METAL);
+            }
+        }
+        R.bin(w * 0.5f - 0.6f, w * 0.5f + 0.6f, -D + 1.0f, -D + 3.2f, 0.92f, hexc(0xc8ccd0));   // folding table
+        R.box(w * 0.5f - 0.3f, 0.92f, -D + 1.6f, w * 0.5f + 0.1f, 1.22f, -D + 2.0f, hexc(0x3a7bd0), MAT_PAINTED);   // baskets
+        R.text("WASH DRY FOLD", w * 0.5f - textWidth3D("WASH DRY FOLD", 0.05f) * 0.5f, 2.7f, -D + 0.03f, 0.05f, hexc(0x60c0ff));
+        if (R.r.chance(0.6f)) R.person(w * 0.5f, -D + 3.8f, 0, 0);
+        break;
+    }
+    case SK_SKATE: {
+        lightCol = Col(255, 170, 110); lightI = 10.f;
+        R.shell(hexc(0x24262a), hexc(0x1c1d20), hexc(0x7a5a3a), MAT_WOOD);
+        R.panels(hexc(0xffe8d0), 3);
+        // wall of decks
+        static const uint32_t deck[] = {0xe23b3b, 0xf5d142, 0x3b7de2, 0x2fbf8a, 0xe8e4d8, 0x8a3be2, 0xf08a24, 0x111111};
+        int nd = std::max(6, (int)((w - 1.4f) / 0.26f));
+        for (int i = 0; i < nd; i++)
+            for (int rw = 0; rw < 2; rw++) {
+                float x = 0.75f + i * 0.26f;
+                if (x > w - 0.7f) continue;
+                Col dc = hexc(deck[R.r.irange(0, 7)]);
+                R.box(x - 0.1f, 0.5f + rw * 1.05f, -D + 0.02f, x + 0.1f, 1.5f + rw * 1.05f, -D + 0.06f, dc, MAT_PAINTED, 63);
+                R.box(x - 0.04f, 0.8f + rw * 1.05f, -D + 0.061f, x + 0.04f, 1.2f + rw * 1.05f, -D + 0.064f, shade(dc, 0.55f), MAT_PAINTED, 16);
+            }
+        R.shelf(wallX, wallX + dir * 0.35f, -2.4f, -D + 1.0f, 1.9f, faceBits);   // shoes, wheels and trucks
+        R.counter(w * 0.5f - 1.0f, w * 0.5f + 1.0f, -D + 1.7f, -D + 1.1f, 1.05f, hexc(0x141416), hexc(0x9a9ea2));
+        R.person(w * 0.5f, -D + 0.7f, 0, 0);
+        // a mini ledge + kicker to try the merchandise on
+        R.box(w * 0.5f - 1.3f, R.fy, -3.3f, w * 0.5f + 1.3f, R.fy + 0.42f, -2.6f, hexc(0xb0aba2), MAT_CONCRETE);
+        R.box(w * 0.5f - 1.3f, R.fy + 0.42f, -3.3f, w * 0.5f + 1.3f, R.fy + 0.46f, -2.6f, hexc(0x6e6f70), MAT_METAL, 4 | 16);
+        R.text("SKATE", w * 0.5f - textWidth3D("SKATE", 0.09f) * 0.5f, 2.55f, -D + 0.05f, 0.09f, hexc(0xff4a30));
+        if (R.r.chance(0.7f)) R.person(w * 0.5f - 1.6f, -3.6f, PI * 0.5f, 1);   // a kid sitting on the ledge
+        break;
+    }
+    case SK_RECORDS: {
+        lightCol = Col(255, 140, 210); lightI = 9.f;
+        R.shell(hexc(0x3a2a44), hexc(0x24202a), hexc(0x5a3d2a), MAT_WOOD);
+        R.panels(hexc(0xffd8f0), 2);
+        R.shelf(0.12f, 0.5f, -1.2f, -D + 0.4f, 1.9f, 4);
+        R.shelf(w - 0.5f, w - 0.12f, -1.2f, -D + 0.4f, 1.9f, 8);
+        R.shelf(0.5f, w - 0.5f, -D, -D + 0.35f, 2.1f, 1);
+        for (int b = 0; b < 2; b++) R.bin(w * 0.5f - 0.9f, w * 0.5f + 0.9f, -2.2f - b * 1.8f, -2.9f - b * 1.8f, 0.85f, hexc(0x7a5a3a));
+        R.counter(w * 0.5f + 0.4f, w * 0.5f + 1.9f, -D + 1.5f, -D + 0.9f, 1.05f, hexc(0x1a1a1e), hexc(0x8a8a90));
+        R.text("RECORDS", w * 0.5f - textWidth3D("RECORDS", 0.08f) * 0.5f, 2.6f, -D + 0.4f, 0.08f, hexc(0xff60d0));
+        for (int k = 0; k < 6; k++) {   // posters
+            float x = 0.9f + k * (w - 1.8f) / 6.f;
+            R.quad(V3(x, 2.15f, -D + 0.42f), V3(x + 0.5f, 2.15f, -D + 0.42f), V3(x + 0.5f, 2.9f, -D + 0.42f), V3(x, 2.9f, -D + 0.42f), V3(0, 0, 1), hexc(0x60c0ff + (uint32_t)k * 0x224488), MAT_PAINTED);
+        }
+        if (R.r.chance(0.7f)) R.person(w * 0.5f + 1.1f, -D + 0.5f, 0, 0);
+        break;
+    }
+    case SK_PAWN: {
+        lightCol = Col(255, 220, 130); lightI = 10.f;
+        R.shell(hexc(0x3a5a4a), hexc(0xe8e6da), hexc(0xcfc8b4), MAT_TILE);
+        R.panels(hexc(0xfff0c0), 3);
+        // L-shaped display counter, guitars and TVs on the back wall
+        R.counter(0.5f, w - 0.5f, -D + 2.2f, -D + 1.5f, 1.0f, hexc(0x1e2420), hexc(0x9aa8a0));
+        R.bin(0.7f, w - 0.7f, -D + 2.1f, -D + 1.6f, 1.02f, hexc(0x1e2420));
+        for (int g = 0; g < 4; g++) {
+            float x = 0.9f + g * (w - 1.8f) / 4.f;
+            SM.capsule(xPoint(R.F, V3(x, 1.2f, -D + 0.1f)), xPoint(R.F, V3(x, 1.75f, -D + 0.1f)), 0.17f, 0.15f, xDir(R.F, V3(1, 0, 0)), hexc(0xb0642a), MAT_WOOD + INT_FLAG, 0.25f, 0.6f, 10);
+            R.box(x - 0.025f, 1.75f, -D + 0.08f, x + 0.025f, 2.5f, -D + 0.12f, hexc(0x3a2a1a), MAT_WOOD);
+        }
+        for (int t = 0; t < 3; t++) {
+            float x = w - 0.9f - t * 0.75f;
+            R.box(x - 0.3f, 0.3f + t * 0.0f, -D + 0.0f, x + 0.3f, 0.85f + 0.0f, -D + 0.35f, hexc(0x161616), MAT_PLAIN);
+            R.box(x - 0.26f, 0.35f, -D + 0.351f, x + 0.26f, 0.8f, -D + 0.354f, hexc(t == 1 ? 0xff8a4a : 0x4aa8ff), MAT_EMISSIVE, 16);
+        }
+        R.box(w * 0.5f - 1.0f, 2.3f, -D + 0.02f, w * 0.5f + 1.0f, 2.85f, -D + 0.06f, hexc(0xc21f1f), MAT_EMISSIVE, 63);
+        R.text("WE BUY GOLD", w * 0.5f - textWidth3D("WE BUY GOLD", 0.045f) * 0.5f, 2.44f, -D + 0.065f, 0.045f, hexc(0xffe040));
+        if (R.r.chance(0.8f)) R.person(w * 0.5f, -D + 0.9f, 0, 0);
+        break;
+    }
+    case SK_BANK: {
+        lightCol = Col(225, 255, 240); lightI = 11.f;
+        R.shell(hexc(0xc7d6d0), hexc(0xf0f4f2), hexc(0xb8c0bc), MAT_TILE);
+        R.panels(hexc(0xf0fff8), 3);
+        float pz = -D + 2.6f;   // teller partition with two windows
+        for (int seg = 0; seg < 3; seg++) {
+            float x0 = 0.12f + seg * (w - 0.24f) / 3.f, x1 = 0.12f + (seg + 1) * (w - 0.24f) / 3.f;
+            if (seg == 1) { R.box(x0, R.fy, pz - 0.15f, x1, 1.1f, pz + 0.15f, hexc(0x2e4a44), MAT_PAINTED); R.quad(V3(x0, 1.1f, pz + 0.16f), V3(x1, 1.1f, pz + 0.16f), V3(x1, 2.5f, pz + 0.16f), V3(x0, 2.5f, pz + 0.16f), V3(0, 0, 1), hexc(0x9ac0b8), MAT_CARGLASS); }
+            else R.box(x0, R.fy, pz - 0.15f, x1, 2.5f, pz + 0.15f, hexc(0x2e4a44), MAT_PAINTED);
+        }
+        R.board(w * 0.5f, 2.9f, pz + 0.16f, std::min(w - 1.0f, 3.2f), 0.6f, {"CHECKS CASHED"}, hexc(0xffe28a), hexc(0x14201d));
+        R.person(w * 0.5f, pz - 0.7f, 0, 0);
+        R.chair(0.9f, -1.6f, 0, -1, hexc(0x2e4a44)); R.chair(w - 0.9f, -2.0f, 0, -1, hexc(0x2e4a44));
+        R.box(0.12f, 0.9f, -2.9f, 0.3f, 1.9f, -1.5f, hexc(0xe8e4d8), MAT_PAINTED);   // rate board
+        break;
+    }
+    default: {   // general retail: wall units, display tables, a register counter
+        lightCol = Col(255, 240, 220); lightI = 11.f;
+        static const uint32_t rw[] = {0xd7dce4, 0xe6dfd0, 0xdad0e0, 0xcfd8cf};
+        R.shell(hexc(rw[R.r.irange(0, 3)]), hexc(0xf4f2ee), R.r.chance(0.5f) ? hexc(0xd8d2c4) : hexc(0x8a6a48), R.r.chance(0.5f) ? MAT_TILE : MAT_WOOD);
+        R.panels(hexc(0xfff8ee), 3);
+        R.shelf(0.12f, 0.45f, -1.2f, -D + 0.4f, 2.1f, 4);
+        R.shelf(w - 0.45f, w - 0.12f, -1.2f, -D + 0.4f, 2.1f, 8);
+        R.shelf(0.45f, w - 0.45f, -D, -D + 0.35f, 2.3f, 1);
+        for (int b = 0; b < 2; b++) R.bin(w * 0.5f - 0.8f, w * 0.5f + 0.8f, -2.4f - b * 2.2f, -3.2f - b * 2.2f, 0.9f, hexc(0x8a6a48));
+        R.counter(wallX + dir * 0.4f, wallX + dir * 1.1f, -1.3f, -2.9f, 1.0f, hexc(0x2a2a30), hexc(0xd4d0c4));
+        R.box(wallX + dir * 0.6f - 0.18f, 1.0f, -2.2f, wallX + dir * 0.6f + 0.18f, 1.2f, -1.9f, hexc(0x222222), MAT_PLAIN);
+        R.text("SALE", w * 0.5f - textWidth3D("SALE", 0.07f) * 0.5f, 2.62f, -D + 0.4f, 0.07f, hexc(0xff4a3a));
+        if (R.r.chance(0.7f)) R.person(wallX + dir * 0.75f - dir * 0.3f, -1.7f, faceYaw, 0);
+        break;
+    }
+    }
+    {   // the room light: warms the floor and spills through the window onto the sidewalk
+        PointLight l;
+        l.pos = xPoint(R.F, V3(w * 0.5f, 3.75f, -1.7f));
+        float h1 = hashf((int)(o.x * 7), (int)(o.z * 7), 1), h2 = hashf((int)(o.x * 7), (int)(o.z * 7), 2);
+        l.col = mulv(V3(lightCol.r / 255.f, lightCol.g / 255.f, lightCol.b / 255.f), V3(0.9f + 0.2f * h1, 1.f, 0.85f + 0.3f * h2)) * lightI;
+        l.radius = 11.f; l.group = LG_SHOP;
+        l.col = l.col * 1.35f;
+        staticLights.push_back(l);
+    }
+}
+
 // Storefront on a building face. 'o' = left end at ground, 'r' = along facade, 'n' = outward normal.
-static void storefront(V3 o, V3 r, V3 n, float w, const std::string& name, Col signBg, Col signFg, Col awning, bool hasAwning, Rng& rng) {
+// The window is real glass in front of a furnished room (see shopInterior); the wall behind is open there.
+static void storefront(V3 o, V3 r, V3 n, float w, const std::string& name, Col signBg, Col signFg, Col awning, bool hasAwning, Rng& rng, float depth = 14.f, bool real = true) {
     V3 up(0, 1, 0);
     float sfH = 4.8f;
     // piers
@@ -2373,28 +2923,58 @@ static void storefront(V3 o, V3 r, V3 n, float w, const std::string& name, Col s
     SM.box(P0, V3(0.25f, sfH * 0.5f, 0.12f), pier, MAT_CONCRETE);
     M4 P1 = mBasis(r, up, n, o + r * (w - 0.25f) + up * (sfH * 0.5f) + n * 0.12f);
     SM.box(P1, V3(0.25f, sfH * 0.5f, 0.12f), pier, MAT_CONCRETE);
-    // kick plate + glass
+    // kick plate
     M4 K = mBasis(r, up, n, o + r * (w * 0.5f) + up * 0.3f + n * 0.08f);
     SM.box(K, V3(w * 0.5f - 0.5f, 0.3f, 0.08f), hexc(0x4a4540), MAT_METAL);
     float doorW = 1.1f, doorX = rng.chance(0.5f) ? 0.9f : w - 0.9f - doorW;
-    V3 gl0 = o + r * 0.5f + up * 0.6f + n * 0.03f;
-    V3 g0 = gl0, g1 = o + r * (w - 0.5f) + up * 0.6f + n * 0.03f;
-    SM.quadN(g0, g1, g1 + up * 2.9f, g0 + up * 2.9f, n, Col(255, 255, 255), MAT_SHOPGLASS);
-    // door
-    V3 d0 = o + r * doorX + n * 0.05f;
-    M4 D = mBasis(r, up, n, d0 + r * (doorW * 0.5f) + up * 1.2f);
-    SM.box(D, V3(doorW * 0.5f, 1.2f, 0.03f), hexc(0x2c2a28), MAT_PAINTED);
-    // transom band + sign
-    M4 T = mBasis(r, up, n, o + r * (w * 0.5f) + up * 3.75f + n * 0.1f);
-    SM.box(T, V3(w * 0.5f - 0.5f, 0.25f, 0.1f), hexc(0x3d3935), MAT_PAINTED);
-    signBoard(o + r * (w * 0.5f) + up * 4.3f + n * 0.12f, r, up, n, w - 1.0f, 0.75f, name, signBg, signFg, rng.chance(0.4f));
-    {   // shop light spilling onto the sidewalk at night
+    if (!real) {   // a corner shop whose front is covered by the building next to it: painted-on window, no room
+        V3 g0 = o + r * 0.5f + up * 0.6f + n * 0.03f, g1 = o + r * (w - 0.5f) + up * 0.6f + n * 0.03f;
+        SM.quadN(g0, g1, g1 + up * 2.9f, g0 + up * 2.9f, n, Col(255, 255, 255), MAT_SHOPGLASS);
+        V3 d0 = o + r * doorX + n * 0.05f;
+        SM.box(mBasis(r, up, n, d0 + r * (doorW * 0.5f) + up * 1.2f), V3(doorW * 0.5f, 1.2f, 0.03f), hexc(0x2c2a28), MAT_PAINTED);
         PointLight l;
         l.pos = o + r * (w * 0.5f) + up * 2.2f + n * 1.2f;
         float h1 = hashf((int)(l.pos.x * 7), (int)(l.pos.z * 7), 1), h2 = hashf((int)(l.pos.x * 7), (int)(l.pos.z * 7), 2);
         l.col = mulv(V3(1.f, 0.86f, 0.66f), V3(0.9f + 0.2f * h1, 1.f, 0.85f + 0.3f * h2)) * 10.f;
         l.radius = 9.f; l.group = LG_SHOP;
         staticLights.push_back(l);
+    } else {   // see-through glass (drawn in the glass pass) with a mullion or two
+        V3 g0 = o + r * 0.5f + up * 0.6f + n * 0.03f, g1 = o + r * (w - 0.5f) + up * 0.6f + n * 0.03f;
+        WM.quadN(g0, g1, g1 + up * 2.9f, g0 + up * 2.9f, n, Col(226, 240, 236), 3);
+        Col frameCol = hexc(0x26241f);
+        SM.box(mBasis(r, up, n, o + r * (w * 0.5f) + up * 3.46f + n * 0.05f), V3(w * 0.5f - 0.5f, 0.04f, 0.03f), frameCol, MAT_METAL);
+        float xm = doorX < w * 0.5f ? (doorX + doorW + w - 0.5f) * 0.5f : (0.5f + doorX) * 0.5f;
+        SM.box(mBasis(r, up, n, o + r * xm + up * 2.05f + n * 0.05f), V3(0.03f, 1.45f, 0.03f), frameCol, MAT_METAL);
+    }
+    if (real) {   // glass door: stiles, top rail, kick panel, push bar
+        Col dframe = hexc(0x26241f);
+        V3 d0 = o + r * doorX + n * 0.05f;
+        auto dbox = [&](float x0, float y0, float x1, float y1, float dz, Col c, uint8_t mat) {
+            SM.box(mBasis(r, up, n, d0 + r * ((x0 + x1) * 0.5f) + up * ((y0 + y1) * 0.5f) + n * dz), V3((x1 - x0) * 0.5f, (y1 - y0) * 0.5f, 0.03f), c, mat);
+        };
+        dbox(0, 0, 0.07f, 2.25f, 0, dframe, MAT_METAL);
+        dbox(doorW - 0.07f, 0, doorW, 2.25f, 0, dframe, MAT_METAL);
+        dbox(0, 2.18f, doorW, 2.25f, 0, dframe, MAT_METAL);
+        dbox(0, 0, doorW, 0.62f, 0.005f, hexc(0x2c2a28), MAT_PAINTED);
+        dbox(doorW - 0.22f, 0.95f, doorW - 0.19f, 1.55f, 0.05f, hexc(0xb8bcc2), MAT_METAL);
+    }
+    // transom band + sign
+    M4 T = mBasis(r, up, n, o + r * (w * 0.5f) + up * 3.75f + n * 0.1f);
+    SM.box(T, V3(w * 0.5f - 0.5f, 0.25f, 0.1f), hexc(0x3d3935), MAT_PAINTED);
+    signBoard(o + r * (w * 0.5f) + up * 4.3f + n * 0.12f, r, up, n, w - 1.0f, 0.75f, name, signBg, signFg, rng.chance(0.4f));
+    if (real) shopInterior(o, r, n, w, depth, name, doorX, doorW);
+    if (real) {   // taped-up posters and price cards on the glass
+        Rng pr(hash32((uint32_t)(int)std::floor(o.x * 3.7f) * 92837111u ^ (uint32_t)(int)std::floor(o.z * 3.1f) * 689287499u));
+        static const uint32_t pc[] = {0xe23b3b, 0xf5d142, 0xf0efe8, 0x3b7de2, 0xf08a24};
+        int np = pr.irange(0, 2);
+        for (int i = 0; i < np; i++) {
+            float pw = pr.range(0.35f, 0.7f), ph = pr.range(0.45f, 0.85f);
+            float px0 = pr.range(0.7f, std::max(0.8f, w - 0.7f - pw)), py0 = pr.range(0.9f, 2.4f);
+            uint32_t col = pc[pr.irange(0, 4)];
+            if (px0 + pw > doorX - 0.1f && px0 < doorX + doorW + 0.1f) continue;   // keep the door clear
+            V3 a = o + r * px0 + up * py0 + n * 0.04f;
+            SM.quadN(a, a + r * pw, a + r * pw + up * ph, a + up * ph, n, hexc(col), MAT_PAINTED);
+        }
     }
     // neon "OPEN" in the window sometimes
     if (rng.chance(0.55f)) {
@@ -2480,16 +3060,33 @@ static void fireEscape(V3 o, V3 r, V3 n, float w, int floors) {
 //   Avenue (N-S) road x in [-9,9]; cross street (E-W) z in [-7,7];
 //   Water St z in [-74,-62]; promenade z in [-88,-74]; river beyond.
 // ----------------------------------------------------------------------------
-static const float SH = 0.15f;   // sidewalk height
 
-static void building(float x0, float z0, float x1, float z1, float h, int style, Col col, uint32_t seed, bool roofStuff = true, bool solid = true) {
+// A hole in the ground-floor front wall (a shopfront): which face (MeshBuilder::box bit), span along the wall and height
+struct FrontOpening { int face = 0; float a = 0, b = 0, y0 = 0, y1 = 0; };
+static void building(float x0, float z0, float x1, float z1, float h, int style, Col col, uint32_t seed, bool roofStuff = true, bool solid = true, const FrontOpening* op = nullptr) {
     uint8_t mat = style == 1 ? MAT_STONEWIN : (style == 2 ? MAT_GLASSWALL : MAT_WINDOWS);
     if (solid) world.addBox((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0, (x1 - x0) * 0.5f, (z1 - z0) * 0.5f, 0, h, SURF_CONCRETE, true);
     // Neighbouring and overlapping buildings share wall planes; a small unique inset per building keeps
     // those walls from being exactly coplanar (which z-fights into flickering triangle-shaped patches).
     float e = 0.01f + 0.035f * (hash32(seed * 2654435761u + 17u) & 0xFFFF) / 65535.f;
     x0 += e; z0 += e; x1 -= e; z1 -= e;
-    SM.boxAA(V3(x0, 0, z0), V3(x1, h, z1), col, mat, 1 | 2 | 16 | 32);
+    SM.boxAA(V3(x0, 0, z0), V3(x1, h, z1), col, mat, (1 | 2 | 16 | 32) & ~(op ? op->face : 0));
+    if (op) {   // the front wall in pieces around the opening (same material and colour, so the shading is seamless)
+        bool zf = op->face == 16 || op->face == 32;
+        float t0 = zf ? x0 : z0, t1 = zf ? x1 : z1;
+        V3 nrm = op->face == 16 ? V3(0, 0, 1) : (op->face == 32 ? V3(0, 0, -1) : (op->face == 1 ? V3(1, 0, 0) : V3(-1, 0, 0)));
+        float plane = op->face == 16 ? z1 : (op->face == 32 ? z0 : (op->face == 1 ? x1 : x0));
+        auto piece = [&](float ta, float tb, float ya, float yb) {
+            if (tb - ta < 1e-4f || yb - ya < 1e-4f) return;
+            V3 p0 = zf ? V3(ta, ya, plane) : V3(plane, ya, ta), p1 = zf ? V3(tb, ya, plane) : V3(plane, ya, tb);
+            V3 p2 = zf ? V3(tb, yb, plane) : V3(plane, yb, tb), p3 = zf ? V3(ta, yb, plane) : V3(plane, yb, ta);
+            SM.quadN(p0, p1, p2, p3, nrm, col, mat);
+        };
+        piece(t0, op->a, 0, op->y1);
+        piece(op->b, t1, 0, op->y1);
+        piece(t0, t1, op->y1, h);
+        if (op->y0 > 0.f) piece(op->a, op->b, 0, op->y0);
+    }
     SM.quadN(V3(x0, h, z1), V3(x1, h, z1), V3(x1, h, z0), V3(x0, h, z0), V3(0, 1, 0), hexc(0x55514c), MAT_ROOF);
     Rng r(seed);
     if (style != 2) {
@@ -2519,7 +3116,8 @@ static int shopIdx = 0;
 
 // A row of buildings with storefronts. 'left' is the street-view left corner of the row at ground level,
 // 'out' the outward (street-facing) normal. Text reads left-to-right for someone on the sidewalk.
-static void facadeRow(V3 left, V3 out, float length, float depth, uint32_t seed, bool shops, float minH, float maxH, int styleMode) {
+// flat: bit 1 = the first building, bit 2 = the last one, bit 4 = all of them get a painted-on window instead of a room (they overlap a neighbouring row at a corner)
+static void facadeRow(V3 left, V3 out, float length, float depth, uint32_t seed, bool shops, float minH, float maxH, int styleMode, int flat = 0) {
     V3 up(0, 1, 0), r = cross(up, out);
     Rng rng(seed);
     static const uint32_t bricks[] = {0x8e4a36, 0x7a3b2c, 0xa0664a, 0x9c7a5a, 0x6e4535, 0xb08560, 0x8a5a44, 0x5e3a2e};
@@ -2537,11 +3135,21 @@ static void facadeRow(V3 left, V3 out, float length, float depth, uint32_t seed,
         int style = styleMode >= 0 ? styleMode : (rng.chance(0.72f) ? 0 : 1);
         Col col = style == 1 ? hexc(stones[rng.irange(0, 3)]) : hexc(bricks[rng.irange(0, 7)]);
         float h = 4.8f + 3.3f * rng.irange((int)((minH - 4.8f) / 3.3f), (int)((maxH - 4.8f) / 3.3f)) + 0.4f;
-        building(mn.x, mn.z, mx.x, mx.z, h, style, col, rng.next());
+        bool real = !(((flat & 1) && x < 0.01f) || ((flat & 2) && x + w >= length - 0.5f) || (flat & 4));
+        FrontOpening op;
+        if (shops && real) {
+            bool zf = std::fabs(out.z) > 0.5f;
+            op.face = zf ? (out.z > 0 ? 16 : 32) : (out.x > 0 ? 1 : 2);
+            V3 pa = p0 + r * 0.5f, pb = p0 + r * (w - 0.5f);
+            op.a = zf ? std::min(pa.x, pb.x) : std::min(pa.z, pb.z);
+            op.b = zf ? std::max(pa.x, pb.x) : std::max(pa.z, pb.z);
+            op.y0 = 0.f; op.y1 = 3.5f;
+        }
+        building(mn.x, mn.z, mx.x, mx.z, h, style, col, rng.next(), true, true, (shops && real) ? &op : nullptr);
         if (shops) {
             int k = rng.irange(0, 7);
             storefront(p0 + out * 0.001f, r, out, w, SHOP_NAMES[shopIdx++ % 28], hexc(signBg[k]), hexc(signFg[k]),
-                       hexc(awn[rng.irange(0, 5)]), rng.chance(0.6f), rng);
+                       hexc(awn[rng.irange(0, 5)]), rng.chance(0.6f), rng, depth, real);
         }
         if (style == 0 && h > 12 && rng.chance(0.5f)) fireEscape(p0 + r * (w * 0.2f) + out * 0.01f, r, out, w * 0.6f, (int)((h - 5.f) / 3.3f));
         x += w;
@@ -2632,8 +3240,8 @@ static void buildNW() {
     V3 up(0, 1, 0);
     // avenue face (x=-14, faces +X), cross-street face (z=-12, faces +Z), Water St face (z=-57, faces -Z)
     facadeRow(V3(-14, 0, -12), V3(1, 0, 0), 45, 16, 11, true, 12, 30, -1);
-    facadeRow(V3(-69.5f, 0, -12), V3(0, 0, 1), 55.5f, 16, 12, true, 12, 26, -1);
-    facadeRow(V3(-14, 0, -57), V3(0, 0, -1), 55.5f, 16, 13, true, 12, 24, -1);
+    facadeRow(V3(-69.5f, 0, -12), V3(0, 0, 1), 39.5f, 16, 12, true, 12, 26, -1);   // ends where the avenue row's corner building begins
+    facadeRow(V3(-30, 0, -57), V3(0, 0, -1), 39.5f, 16, 13, true, 12, 24, -1);
     facadeRow(V3(-170, 0, -12), V3(0, 0, 1), 100.5f, 16, 101, true, 12, 24, -1);
     facadeRow(V3(-69.5f, 0, -57), V3(0, 0, -1), 100.5f, 16, 102, true, 12, 22, -1);
     building(-170, -41, -69.5f, -28, 18, 0, hexc(0x7a4a3a), 14, false);
@@ -2934,7 +3542,6 @@ static void buildSE() {
     for (int i = 0; i < 7; i++) brownstone(30.f + i * 6.f, i);
     facadeRow(V3(16, 0, 72), V3(-1, 0, 0), 128, 14, 105, true, 12, 24, -1);
     facadeRow(V3(16, 0, 12), V3(-1, 0, 0), 18, 14, 71, true, 12, 20, 0);
-    facadeRow(V3(30, 0, 12), V3(0, 0, -1), 14, 18, 72, true, 12, 20, 0);
     building(30, 45, 200, 200, 32, 1, hexc(0xb8ae9c), 73);
     facadeRow(V3(200, 0, 12), V3(0, 0, -1), 130.5f, 16, 106, true, 12, 26, 0);
     building(69.5f, 28, 200, 45, 24, 0, hexc(0x7a4b3c), 74);
@@ -3091,7 +3698,7 @@ static void buildSkyline() {
     }
     // an art-deco spire tower down the avenue
     {
-        float x = -40, z = 380;
+        float x = -112, z = 560;
         building(x - 30, z - 30, x + 30, z + 30, 120, 1, hexc(0xc9c0ae), 9001, false);
         building(x - 20, z - 20, x + 20, z + 20, 170, 1, hexc(0xc9c0ae), 9002, false);
         building(x - 12, z - 12, x + 12, z + 12, 215, 1, hexc(0xc9c0ae), 9003, false);
@@ -3120,6 +3727,7 @@ static void buildSkyline() {
             SM.boxAA(V3(bx - 16, base, z0), V3(bx + 16, deckY - 1.5f, z1), stone, MAT_GRANITE);
             SM.boxAA(V3(bx - 14, deckY - 1.5f, z0 + 3), V3(bx + 14, deckY + 7, z1 - 3), shade(stone, 0.92f), MAT_GRANITE);
             SM.boxAA(V3(bx - 16.5f, deckY + 7, z0 + 2), V3(bx + 16.5f, deckY + 8.2f, z1 - 2), shade(stone, 1.05f), MAT_GRANITE);
+            if (end == 0) world.addBox(bx, (z0 + z1) * 0.5f, 0, 16.f, (z1 - z0) * 0.5f, 0, deckY + 8.2f, SURF_CONCRETE, true);   // the north anchorage is a real block
         }
         // approach viaducts: the road leaves the anchorage and descends on twin-column piers
         auto viaduct = [&](float zFrom, float zTo, float yFrom, float yTo, const std::vector<float>& piers) {
@@ -3211,56 +3819,1073 @@ static void farRow(V3 left, V3 out, float length, float maxDepth, uint32_t seed)
     }
 }
 
-// Past the edges of the skateable block the city keeps going: street furniture, parked cars and
-// pedestrians continue down every street, and landmark buildings close the long street views.
+// ----------------------------------------------------------------------------
+// A kit of street trick spots. Each function takes a world position and a yaw (a box's local z runs along
+// fwdYaw(rot)) and emits render geometry, collision and grind rails.
+// ----------------------------------------------------------------------------
+static int areaBlocker(float x0, float z0, float x1, float z1) {   // index of a solid taller than the sidewalk in this rectangle, or -1
+    for (size_t i = 0; i < world.solids.size(); i++) {
+        const Solid& s = world.solids[i];
+        if (s.y0 + s.h <= SH + 0.06f) continue;
+        float ex = std::fabs(s.c) * s.hx + std::fabs(s.s) * s.hz, ez = std::fabs(s.s) * s.hx + std::fabs(s.c) * s.hz;
+        if (s.cx + ex < x0 || s.cx - ex > x1 || s.cz + ez < z0 || s.cz - ez > z1) continue;
+        return (int)i;
+    }
+    return -1;
+}
+static bool areaFree(float x0, float z0, float x1, float z1) { return areaBlocker(x0, z0, x1, z1) < 0; }
+static V3 gp(float cx, float cz, float rot, float lx, float lz) {   // local offset -> world position
+    V3 o = rotLocal(rot, lx, lz);
+    return V3(cx + o.x, 0, cz + o.z);
+}
+
+// Grind bar on legs between two ground points
+static void flatBar(V3 a, V3 b, float h, float y0 = SH, Col col = hexc(0xd0d2d4)) {
+    V3 A(a.x, y0 + h, a.z), B(b.x, y0 + h, b.z), d = B - A;
+    float L = lenXZ(d);
+    if (L < 0.5f) return;
+    V3 dn = norm(V3(d.x, 0, d.z)), side = cross(V3(0, 1, 0), dn);
+    SM.limb(A, B, 0.07f, 0.07f, V3(0, 1, 0), col, MAT_METAL);
+    int legs = std::max(2, (int)(L / 2.4f) + 1);
+    for (int i = 0; i < legs; i++) {
+        V3 p = A + d * ((float)i / (legs - 1));
+        for (int sg = -1; sg <= 1; sg += 2) SM.limb(V3(p.x, y0, p.z) + side * (0.25f * sg), p, 0.05f, 0.05f, side, hexc(0xb0b2b4), MAT_METAL);
+    }
+    addRailW(A, B, RK_METAL);
+    V3 m = (A + B) * 0.5f;
+    int si = world.addBox(m.x, m.z, std::atan2(dn.x, dn.z), 0.05f, L * 0.5f, y0, y0 + std::max(0.05f, h - 0.05f), SURF_METAL);
+    world.solids[si].noGround = true;
+}
+
+// Pipe rail on cinder blocks
+static void pipeRail(V3 a, V3 b, float h, float y0 = SH) {
+    V3 A(a.x, y0 + h, a.z), B(b.x, y0 + h, b.z), d = B - A;
+    float L = lenXZ(d);
+    if (L < 0.5f) return;
+    V3 dn = norm(V3(d.x, 0, d.z));
+    SM.limb(A, B, 0.1f, 0.1f, V3(0, 1, 0), hexc(0x9a7040), MAT_METAL);
+    int nb = std::max(2, (int)(L / 3.f) + 1);
+    for (int i = 0; i < nb; i++) {
+        V3 p = A + d * ((float)i / (nb - 1));
+        SM.boxAA(V3(p.x - 0.2f, y0, p.z - 0.2f), V3(p.x + 0.2f, y0 + h - 0.08f, p.z + 0.2f), hexc(0x8a8680), MAT_CONCRETE);
+    }
+    addRailW(A, B, RK_METAL);
+    V3 m = (A + B) * 0.5f;
+    int si = world.addBox(m.x, m.z, std::atan2(dn.x, dn.z), 0.06f, L * 0.5f, y0, y0 + h - 0.05f, SURF_METAL);
+    world.solids[si].noGround = true;
+}
+
+// Sloped ledge (the kind that runs beside a stair set). It rises towards fwdYaw(rot); loH/hiH = height of the top edge above the floor.
+static void hubba(float cx, float cz, float rot, float len, float loH, float hiH, float halfW = 0.32f, Col col = C_GRANITE) {
+    float hl = len * 0.5f;
+    M4 F = frame(cx, SH, cz, rot);
+    V3 a0 = xPoint(F, V3(-halfW, loH, -hl)), a1 = xPoint(F, V3(halfW, loH, -hl));
+    V3 b0 = xPoint(F, V3(-halfW, hiH, hl)), b1 = xPoint(F, V3(halfW, hiH, hl));
+    V3 ga0 = xPoint(F, V3(-halfW, 0, -hl)), ga1 = xPoint(F, V3(halfW, 0, -hl)), gb0 = xPoint(F, V3(-halfW, 0, hl)), gb1 = xPoint(F, V3(halfW, 0, hl));
+    SM.quadOut(a0, a1, b1, b0, V3(0, 1, 0), shade(col, 1.08f), MAT_GRANITE);
+    SM.quadOut(a0, b0, gb0, ga0, xDir(F, V3(-1, 0, 0)), col, MAT_GRANITE);
+    SM.quadOut(a1, b1, gb1, ga1, xDir(F, V3(1, 0, 0)), col, MAT_GRANITE);
+    SM.quadOut(a0, a1, ga1, ga0, xDir(F, V3(0, 0, -1)), shade(col, 0.85f), MAT_GRANITE);
+    SM.quadOut(b0, b1, gb1, gb0, xDir(F, V3(0, 0, 1)), shade(col, 0.85f), MAT_GRANITE);
+    SM.limb(a0, b0, 0.035f, 0.035f, V3(0, 1, 0), hexc(0x6e6f70), MAT_METAL);
+    SM.limb(a1, b1, 0.035f, 0.035f, V3(0, 1, 0), hexc(0x6e6f70), MAT_METAL);
+    V3 up02(0, 0.02f, 0);
+    addRailW(a0 + up02, b0 + up02, RK_LEDGE);
+    addRailW(a1 + up02, b1 + up02, RK_LEDGE);
+    world.addRamp(cx, cz, rot, halfW, hl, SH + loH, hiH - loH, SURF_CONCRETE);
+}
+
+// Stairs (rising towards fwdYaw(rot)) with handrails and hubba ledges either side
+static float stairSet(float cx, float cz, float rot, float hx, int n, float stepH, float stepD, bool rails, bool hubbas, Col col = hexc(0xa39e95)) {
+    float top = stairs(cx, cz, rot, hx, n, stepH, stepD, SH, col, MAT_GRANITE, rails);
+    float L = n * stepD;
+    if (hubbas)
+        for (int sg = -1; sg <= 1; sg += 2) {
+            V3 p = gp(cx, cz, rot, sg * (hx + 0.5f), 0);
+            hubba(p.x, p.z, rot, L, 0.4f, 0.4f + n * stepH);
+        }
+    world.addGap(n >= 8 ? "BIG SET" : "STAIR SET", 250 + n * 50, cx, cz, rot, hx * 0.85f, L * 0.4f, top + 0.05f);
+    return top;
+}
+
+// Wooden pyramid: flat top with four ramps
+static void pyramid(float cx, float cz, float rot, float hx, float hz, float h, Col col = C_PLYWOOD) {
+    Col top = shade(col, 1.12f);
+    solidBox(cx, cz, rot, hx, hz, SH, SH + h, shade(col, 0.85f), MAT_WOOD, SURF_WOOD, false, &top);
+    edgeRails(cx, cz, rot, hx, hz, SH + h, RK_WOOD, false);
+    float kz = 1.3f;
+    V3 p = gp(cx, cz, rot, 0, -(hz + kz));  kicker(p.x, p.z, rot, hx, kz, h, SH, col);
+    p = gp(cx, cz, rot, 0, hz + kz);        kicker(p.x, p.z, rot + PI, hx, kz, h, SH, col);
+    p = gp(cx, cz, rot, -(hx + kz), 0);     kicker(p.x, p.z, rot + PI * 0.5f, hz, kz, h, SH, col);
+    p = gp(cx, cz, rot, hx + kz, 0);        kicker(p.x, p.z, rot - PI * 0.5f, hz, kz, h, SH, col);
+    world.addGap("PYRAMID", 200, cx, cz, rot, hx, hz, SH + h + 0.1f);
+}
+
+// Two raised slabs with a gap between them, and ramps on the outside ends
+static void gapJump(float cx, float cz, float rot, float hx, float gap, float slabLen, float h, Col col = hexc(0xb0aba2)) {
+    for (int sg = -1; sg <= 1; sg += 2) {
+        V3 p = gp(cx, cz, rot, 0, sg * (gap * 0.5f + slabLen * 0.5f));
+        Col t = shade(col, 1.08f);
+        solidBox(p.x, p.z, rot, hx, slabLen * 0.5f, SH, SH + h, col, MAT_CONCRETE, SURF_CONCRETE, false, &t);
+        edgeRails(p.x, p.z, rot, hx, slabLen * 0.5f, SH + h, RK_LEDGE, false);
+        V3 k = gp(cx, cz, rot, 0, sg * (gap * 0.5f + slabLen + 1.6f));
+        kicker(k.x, k.z, sg > 0 ? rot + PI : rot, hx, 1.6f, h, SH, hexc(0xc49a62));
+    }
+    world.addGap("GAP JUMP", 350, cx, cz, rot, hx, gap * 0.5f, SH + h + 0.2f);
+}
+
+static void bench(float cx, float cz, float rot, float len = 1.8f) {
+    Col seat = hexc(0x8a6038), fr = hexc(0x22302a);
+    float hl = len * 0.5f;
+    solidBox(cx, cz, rot, hl, 0.28f, SH, SH + 0.46f, fr, MAT_WOOD, SURF_WOOD, false, &seat);
+    V3 b = gp(cx, cz, rot, 0, 0.27f);
+    SM.boxRot(b.x, b.z, rot, hl, 0.03f, SH + 0.46f, SH + 0.95f, seat, MAT_WOOD);
+    int si = world.addBox(b.x, b.z, rot, hl, 0.04f, SH + 0.46f, SH + 0.95f, SURF_WOOD);
+    world.solids[si].noGround = true;
+    V3 f = gp(cx, cz, rot, 0, -0.28f), ax = rotLocal(rot, 1, 0);
+    addRailW(V3(f.x - ax.x * hl, SH + 0.46f, f.z - ax.z * hl), V3(f.x + ax.x * hl, SH + 0.46f, f.z + ax.z * hl), RK_WOOD);
+}
+
+static void planter(float cx, float cz, float rot, float hx, float hz, float h, bool withTree) {
+    Col pt = hexc(0x5a4632), body = hexc(0x8f8a82);
+    solidBox(cx, cz, rot, hx, hz, SH, SH + h, body, MAT_GRANITE, SURF_CONCRETE, false, &pt);
+    edgeRails(cx, cz, rot, hx, hz, SH + h, RK_LEDGE, false);
+    if (withTree) farTree(cx, cz, SH + h);
+}
+
+static void jersey(float cx, float cz, float rot, float len, Col c = hexc(0xc9c5bc), float y0 = SH) {
+    Col t = shade(c, 1.06f);
+    solidBox(cx, cz, rot, 0.22f, len * 0.5f, y0, y0 + 0.82f, c, MAT_CONCRETE, SURF_CONCRETE, false, &t);
+    SM.boxRot(cx, cz, rot, 0.34f, len * 0.5f, y0, y0 + 0.25f, c, MAT_CONCRETE);
+    V3 ax = rotLocal(rot, 0, 1);
+    addRailW(V3(cx - ax.x * len * 0.5f, y0 + 0.82f, cz - ax.z * len * 0.5f), V3(cx + ax.x * len * 0.5f, y0 + 0.82f, cz + ax.z * len * 0.5f), RK_LEDGE);
+}
+
+static void waterBarrier(float cx, float cz, float rot, float len = 1.9f) {
+    Col orange = hexc(0xf0631a), white = hexc(0xf2f0e8), top = hexc(0xd8541a);
+    float hl = len * 0.5f;
+    solidBox(cx, cz, rot, 0.28f, hl, SH, SH + 0.85f, orange, MAT_PAINTED, SURF_METAL, false, &top);
+    SM.boxRot(cx, cz, rot, 0.295f, hl * 0.95f, SH + 0.36f, SH + 0.5f, white, MAT_PAINTED);
+    SM.boxRot(cx, cz, rot, 0.34f, hl * 0.98f, SH, SH + 0.14f, shade(orange, 0.8f), MAT_PAINTED);
+    V3 ax = rotLocal(rot, 0, 1);
+    addRailW(V3(cx - ax.x * hl, SH + 0.85f, cz - ax.z * hl), V3(cx + ax.x * hl, SH + 0.85f, cz + ax.z * hl), RK_LEDGE);
+}
+
+static void cone(float x, float z, float y0 = SH) {
+    SM.boxAA(V3(x - 0.2f, y0, z - 0.2f), V3(x + 0.2f, y0 + 0.03f, z + 0.2f), hexc(0x141414), MAT_RUBBER);
+    SM.cylinder(frame(x, y0 + 0.03f, z, 0), 0.16f, 0.7f, 10, hexc(0xf25a12), MAT_PAINTED, true, 0.03f);
+    SM.cylinder(frame(x, y0 + 0.38f, z, 0), 0.098f, 0.13f, 10, hexc(0xf2f0e8), MAT_PAINTED, false, 0.08f);
+    world.addBox(x, z, 0, 0.14f, 0.14f, y0, y0 + 0.7f, SURF_METAL);
+}
+
+static void palletStack(float cx, float cz, float rot, int n, float hx = 0.6f, float hz = 0.5f) {
+    float h = 0.15f * n;
+    Col w = hexc(0xb89a70), t = hexc(0xc8aa80);
+    solidBox(cx, cz, rot, hx, hz, SH, SH + h, w, MAT_WOOD, SURF_WOOD, false, &t);
+    edgeRails(cx, cz, rot, hx, hz, SH + h, RK_WOOD, false);
+    for (int i = 1; i < n; i++) SM.boxRot(cx, cz, rot, hx + 0.015f, hz + 0.015f, SH + i * 0.15f - 0.02f, SH + i * 0.15f + 0.02f, shade(w, 0.55f), MAT_WOOD);
+}
+
+static void bikeRack(float cx, float cz, float rot, int units) {
+    for (int i = 0; i < units; i++) {
+        V3 p = gp(cx, cz, rot, (i - (units - 1) * 0.5f) * 0.7f, 0);
+        V3 ax = rotLocal(rot, 0, 1);   // the loop lies along local z
+        V3 a(p.x - ax.x * 0.3f, SH, p.z - ax.z * 0.3f), b(p.x + ax.x * 0.3f, SH, p.z + ax.z * 0.3f);
+        SM.limb(a, a + V3(0, 0.8f, 0), 0.04f, 0.04f, V3(1, 0, 0), hexc(0x8a9096), MAT_METAL);
+        SM.limb(b, b + V3(0, 0.8f, 0), 0.04f, 0.04f, V3(1, 0, 0), hexc(0x8a9096), MAT_METAL);
+        SM.limb(a + V3(0, 0.8f, 0), b + V3(0, 0.8f, 0), 0.04f, 0.04f, V3(0, 1, 0), hexc(0x8a9096), MAT_METAL);
+        addRailW(a + V3(0, 0.8f, 0), b + V3(0, 0.8f, 0), RK_METAL);
+        world.addBox(p.x, p.z, rot, 0.05f, 0.3f, SH, SH + 0.8f, SURF_METAL);
+    }
+}
+
+static void bollard(float x, float z) {
+    SM.cylinder(frame(x, SH, z, 0), 0.11f, 0.9f, 10, hexc(0x2a2d30), MAT_METAL);
+    SM.cylinder(frame(x, SH + 0.86f, z, 0), 0.115f, 0.05f, 10, hexc(0xe8c020), MAT_PAINTED);
+    world.addBox(x, z, 0, 0.11f, 0.11f, SH, SH + 0.9f, SURF_METAL);
+}
+
+// Painted-on mural / tags for a wall face (colour blocks and a tag word)
+static void mural(V3 base, V3 right, V3 up, V3 out, float w, float h, uint32_t seed) {
+    Rng r(seed);
+    static const uint32_t pal[] = {0xe23b3b, 0xf5d142, 0x3b7de2, 0x2fbf8a, 0xf0efe8, 0x8a3be2, 0xf08a24, 0x111111, 0xff4fa0, 0x40e0ff};
+    V3 o = out * 0.035f;
+    SM.quadN(base + o, base + right * w + o, base + right * w + up * h + o, base + up * h + o, out, hexc(pal[r.irange(0, 9)]), MAT_PLAIN);
+    int blocks = r.irange(5, 9);
+    for (int i = 0; i < blocks; i++) {
+        float bw = r.range(w * 0.12f, w * 0.35f), bh = r.range(h * 0.15f, h * 0.5f);
+        float bx = r.range(0.f, w - bw), by = r.range(0.f, h - bh);
+        V3 p = base + right * bx + up * by + out * (0.04f + 0.004f * i);
+        SM.quadN(p, p + right * bw, p + right * bw + up * bh, p + up * bh, out, hexc(pal[r.irange(0, 9)]), MAT_PLAIN);
+    }
+    static const char* tags[] = {"SKATE", "NYC", "OPUS", "CRUZ", "PEACE", "RIDE", "FLIP", "JUNGLE"};
+    std::string t = tags[r.irange(0, 7)];
+    float px = std::min(h * 0.5f / 7.f, w * 0.8f / (t.size() * 6.f));
+    float tw = textWidth3D(t, px);
+    SM.text3D(t, base + right * (w * 0.5f - tw * 0.5f) + up * (h * 0.5f - px * 3.5f) + out * 0.06f, right, up, px, hexc(pal[r.irange(0, 9)]) , MAT_PLAIN);
+}
+
+// ----------------------------------------------------------------------------
+// Skate lots: gaps in a street frontage filled with a themed cluster of spots, walled in by the
+// buildings on either side (and a back wall when the lot is a dead end).
+// ----------------------------------------------------------------------------
+struct MapMark { float x, z; int kind; };   // spots shown on the minimap: kind 0-6 skate lots, 7 landmarks
+static std::vector<MapMark> mapMarks;
+struct LotFrame {
+    V3 P;               // centre of the lot's front edge
+    V3 d;               // unit vector into the lot
+    float W = 30, D = 30, yaw = 0;   // width along the street, depth, yaw of d
+    V3 xa() const { return V3(d.z, 0, -d.x); }   // lateral axis (local x of a box whose rot is yaw)
+    V3 at(float u, float v) const { return P + xa() * u + d * v; }
+};
+
+static void lotFloor(const LotFrame& L, Col col, uint8_t mat) {
+    V3 c0 = L.at(-L.W * 0.5f, 0.3f), c1 = L.at(L.W * 0.5f, L.D - 0.05f);
+    overlay(std::min(c0.x, c1.x), std::min(c0.z, c1.z), std::max(c0.x, c1.x), std::max(c0.z, c1.z), SH + 0.01f, col, mat);
+}
+
+// kinked rail: flat, drop, flat (a "flat-down-flat"), running along local z from v0
+static void kinkRail(const LotFrame& L, float u, float v0, float hi, float lo) {
+    V3 p0 = L.at(u, v0), p1 = L.at(u, v0 + 4.f), p2 = L.at(u, v0 + 9.f), p3 = L.at(u, v0 + 13.f);
+    V3 a(p0.x, SH + hi, p0.z), b(p1.x, SH + hi, p1.z), c(p2.x, SH + lo, p2.z), d(p3.x, SH + lo, p3.z);
+    Col col = hexc(0xd0d2d4);
+    V3 side = cross(V3(0, 1, 0), L.d);
+    V3 pts[4] = {a, b, c, d};
+    for (int i = 0; i < 3; i++) {
+        SM.limb(pts[i], pts[i + 1], 0.07f, 0.07f, side, col, MAT_METAL);
+        addRailW(pts[i], pts[i + 1], RK_METAL);
+    }
+    for (int i = 0; i < 4; i++) for (int sg = -1; sg <= 1; sg += 2) SM.limb(V3(pts[i].x, SH, pts[i].z) + side * (0.25f * sg), pts[i], 0.05f, 0.05f, side, hexc(0xb0b2b4), MAT_METAL);
+    for (int i = 0; i < 3; i++) {
+        V3 m = (pts[i] + pts[i + 1]) * 0.5f, dd = pts[i + 1] - pts[i];
+        int si = world.addBox(m.x, m.z, L.yaw, 0.05f, lenXZ(dd) * 0.5f, SH, SH + std::min(pts[i].y, pts[i + 1].y) - SH - 0.06f, SURF_METAL);
+        world.solids[si].noGround = true;
+    }
+}
+
+static void lotBanks(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x9a8f84), MAT_CONCRETE);
+    Col brick = hexc(0xa0503a);
+    for (int sg = -1; sg <= 1; sg += 2) {   // brick banks rising into the side walls
+        V3 p = L.at(sg * (W * 0.5f - 3.3f), D * 0.4f);
+        kicker(p.x, p.z, y + sg * PI * 0.5f, 6.5f, 3.3f, 1.5f, SH, brick, MAT_BRICKBANK, SURF_BRICK);
+        V3 q = L.at(sg * (W * 0.5f - 2.4f), D * 0.8f);
+        kicker(q.x, q.z, y + sg * PI * 0.5f, 4.0f, 2.4f, 1.1f, SH, brick, MAT_BRICKBANK, SURF_BRICK);
+    }
+    V3 c = L.at(0, D * 0.5f);
+    pyramid(c.x, c.z, y, 2.4f, 2.4f, 0.62f);
+    V3 m = L.at(0, D * 0.2f);
+    ledge(m.x, m.z, y, 3.5f, 0.6f, SH, 0.16f, hexc(0xb0aba2), MAT_CONCRETE);
+    flatBar(L.at(-5.5f, D * 0.88f), L.at(5.5f, D * 0.88f), 0.55f);
+    V3 w = L.at(0, D - 1.6f);
+    ledge(w.x, w.z, y, W * 0.5f - 7.5f, 0.4f, SH, 0.5f);
+    (void)r;
+}
+
+static void lotStairYard(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x8d8a84), MAT_CONCRETE);
+    const float tH = 1.8f;
+    const int n = 10;
+    float sD = 0.45f, sH = tH / n;
+    float tz = D - 5.0f;   // terrace spans the back 10 m
+    V3 t = L.at(0, tz);
+    Col top = hexc(0xa8a49c);
+    solidBox(t.x, t.z, y, W * 0.5f - 1.f, 5.0f, SH, SH + tH, hexc(0x9a968f), MAT_GRANITE, SURF_CONCRETE, false, &top);
+    edgeRails(t.x, t.z, y, W * 0.5f - 1.f, 5.0f, SH + tH, RK_LEDGE, false);
+    V3 s = L.at(0, D - 10.f - n * sD * 0.5f);
+    stairSet(s.x, s.z, y, 3.0f, n, sH, sD, true, true);
+    for (int sg = -1; sg <= 1; sg += 2) {   // planters and benches up on the terrace
+        V3 p = L.at(sg * (W * 0.5f - 4.f), D - 4.f);
+        planter(p.x, p.z, y, 1.5f, 1.5f, 0.5f, true);
+        V3 b = L.at(sg * 6.f, D - 1.3f);
+        bench(b.x, b.z, y + PI, 1.8f);
+    }
+    flatBar(L.at(-8.f, 6.f), L.at(8.f, 6.f), 0.55f);
+    V3 k = L.at(-9.f, 11.f);
+    gapJump(k.x, k.z, y, 1.4f, 3.0f, 2.2f, 0.6f);
+    V3 k2 = L.at(9.f, 11.f);
+    pyramid(k2.x, k2.z, y, 1.6f, 1.6f, 0.5f);
+    (void)r;
+}
+
+static void lotLedges(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x9c9890), MAT_CONCRETE);
+    for (int i = 0; i < 3; i++) {   // row of low ledges with gaps
+        V3 p = L.at((i - 1) * 8.5f, D * 0.22f);
+        ledge(p.x, p.z, y, 2.0f + i * 0.4f, 0.4f, SH, 0.38f + 0.06f * i);
+    }
+    V3 l = L.at(0, D * 0.46f);
+    ledge(l.x, l.z, y, 6.f, 0.45f, SH, 0.55f);
+    for (int sg = -1; sg <= 1; sg += 2) { V3 p = L.at(sg * 8.8f, D * 0.46f); planter(p.x, p.z, y, 1.4f, 1.4f, 0.55f, true); }
+    for (int i = 0; i < 4; i++) {   // ledges that step up: ollie up them one by one
+        V3 p = L.at((i - 1.5f) * 6.f, D * 0.74f);
+        ledge(p.x, p.z, y, 2.6f, 0.4f, SH, 0.28f + 0.2f * i);
+    }
+    for (int sg = -1; sg <= 1; sg += 2) {
+        V3 m = L.at(sg * 4.f, D * 0.1f);
+        ledge(m.x, m.z, y, 2.4f, 0.7f, SH, 0.14f, hexc(0xb0aba2), MAT_CONCRETE);   // manual pads
+        V3 b = L.at(sg * (W * 0.5f - 0.7f), D * 0.6f);
+        bench(b.x, b.z, y + sg * PI * 0.5f + PI, 2.0f);
+    }
+    V3 g = L.at(0, D * 0.92f);
+    gapJump(g.x, g.z, y + PI * 0.5f, 1.0f, 2.6f, 3.0f, 0.5f);
+    (void)r;
+}
+
+static void lotRails(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x8f8c86), MAT_CONCRETE);
+    flatBar(L.at(-W * 0.5f + 4.f, 5.f), L.at(-W * 0.5f + 12.f, 5.f), 0.45f);
+    flatBar(L.at(-W * 0.5f + 5.f, 8.f), L.at(-W * 0.5f + 11.f, 8.f), 0.75f);
+    flatBar(L.at(W * 0.5f - 12.f, 6.5f), L.at(W * 0.5f - 4.f, 6.5f), 0.95f);
+    kinkRail(L, -2.f, D * 0.3f, 0.95f, 0.35f);
+    V3 s = L.at(6.5f, D * 0.6f);
+    V3 top = s;
+    float t = stairSet(s.x, s.z, y, 1.5f, 7, 0.17f, 0.42f, true, false);
+    V3 a = L.at(6.5f, D * 0.6f - 1.47f), b = L.at(6.5f, D * 0.6f + 1.47f);   // centre down-rail
+    handrail(V3(a.x, SH + 0.3f + 0.85f, a.z), V3(b.x, t + 0.85f, b.z), true, C_IRON, 1.3f);
+    (void)top;
+    V3 s2 = L.at(-8.f, D * 0.68f);
+    stairSet(s2.x, s2.z, y, 2.4f, 4, 0.18f, 0.45f, true, true);
+    V3 k = L.at(0, D * 0.12f);
+    kicker(k.x, k.z, y, 1.3f, 1.5f, 0.55f);
+    V3 l = L.at(0, D * 0.12f + 5.5f);
+    ledge(l.x, l.z, y, 2.8f, 0.4f, SH, 0.5f);
+    pipeRail(L.at(-W * 0.5f + 3.f, D * 0.9f), L.at(-W * 0.5f + 13.f, D * 0.9f), 0.5f);
+    pipeRail(L.at(W * 0.5f - 13.f, D * 0.88f), L.at(W * 0.5f - 3.f, D * 0.88f), 0.7f);
+    (void)r;
+}
+
+static void lotMiniRamp(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x85827c), MAT_CONCRETE);
+    float Rr = 2.4f, H = 1.6f;
+    V3 a = L.at(0, D - 3.f);    // back ramp rides towards +d, coping at its midpoint
+    quarterPipe(a.x, a.z, y, 4.6f, Rr, H, 1.4f, SH);
+    V3 b = L.at(0, 4.f);        // front ramp rides towards the street
+    quarterPipe(b.x, b.z, y + PI, 4.6f, Rr, H, 1.0f, SH);
+    for (int sg = -1; sg <= 1; sg += 2) {
+        V3 p = L.at(sg * 10.5f, D * 0.5f);
+        pyramid(p.x, p.z, y, 1.8f, 1.8f, 0.6f);
+        V3 k = L.at(sg * (W * 0.5f - 2.5f), D * 0.3f);
+        kicker(k.x, k.z, y + sg * PI * 0.5f, 3.0f, 2.5f, 1.2f, SH, hexc(0xc49a62));
+    }
+    flatBar(L.at(-4.f, D * 0.5f), L.at(4.f, D * 0.5f), 0.55f);
+    V3 m = L.at(0, D * 0.3f);
+    ledge(m.x, m.z, y, 2.0f, 0.4f, SH, 0.16f, hexc(0xb0aba2), MAT_CONCRETE);
+    (void)r;
+}
+
+static void lotPlaza(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x9a5b47), MAT_PAVERS);
+    V3 c = L.at(0, D * 0.5f);
+    pyramid(c.x, c.z, y, 3.6f, 3.6f, 0.7f, hexc(0xb89a70));
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sz = 0; sz < 2; sz++) {
+            V3 p = L.at(sx * (W * 0.5f - 3.f), D * (sz ? 0.78f : 0.22f));
+            planter(p.x, p.z, y, 1.6f, 1.6f, 0.55f, true);
+        }
+    for (int i = 0; i < 6; i++) if (i != 2 && i != 3) { V3 b = L.at(-7.5f + i * 3.f, 1.0f); bollard(b.x, b.z); }
+    for (int sg = -1; sg <= 1; sg += 2) {
+        V3 b = L.at(sg * 6.5f, D * 0.32f);
+        bench(b.x, b.z, y + PI, 2.0f);
+        V3 l = L.at(sg * 7.5f, D * 0.68f);
+        ledge(l.x, l.z, y + PI * 0.5f, 3.0f, 0.4f, SH, 0.45f);
+        V3 h = L.at(sg * 3.2f, D * 0.18f);
+        hubba(h.x, h.z, y, 5.f, 0.3f, 0.75f);
+    }
+    (void)r;
+}
+
+static void lotYard(const LotFrame& L, Rng& r) {
+    float W = L.W, D = L.D, y = L.yaw;
+    lotFloor(L, hexc(0x7c766c), MAT_CONCRETE);
+    for (int i = 0; i < 6; i++) {   // zig-zag of jersey barriers
+        V3 p = L.at(-9.f + i * 3.6f, D * 0.3f + (i & 1) * 2.4f);
+        jersey(p.x, p.z, y + PI * 0.5f, 3.6f);
+    }
+    pipeRail(L.at(-W * 0.5f + 4.f, D * 0.55f), L.at(-W * 0.5f + 14.f, D * 0.55f), 0.5f);
+    pipeRail(L.at(W * 0.5f - 14.f, D * 0.6f), L.at(W * 0.5f - 4.f, D * 0.6f), 0.4f);
+    for (int i = 0; i < 3; i++) { V3 p = L.at(-4.f + i * 4.f, D * 0.78f); palletStack(p.x, p.z, y, 2 + i, 0.7f, 0.55f); }
+    V3 d = L.at(W * 0.5f - 4.f, D * 0.85f);
+    Col dc = hexc(0x2f6b3f), dt = hexc(0x3d7a4d);
+    solidBox(d.x, d.z, y, 1.0f, 2.0f, SH, SH + 1.3f, dc, MAT_PAINTED, SURF_METAL, false, &dt);
+    edgeRails(d.x, d.z, y, 1.0f, 2.0f, SH + 1.3f, RK_METAL, false);
+    V3 k = L.at(W * 0.5f - 6.6f, D * 0.85f);
+    kicker(k.x, k.z, y + PI * 0.5f * -1.f, 1.2f, 1.0f, 1.3f);
+    world.addGap("DUMPSTER HOP", 300, d.x, d.z, y, 1.0f, 2.0f, SH + 1.4f);
+    for (int i = 0; i < 5; i++) { V3 c = L.at(-12.f + i * 1.3f, D * 0.12f); cone(c.x, c.z); }
+    V3 fa = L.at(-W * 0.5f + 0.5f, 0.4f), fb = L.at(-5.f, 0.4f), fc = L.at(5.f, 0.4f), fd = L.at(W * 0.5f - 0.5f, 0.4f);
+    chainFence(V3(fa.x, SH, fa.z), V3(fb.x, SH, fb.z), 2.4f);
+    chainFence(V3(fc.x, SH, fc.z), V3(fd.x, SH, fd.z), 2.4f);
+    (void)r;
+}
+
+// Extra spots dropped into a lot wherever there is room: lines (kicker, gap, ledge), bars, stairs, pads, benches...
+static void fillLot(const LotFrame& L, Rng& r, int count) {
+    float W = L.W, D = L.D, y = L.yaw;
+    int placed = 0, tries = 0;
+    static const float RAD[12] = {4.6f, 3.9f, 4.1f, 4.9f, 3.0f, 4.1f, 2.9f, 2.7f, 3.2f, 4.4f, 3.2f, 2.7f};   // clear space each kind needs
+    while (placed < count && tries < count * 40) {
+        tries++;
+        int kind = r.irange(0, 11);
+        float rad = RAD[kind];
+        float rot = y + r.irange(0, 3) * PI * 0.5f;
+        V3 p;
+        float tu, tv;   // centre of the area that has to be free
+        if (kind == 7 || kind == 11) {   // built against a side wall
+            float sg = r.chance(0.5f) ? 1.f : -1.f;
+            float v = r.range(rad + 2.f, D - rad - 2.f);
+            p = L.at(sg * (W * 0.5f - (kind == 7 ? 0.3f : 2.6f)), v);
+            rot = y + sg * PI * 0.5f;
+            V3 c = L.at(sg * (W * 0.5f - rad - 0.15f), v);
+            tu = c.x; tv = c.z;
+        } else {
+            float u = r.range(-W * 0.5f + rad + 0.6f, W * 0.5f - rad - 0.6f), v = r.range(rad + 1.5f, D - rad - 1.5f);
+            p = L.at(u, v);
+            tu = p.x; tv = p.z;
+        }
+        {
+            int bi = areaBlocker(tu - rad, tv - rad, tu + rad, tv + rad);
+            if (bi >= 0) {
+                if (getenv("CJ_DEBUG_LOTS") && std::fabs(L.P.x + 238.f) < 1.f && tries < 14) {
+                    const Solid& b = world.solids[bi];
+                    fprintf(stderr, "  try kind %d at %.1f %.1f rad %.1f blocked by c(%.1f %.1f) h(%.1f %.1f) y %.2f..%.2f\n", kind, tu, tv, rad, b.cx, b.cz, b.hx, b.hz, b.y0, b.y0 + b.h);
+                }
+                continue;
+            }
+        }
+        placed++;
+        switch (kind) {
+            case 0: {   // kicker, gap, ledge
+                V3 k = gp(p.x, p.z, rot, 0, -3.5f), l = gp(p.x, p.z, rot, 0, 3.f);
+                kicker(k.x, k.z, rot, 1.3f, 1.5f, 0.5f);
+                ledge(l.x, l.z, rot, 2.2f, 0.4f, SH, 0.3f + 0.4f * r.f());
+                break;
+            }
+            case 1: {   // two bars, different heights
+                V3 a = gp(p.x, p.z, rot, -3.5f, -1.f), b = gp(p.x, p.z, rot, 3.5f, -1.f), c = gp(p.x, p.z, rot, -3.5f, 1.2f), d = gp(p.x, p.z, rot, 3.5f, 1.2f);
+                flatBar(a, b, 0.45f); flatBar(c, d, 0.85f);
+                break;
+            }
+            case 2: {   // small stair set with hubbas
+                int n = r.irange(3, 6);
+                stairSet(p.x, p.z, rot, 1.3f, n, 0.17f, 0.42f, r.chance(0.7f), r.chance(0.7f));
+                break;
+            }
+            case 3: {   // manual pads in a row
+                for (int i = 0; i < 3; i++) { V3 q = gp(p.x, p.z, rot, 0, (i - 1) * 4.f); ledge(q.x, q.z, rot, 1.2f, 1.4f, SH, 0.14f + 0.05f * i, hexc(0xb0aba2), MAT_CONCRETE); }
+                break;
+            }
+            case 4: {   // a couple of benches
+                V3 a = gp(p.x, p.z, rot, -1.3f, 0), b = gp(p.x, p.z, rot, 1.3f, 0);
+                bench(a.x, a.z, rot, 1.8f); bench(b.x, b.z, rot + PI, 1.8f);
+                break;
+            }
+            case 5: {   // planters with a gap to jump
+                V3 a = gp(p.x, p.z, rot, -3.f, 0), b = gp(p.x, p.z, rot, 3.f, 0);
+                planter(a.x, a.z, rot, 1.3f, 1.3f, 0.55f, true); planter(b.x, b.z, rot, 1.3f, 1.3f, 0.55f, r.chance(0.5f));
+                break;
+            }
+            case 6: pyramid(p.x, p.z, rot, 1.8f, 1.8f, 0.5f + 0.15f * r.f()); break;
+            case 7: quarterPipe(p.x, p.z, rot, 3.2f, 2.f, 1.3f, 1.2f, SH); break;
+            case 8: {   // L of two ledges
+                V3 a = gp(p.x, p.z, rot, 0, 0), b = gp(p.x, p.z, rot, 2.3f, 2.3f);
+                ledge(a.x, a.z, rot, 2.4f, 0.4f, SH, 0.45f); ledge(b.x, b.z, rot + PI * 0.5f, 2.4f, 0.4f, SH, 0.45f);
+                break;
+            }
+            case 9: {
+                for (int i = 0; i < 3; i++) { V3 q = gp(p.x, p.z, rot, (i - 1) * 3.4f, (i & 1) * 1.2f); jersey(q.x, q.z, rot + PI * 0.5f, 3.2f); }
+                break;
+            }
+            case 10: pipeRail(gp(p.x, p.z, rot, -3.f, 0), gp(p.x, p.z, rot, 3.f, 0), 0.4f + 0.2f * r.f()); break;
+            default: kicker(p.x, p.z, rot, 2.6f, 2.4f, 1.0f, SH, hexc(0xc49a62)); break;   // bank against the wall
+        }
+    }
+    if (getenv("CJ_DEBUG_LOTS") && std::fabs(L.P.x + 238.f) < 1.f) {
+        V3 c0 = L.at(-W * 0.5f + 1, 1), c1 = L.at(W * 0.5f - 1, D - 1);
+        float x0 = std::min(c0.x, c1.x), x1 = std::max(c0.x, c1.x), z0 = std::min(c0.z, c1.z), z1 = std::max(c0.z, c1.z);
+        for (const Solid& sd : world.solids) {
+            if (sd.y0 + sd.h <= SH + 0.06f) continue;
+            float ex = std::fabs(sd.c) * sd.hx + std::fabs(sd.s) * sd.hz, ez = std::fabs(sd.s) * sd.hx + std::fabs(sd.c) * sd.hz;
+            if (sd.cx + ex < x0 || sd.cx - ex > x1 || sd.cz + ez < z0 || sd.cz - ez > z1) continue;
+            if (ex > 3.f || ez > 3.f) fprintf(stderr, "  solid c(%.1f %.1f) e(%.1f %.1f) y %.2f..%.2f type %d\n", sd.cx, sd.cz, ex, ez, sd.y0, sd.y0 + sd.h, sd.type);
+        }
+    }
+    if (getenv("CJ_DEBUG_LOTS")) fprintf(stderr, "lot at %.0f %.0f W %.0f D %.0f: %d of %d spots, %d tries\n", L.P.x, L.P.z, W, D, placed, count, tries);
+}
+
+// A lot between two buildings; 'front' = centre of the street-side edge, 'into' = unit vector into the lot
+static void buildLot(V3 front, V3 into, float W, float D, int theme, uint32_t seed, bool deadEnd) {
+    LotFrame L;
+    L.P = front; L.d = into; L.W = W; L.D = D; L.yaw = yawOf(into);
+    Rng r(seed);
+    switch (((theme % 7) + 7) % 7) {
+        case 0: lotBanks(L, r); break;
+        case 1: lotStairYard(L, r); break;
+        case 2: lotLedges(L, r); break;
+        case 3: lotRails(L, r); break;
+        case 4: lotMiniRamp(L, r); break;
+        case 5: lotPlaza(L, r); break;
+        default: lotYard(L, r); break;
+    }
+    fillLot(L, r, deadEnd ? 22 : 34);
+    {   // name board at the entrance, readable from the street
+        static const char* names[7] = {"THE BANKS", "STAIR YARD", "LEDGE GARDEN", "RAIL CITY", "MINI RAMP", "THE PLAZA", "THE YARD"};
+        const char* nm = names[((theme % 7) + 7) % 7];
+        V3 pp = L.at(-W * 0.5f + 2.6f, 1.4f);
+        SM.cylinder(frame(pp.x, SH, pp.z, 0), 0.06f, 3.4f, 8, hexc(0x3a463e), MAT_METAL);
+        signBoard(V3(pp.x, SH + 3.6f, pp.z) + L.d * -0.1f, L.xa(), V3(0, 1, 0), L.d * -1.f, 4.8f, 0.9f, nm, hexc(0x141414), hexc(0xffd23a), true);
+        signBoard(V3(pp.x, SH + 3.6f, pp.z) + L.d * 0.1f, L.xa() * -1.f, V3(0, 1, 0), L.d, 4.8f, 0.9f, nm, hexc(0x141414), hexc(0xffd23a), true);
+        world.addBox(pp.x, pp.z, L.yaw, 0.08f, 0.08f, SH, SH + 3.4f, SURF_METAL);
+    }
+    if (deadEnd) {   // a tall back wall with a mural, and lamps at the back corners
+        V3 c0 = L.at(-W * 0.5f - 14.f, D), c1 = L.at(W * 0.5f + 14.f, D + 10.f);
+        building(std::min(c0.x, c1.x), std::min(c0.z, c1.z), std::max(c0.x, c1.x), std::max(c0.z, c1.z), 22.f, 0, hexc(0x7a4a3a), seed + 5, false);
+        mural(L.at(W * 0.5f - 2.f, D), L.xa() * -1.f, V3(0, 1, 0), L.d * -1.f, W - 4.f, 4.2f, seed + 77);
+    }
+    for (int sg = -1; sg <= 1; sg += 2) {   // murals on the side walls
+        mural(L.at(sg * W * 0.5f, sg > 0 ? D * 0.25f : D * 0.75f), sg > 0 ? L.d : L.d * -1.f, V3(0, 1, 0), L.xa() * (float)(-sg), D * 0.5f, 3.6f, seed + 91 + sg * 7);
+        V3 lp = L.at(sg * (W * 0.5f - 1.5f), D - 1.6f);
+        streetLamp(lp.x, lp.z, SH, L.yaw + PI * 0.5f * sg);
+    }
+    V3 pg = L.at(0, D * 0.4f);
+    pigeonSpots.push_back(V3(pg.x, SH, pg.z));
+    V3 mc = L.at(0, D * 0.5f);
+    mapMarks.push_back({mc.x, mc.z, ((theme % 7) + 7) % 7});
+}
+
+struct LotSpec { float a, b; int theme; };
+// A street frontage of shops with gaps left for lots. 'left' and 'out' are as for facadeRow; the lots are given as
+// world coordinate ranges along the street (x for the cross streets, z for the avenue). The buildings beside a lot
+// are built lotDepth deep so the lot has real walls; lots are filled in by the caller.
+static void lotRow(V3 left, V3 out, float length, float rowDepth, float lotDepth, uint32_t seed, float minH, float maxH, const std::vector<LotSpec>& lots) {
+    V3 up(0, 1, 0), r = cross(up, out);
+    bool alongX = std::fabs(r.x) > 0.5f;
+    float lc = alongX ? left.x : left.z, rs = alongX ? r.x : r.z;
+    std::vector<std::pair<float, float>> gaps;
+    for (const LotSpec& L : lots) {
+        float u0 = (L.a - lc) * rs, u1 = (L.b - lc) * rs;
+        if (u0 > u1) std::swap(u0, u1);
+        gaps.push_back({u0, u1});
+    }
+    std::sort(gaps.begin(), gaps.end());
+    float cur = 0;
+    int k = 0;
+    for (auto& g : gaps) {
+        float deep0 = std::max(cur, g.first - 14.f);
+        if (deep0 - cur > 0.5f) facadeRow(left + r * cur, out, deep0 - cur, rowDepth, seed + 97 * k++, true, minH, maxH, -1);
+        if (g.first - deep0 > 0.5f) facadeRow(left + r * deep0, out, g.first - deep0, lotDepth, seed + 97 * k++, true, minH, maxH, -1);
+        float deep1 = std::min(length, g.second + 14.f);
+        if (deep1 - g.second > 0.5f) facadeRow(left + r * g.second, out, deep1 - g.second, lotDepth, seed + 97 * k++, true, minH, maxH, -1);
+        cur = std::max(cur, deep1);
+    }
+    if (length - cur > 0.5f) facadeRow(left + r * cur, out, length - cur, rowDepth, seed + 97 * k++, true, minH, maxH, -1);
+}
+
+// ----------------------------------------------------------------------------
+// Road closures: every street ends in a construction blockade that stops you for good.
+// Layers, from the skater's side: cones and water barriers, striped barricades with flashing
+// beacons, jersey barriers to grind, then a tall chain-link fence hung with ROAD BLOCKED signs.
+// Behind it there is a torn-up road with an excavator, a dump truck and floodlights.
+// ----------------------------------------------------------------------------
+struct Beacon { V3 pos; int phase; };
+static std::vector<Beacon> beacons;
+
+// striped board of a Type III barricade: slanted orange and white bands clipped to the board ends
+static void stripedBoard(const M4& F, float x0, float x1, float y0, float y1, float z, V3 nOut) {
+    const float slant = 0.32f, bw = 0.2f;
+    for (float a = x0 - slant; a < x1; a += bw) {
+        bool orange = ((int)std::floor((a - x0 + 10.f) / bw)) & 1;
+        // parallelogram (a..a+bw at the bottom, shifted by slant at the top), clipped to [x0, x1]
+        float bl = a, br = a + bw, tl = a + slant, tr = a + bw + slant;
+        std::vector<V2> poly = {{bl, y0}, {br, y0}, {tr, y1}, {tl, y1}};
+        for (int side = 0; side < 2; side++) {
+            float lim = side ? x1 : x0;
+            std::vector<V2> out;
+            for (size_t i = 0; i < poly.size(); i++) {
+                V2 p = poly[i], q = poly[(i + 1) % poly.size()];
+                bool pin = side ? p.x <= lim : p.x >= lim, qin = side ? q.x <= lim : q.x >= lim;
+                if (pin) out.push_back(p);
+                if (pin != qin) {
+                    float t = (lim - p.x) / (q.x - p.x);
+                    out.push_back({lim, p.y + (q.y - p.y) * t});
+                }
+            }
+            poly = out;
+            if (poly.size() < 3) break;
+        }
+        if (poly.size() < 3) continue;
+        Col c = orange ? hexc(0xf0631a) : hexc(0xf4f2ea);
+        for (size_t i = 1; i + 1 < poly.size(); i++)
+            SM.tri(xPoint(F, V3(poly[0].x, poly[0].y, z)), xPoint(F, V3(poly[i].x, poly[i].y, z)), xPoint(F, V3(poly[i + 1].x, poly[i + 1].y, z)), c, MAT_PAINTED);
+        (void)nOut;
+    }
+}
+
+static void excavator(const M4& F0, float x, float z, float yawL) {
+    M4 F = F0 * mTranslate(V3(x, SH, z)) * mRotY(yawL);
+    Col yel = hexc(0xf2b818), dark = hexc(0x1e1e1e), steel = hexc(0x5a5d60);
+    for (int sg = -1; sg <= 1; sg += 2) {   // tracks
+        SM.box(F * mTranslate(V3(sg * 1.05f, 0.3f, 0)), V3(0.42f, 0.3f, 1.8f), dark, MAT_RUBBER);
+        SM.box(F * mTranslate(V3(sg * 1.05f, 0.62f, 0)), V3(0.3f, 0.05f, 1.7f), steel, MAT_METAL);
+    }
+    SM.box(F * mTranslate(V3(0, 0.75f, 0)), V3(1.15f, 0.22f, 1.3f), steel, MAT_METAL);
+    M4 U = F * mTranslate(V3(0, 0.97f, 0)) * mRotY(0.5f);   // the house swings round on the undercarriage
+    SM.box(U * mTranslate(V3(0, 0.42f, -0.3f)), V3(1.15f, 0.42f, 1.5f), yel, MAT_PAINTED);
+    SM.box(U * mTranslate(V3(0, 0.55f, -1.75f)), V3(1.0f, 0.5f, 0.35f), hexc(0x3a3a3c), MAT_PAINTED);   // counterweight
+    SM.box(U * mTranslate(V3(-0.55f, 1.4f, 0.55f)), V3(0.6f, 0.62f, 0.75f), yel, MAT_PAINTED);          // cab
+    SM.quadN(xPoint(U, V3(-1.05f, 1.0f, 1.301f)), xPoint(U, V3(-0.05f, 1.0f, 1.301f)), xPoint(U, V3(-0.05f, 1.95f, 1.301f)), xPoint(U, V3(-1.05f, 1.95f, 1.301f)),
+             xDir(U, V3(0, 0, 1)), hexc(0x22323c), MAT_CARGLASS);
+    V3 p0 = xPoint(U, V3(0.4f, 0.9f, 1.2f)), p1 = xPoint(U, V3(0.4f, 2.6f, 2.8f)), p2 = xPoint(U, V3(0.4f, 1.2f, 5.2f));   // boom, stick
+    SM.limb(p0, p1, 0.4f, 0.32f, xDir(U, V3(1, 0, 0)), yel, MAT_PAINTED);
+    SM.limb(p1, p2, 0.3f, 0.26f, xDir(U, V3(1, 0, 0)), yel, MAT_PAINTED);
+    SM.limb(p2, p2 + xDir(U, V3(0, -0.7f, 0.5f)), 0.75f, 0.6f, xDir(U, V3(1, 0, 0)), steel, MAT_METAL);   // bucket
+    SM.limb(xPoint(U, V3(0.7f, 1.0f, 1.6f)), p1 - xDir(U, V3(0, 0.4f, 0)), 0.1f, 0.1f, xDir(U, V3(0, 1, 0)), hexc(0x9aa0a6), MAT_METAL);   // hydraulic ram
+}
+
+static void dumpTruck(const M4& F0, float x, float z, float yawL) {
+    M4 F = F0 * mTranslate(V3(x, SH, z)) * mRotY(yawL);
+    Col org = hexc(0xe0731a), dark = hexc(0x202020), steel = hexc(0x606468);
+    SM.box(F * mTranslate(V3(0, 0.85f, -0.4f)), V3(1.15f, 0.22f, 4.4f), dark, MAT_METAL);
+    SM.box(F * mTranslate(V3(0, 1.75f, 3.7f)), V3(1.2f, 1.0f, 1.0f), org, MAT_PAINTED);   // cab
+    SM.quadN(xPoint(F, V3(-1.0f, 1.6f, 4.71f)), xPoint(F, V3(1.0f, 1.6f, 4.71f)), xPoint(F, V3(1.0f, 2.45f, 4.71f)), xPoint(F, V3(-1.0f, 2.45f, 4.71f)), xDir(F, V3(0, 0, 1)), hexc(0x22323c), MAT_CARGLASS);
+    SM.box(F * mTranslate(V3(0, 1.75f, 1.9f)), V3(1.2f, 0.3f, 0.6f), org, MAT_PAINTED);
+    M4 B = F * mTranslate(V3(0, 1.3f, -1.4f)) * mRotX(-0.22f);   // the bed, tipped a little
+    SM.box(B * mTranslate(V3(0, 0.75f, 0)), V3(1.3f, 0.7f, 2.9f), shade(org, 0.85f), MAT_PAINTED);
+    SM.box(B * mTranslate(V3(0, 1.44f, 0)), V3(1.36f, 0.06f, 2.95f), steel, MAT_METAL);
+    for (int i = 0; i < 6; i++) {
+        float zz = i < 2 ? 3.6f : (i < 4 ? -0.3f : -1.6f), xx = (i & 1) ? 1.2f : -1.2f;
+        SM.cylinder(F * mTranslate(V3(xx, 0.5f, zz)) * mRotZ(PI * 0.5f), 0.5f, 0.35f, 14, dark, MAT_RUBBER, true);
+    }
+}
+
+static void floodlightTower(const M4& F0, float x, float z, float yawL, bool lit) {
+    M4 F = F0 * mTranslate(V3(x, SH, z)) * mRotY(yawL);
+    SM.box(F * mTranslate(V3(0, 0.25f, 0)), V3(0.7f, 0.25f, 0.5f), hexc(0x3a3d3f), MAT_METAL);
+    SM.cylinder(F * mTranslate(V3(0, 0.5f, 0)), 0.08f, 7.5f, 8, hexc(0x5c6064), MAT_METAL, true, 0.05f);
+    M4 H = F * mTranslate(V3(0, 8.1f, 0.3f));
+    SM.box(H, V3(1.0f, 0.65f, 0.12f), hexc(0x2a2d30), MAT_METAL);
+    for (int i = 0; i < 6; i++)
+        SM.box(H * mTranslate(V3(-0.68f + (i % 3) * 0.68f, -0.32f + (i / 3) * 0.64f, 0.14f)), V3(0.27f, 0.25f, 0.03f), hexc(0xfff2d0), MAT_EMISSIVE);
+    if (lit) {
+        PointLight l;
+        l.pos = xPoint(H, V3(0, 0, 0.6f));
+        V3 dir = norm(xDir(F, V3(0, -0.55f, 1.f)));
+        l.dir = dir; l.cosOuter = 0.1f; l.cosInner = 0.6f;
+        l.col = V3(1.f, 0.93f, 0.8f) * 420.f; l.radius = 60.f; l.group = LG_LAMP;
+        staticLights.push_back(l);
+    }
+}
+
+// c = centre of the closure line on the road, dir = unit vector pointing out of the skateable world,
+// halfW = half the distance between the two building fronts, roadHalf = half the road width, roadOff = how far
+// the middle of the road sits from c across the street
+static void roadBlock(V3 c, V3 dir, float halfW, float roadHalf, float roadOff, uint32_t seed) {
+    V3 up(0, 1, 0), across = cross(up, dir);
+    const float rl = roadOff - roadHalf, rr = roadOff + roadHalf;   // the roadway across the closure
+    M4 F = mBasis(across, up, dir, c);
+    float rot = yawOf(dir), rotAcross = rot + PI * 0.5f;
+    Rng r(seed);
+    auto P = [&](float x, float z) { return xPoint(F, V3(x, SH, z)); };
+    {   // the wall itself: solid from the ground to 7 m, running into the buildings on both sides
+        V3 m = xPoint(F, V3(0, 0, 0.1f));
+        world.addBox(m.x, m.z, rot, halfW + 2.0f, 0.65f, -0.3f, 7.f, SURF_METAL, true);
+    }
+    // ---- chain-link fence with posts and rails
+    float fh = 3.4f;
+    {
+        V3 a = P(-halfW, 0.f), b = P(halfW, 0.f);
+        SM.quadN(a, b, b + V3(0, fh, 0), a + V3(0, fh, 0), dir * -1.f, hexc(0x9ea4a8), MAT_FENCE);
+        int posts = (int)std::ceil(2 * halfW / 3.f);
+        for (int i = 0; i <= posts; i++) {
+            float x = -halfW + 2 * halfW * i / posts;
+            V3 p = P(x, 0.f);
+            SM.cylinder(frame(p.x, SH, p.z, 0), 0.05f, fh + 0.35f, 6, hexc(0x8a9094), MAT_METAL);
+            if (i < posts) {   // concrete feet
+                V3 q = P(x + halfW / posts, 0.f);
+                SM.boxRot(q.x, q.z, rotAcross, 0.4f, 0.22f, SH, SH + 0.14f, hexc(0x8a8680), MAT_CONCRETE);
+            }
+        }
+        SM.limb(a + V3(0, fh, 0), b + V3(0, fh, 0), 0.06f, 0.06f, V3(0, 1, 0), hexc(0x8a9094), MAT_METAL);
+        SM.limb(a + V3(0, 0.3f, 0), b + V3(0, 0.3f, 0), 0.05f, 0.05f, V3(0, 1, 0), hexc(0x8a9094), MAT_METAL);
+    }
+    // ---- signs hung on the fence
+    {
+        V3 right = across * -1.f;   // reads left to right for someone walking towards the fence
+        V3 centre = P(0, -0.12f);
+        signBoard(centre + V3(0, 2.05f, 0), right, up, dir * -1.f, std::min(10.5f, halfW * 0.7f), 1.5f, "ROAD BLOCKED", hexc(0xf2c318), hexc(0x141414), false);
+        signBoard(P(-halfW * 0.56f, -0.12f) + V3(0, 1.35f, 0), right, up, dir * -1.f, 5.4f, 0.8f, "CONSTRUCTION", hexc(0xf0631a), hexc(0x141414), false);
+        signBoard(P(halfW * 0.56f, -0.12f) + V3(0, 1.35f, 0), right, up, dir * -1.f, 6.4f, 0.8f, "NO THROUGH TRAFFIC", hexc(0xf4f2ea), hexc(0xc0201b), false);
+        signBoard(P(-halfW * 0.56f, -0.12f) + V3(0, 0.55f, 0), right, up, dir * -1.f, 4.6f, 0.5f, "DETOUR", hexc(0x141414), hexc(0xf2c318), false);
+        signBoard(P(halfW * 0.56f, -0.12f) + V3(0, 0.55f, 0), right, up, dir * -1.f, 5.6f, 0.5f, "TURN BACK", hexc(0x141414), hexc(0xf2c318), false);
+    }
+    // ---- jersey barriers along the foot of the fence
+    {
+        int n = (int)std::ceil(2 * halfW / 3.6f);
+        for (int i = 0; i < n; i++) {
+            float x = -halfW + (i + 0.5f) * 2 * halfW / n;
+            V3 p = P(x, -1.35f + ((i & 1) ? 0.12f : 0.f));
+            jersey(p.x, p.z, rotAcross, 2 * halfW / n + 0.06f);
+        }
+    }
+    // ---- steel pedestrian barricades on the sidewalks
+    for (int side = -1; side <= 1; side += 2) {
+        float x0 = side < 0 ? rl - 0.3f : rr + 0.3f, x1 = side < 0 ? -(halfW - 0.2f) : (halfW - 0.2f);
+        if (std::fabs(x1 - x0) < 0.8f) continue;
+        int n = std::max(1, (int)std::ceil(std::fabs(x1 - x0) / 2.4f));
+        for (int i = 0; i < n; i++) {
+            float xa = x0 + (x1 - x0) * i / n, xb = x0 + (x1 - x0) * (i + 1) / n;
+            V3 a = P(xa, -3.1f), b = P(xb, -3.1f);
+            flatBar(a, b, 1.0f, SH, hexc(0xc8ccd0));
+            SM.limb(V3(a.x, SH + 0.55f, a.z), V3(b.x, SH + 0.55f, b.z), 0.04f, 0.04f, V3(0, 1, 0), hexc(0xc8ccd0), MAT_METAL);
+        }
+    }
+    // ---- Type III barricades across the roadway, with flashing beacons
+    {
+        int n = (int)std::ceil((rr - rl) / 2.4f);
+        float uw = (rr - rl) / n;
+        for (int i = 0; i < n; i++) {
+            float x = rl + (i + 0.5f) * uw;
+            V3 p = P(x, -4.6f);
+            M4 B = mBasis(across, up, dir, V3(p.x, SH, p.z));
+            float hw = uw * 0.5f - 0.04f;
+            for (int k = 0; k < 2; k++) {
+                float yb = 0.72f + 0.5f * k, yt = yb + 0.3f;
+                SM.box(B * mTranslate(V3(0, (yb + yt) * 0.5f, 0)), V3(hw, 0.15f, 0.03f), hexc(0xf4f2ea), MAT_PAINTED, 63 & ~16 & ~32);
+                stripedBoard(B, -hw, hw, yb, yt, -0.032f, dir * -1.f);
+                stripedBoard(B, -hw, hw, yb, yt, 0.032f, dir);
+            }
+            for (int sg = -1; sg <= 1; sg += 2) {   // A-frame legs
+                SM.limb(xPoint(B, V3(sg * (hw - 0.2f), 0.f, -0.45f)), xPoint(B, V3(sg * (hw - 0.2f), 1.5f, 0.f)), 0.06f, 0.06f, across, hexc(0xe8e8e0), MAT_PAINTED);
+                SM.limb(xPoint(B, V3(sg * (hw - 0.2f), 0.f, 0.45f)), xPoint(B, V3(sg * (hw - 0.2f), 1.5f, 0.f)), 0.06f, 0.06f, across, hexc(0xe8e8e0), MAT_PAINTED);
+            }
+            world.addBox(p.x, p.z, rot, hw + 0.04f, 0.12f, SH, SH + 1.55f, SURF_METAL);
+            if (i % 2 == 0) {   // amber beacon on top
+                V3 bp = V3(p.x, SH + 1.72f, p.z);
+                SM.box(mTranslate(bp), V3(0.12f, 0.16f, 0.12f), hexc(0x5a3c08), MAT_PAINTED);
+                beacons.push_back({bp + V3(0, 0.02f, 0), i});
+            }
+        }
+        V3 cp = P(roadOff, -4.65f);
+        signBoard(V3(cp.x, SH + 2.7f, cp.z), across * -1.f, up, dir * -1.f, 3.4f, 0.7f, "ROAD CLOSED", hexc(0xf4f2ea), hexc(0xc0201b), false);
+        SM.limb(V3(cp.x, SH, cp.z), V3(cp.x, SH + 2.35f, cp.z), 0.08f, 0.08f, across, hexc(0x5c6064), MAT_METAL);
+        world.addBox(cp.x, cp.z, rot, 0.1f, 0.1f, SH, SH + 2.4f, SURF_METAL);
+    }
+    // ---- water-filled barriers and cones in front, forming a chicane
+    for (int i = 0; i < 5; i++) {
+        float x = roadOff + (i & 1 ? 1.f : -1.f) * (roadHalf * 0.35f) + r.range(-0.8f, 0.8f);
+        V3 p = P(x, -9.f - i * 2.6f);
+        waterBarrier(p.x, p.z, rotAcross + r.range(-0.12f, 0.12f), 2.0f);
+    }
+    for (int i = 0; i < 16; i++) {
+        float t = (float)i / 15.f;
+        V3 p = P(roadOff + roadHalf * (0.85f - 0.3f * t) * (i & 1 ? 1.f : -1.f) * (1.f - t * 0.2f) + r.range(-0.15f, 0.15f), -16.f - i * 1.7f);
+        cone(p.x, p.z);
+    }
+    // ---- warning signs along the approach
+    {
+        static const char* txt[3] = {"ROAD CLOSED AHEAD", "ROAD WORK AHEAD", "DETOUR >>>"};
+        static const uint32_t bg[3] = {0xf4f2ea, 0xf28a14, 0xf28a14};
+        for (int i = 0; i < 3; i++) {
+            V3 p = P(roadOff + (i & 1 ? 1.f : -1.f) * (roadHalf + 1.5f), -24.f - i * 20.f);
+            SM.cylinder(frame(p.x, SH, p.z, 0), 0.05f, 2.4f, 6, hexc(0x5c6064), MAT_METAL);
+            world.addBox(p.x, p.z, rot, 0.06f, 0.06f, SH, SH + 2.4f, SURF_METAL);
+            signBoard(V3(p.x, SH + 2.55f, p.z) + dir * -0.09f, across * -1.f, up, dir * -1.f, 3.4f, 0.95f, txt[i], hexc(bg[i]), hexc(i == 0 ? 0xc0201b : 0x141414), false);
+        }
+    }
+    // ---- hazard paint and lettering on the road
+    {
+        for (int i = 0; i < 30; i++) {   // diagonal hazard stripes across the roadway ahead of the barricade
+            float w = (rr - rl) / 30, x = rl + i * w;
+            if ((i & 1) == 0 || x + w + 0.9f > rr) continue;
+            V3 a = P(x, -6.6f), b = P(x + w, -6.6f), c2 = P(x + w + 0.9f, -5.7f), d = P(x + 0.9f, -5.7f);
+            SM.quadN(V3(a.x, 0.022f, a.z), V3(b.x, 0.022f, b.z), V3(c2.x, 0.022f, c2.z), V3(d.x, 0.022f, d.z), V3(0, 1, 0), hexc(0xe8c020), MAT_ROADPAINT);
+        }
+        std::string t1 = "ROAD CLOSED";
+        float px = std::min(0.22f, roadHalf * 1.7f / (t1.size() * 6.f));
+        float tw = textWidth3D(t1, px);
+        V3 o = P(roadOff + tw * 0.5f, -14.f);
+        SM.text3D(t1, V3(o.x, 0.024f, o.z), across * -1.f, dir, px, hexc(0xe8e4da), MAT_ROADPAINT);
+    }
+    // ---- the work site behind the fence: torn-up road, plates, pipes, machines, light towers
+    {
+        auto patch = [&](float x0, float x1, float z0, float z1, Col col, float y) {
+            V3 a = P(x0, z0), b = P(x1, z0), cc = P(x1, z1), d = P(x0, z1);
+            SM.quadN(V3(a.x, y, a.z), V3(b.x, y, b.z), V3(cc.x, y, cc.z), V3(d.x, y, d.z), V3(0, 1, 0), col, MAT_CONCRETE);
+        };
+        patch(rl, rr, 0.7f, 13.f, hexc(0x4e4034), 0.03f);          // dug-up ground
+        patch(rl + 1.f, rr - 1.f, 4.f, 7.5f, hexc(0x2a231c), 0.035f); // the trench
+        for (int i = 0; i < 4; i++) {   // steel road plates next to the trench
+            float x = rl + 2.f + i * 2.6f;
+            V3 a = P(x, 7.8f), b = P(x + 2.4f, 7.8f), cc = P(x + 2.4f, 10.f), d = P(x, 10.f);
+            SM.quadN(V3(a.x, 0.045f, a.z), V3(b.x, 0.045f, b.z), V3(cc.x, 0.045f, cc.z), V3(d.x, 0.045f, d.z), V3(0, 1, 0), hexc(0x6c7074), MAT_METAL);
+        }
+        for (int i = 0; i < 3; i++) for (int k = 0; k <= i; k++) {   // stacked concrete pipes
+            V3 p = P(roadOff + roadHalf * 0.55f + (k - i * 0.5f) * 1.25f, 3.0f);
+            SM.cylinder(frame(p.x + across.x * 1.2f, SH + 0.6f + i * 1.0f, p.z + across.z * 1.2f, rot) * mRotZ(PI * 0.5f), 0.6f, 2.4f, 14, hexc(0xa8a49c), MAT_CONCRETE, true);
+        }
+        for (int i = 0; i < 4; i++) {   // dirt mounds
+            V3 p = P(rl + 3.f + i * 4.6f, 11.f + r.range(0.f, 2.f));
+            SM.sphere(mTranslate(V3(p.x, SH, p.z)), V3(2.2f, 1.0f + r.f() * 0.5f, 2.0f), 10, 5, hexc(0x5a4632), MAT_CONCRETE);
+        }
+        excavator(F, roadOff - roadHalf * 0.4f, 6.5f, PI * 0.2f);
+        dumpTruck(F, roadOff + roadHalf * 0.45f, 11.5f, -PI * 0.15f);
+        floodlightTower(F, roadOff - roadHalf * 0.7f, 2.2f, PI, true);
+        floodlightTower(F, roadOff + roadHalf * 0.75f, 2.2f, PI, true);
+        for (int i = 0; i < 6; i++) {   // barrels
+            V3 p = P(rl + 1.5f + i * 0.7f, 2.0f);
+            SM.cylinder(frame(p.x, SH, p.z, 0), 0.27f, 0.85f, 10, hexc(i & 1 ? 0xf0631a : 0xf4f2ea), MAT_PAINTED);
+        }
+    }
+    // fence-top work lamps so the closure reads clearly at night
+    for (int i = 0; i < 5; i++) {
+        V3 p = P(-halfW + (i + 0.5f) * 2 * halfW / 5, -0.2f) + V3(0, fh + 0.3f, 0);
+        beacons.push_back({p, i + 1});
+        SM.box(mTranslate(p - V3(0, 0.02f, 0)), V3(0.1f, 0.13f, 0.1f), hexc(0x5a3c08), MAT_PAINTED);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The long streets: shops, lots and street furniture out to EXT, and a road closure at every end.
+// ----------------------------------------------------------------------------
+static float rotForX(V3 t) { return std::atan2(-t.z, t.x); }   // rot whose local x axis is t
+
+// Trick spots scattered along a sidewalk: 'origin' is a point on the facade line, t runs along the street,
+// n points from the facade into the street. Keeps a clear walkway and avoids everything already built.
+static void scatterSpots(V3 origin, V3 t, V3 n, float s0, float s1, uint32_t seed, const std::vector<std::pair<float, float>>& skip) {
+    Rng r(seed);
+    float s = s0 + r.range(0.f, 8.f);
+    float rx = rotForX(t), rzn = yawOf(n * -1.f);
+    while (s < s1) {
+        float step = r.range(9.f, 16.f);
+        bool blocked = false;
+        for (auto& k : skip) if (s > k.first - 4.f && s < k.second + 4.f) blocked = true;
+        int kind = r.irange(0, 6);
+        if (!blocked) {
+            V3 base = origin + t * s;
+            float off = 0, half = 1.6f;
+            switch (kind) { case 0: off = 1.0f; half = 1.3f; break; case 1: off = 1.3f; half = 1.9f; break; case 2: off = 1.0f; half = 1.6f; break;
+                            case 3: off = 1.0f; half = 3.0f; break; case 4: off = 1.5f; half = 3.2f; break; case 5: off = 1.9f; half = 3.0f; break; default: off = 1.3f; half = 2.2f; break; }
+            V3 p = base + n * off;
+            if (areaFree(p.x - half, p.z - half, p.x + half, p.z + half)) {
+                switch (kind) {
+                    case 0: bench(p.x, p.z, rzn, 1.8f); break;
+                    case 1: planter(p.x, p.z, rx, 1.4f, 0.8f, 0.5f, true); break;
+                    case 2: bikeRack(p.x, p.z, rzn, 4); break;
+                    case 3: { V3 a = p - t * 1.7f, b = p + t * 1.7f; ledge(a.x, a.z, rx, 1.2f, 0.4f, SH, 0.42f); ledge(b.x, b.z, rx, 1.2f, 0.4f, SH, 0.55f); break; }
+                    case 4: flatBar(p - t * 2.5f, p + t * 2.5f, 0.5f); break;
+                    case 5: { V3 a = p - t * 1.4f, b = p + t * 1.4f; ledge(a.x, a.z, rx, 1.3f, 0.9f, SH, 0.14f, hexc(0xb0aba2), MAT_CONCRETE); ledge(b.x, b.z, rx, 1.3f, 0.9f, SH, 0.24f, hexc(0xb0aba2), MAT_CONCRETE); break; }
+                    default: pipeRail(p - t * 1.8f, p + t * 1.8f, 0.45f); break;
+                }
+            }
+        }
+        s += step;
+    }
+}
+
+// Waterfront skate spots on the promenade deck, centred on x = xc
+static void promenadeSpot(float xc, int variant, uint32_t seed) {
+    Rng r(seed);
+    float zc = -81.f;   // middle of the deck
+    switch (variant & 3) {
+        case 0: {   // step-up ledges and a rail
+            for (int i = 0; i < 4; i++) ledge(xc - 13.f + i * 8.5f, zc + 2.f, 0, 3.0f, 0.4f, SH, 0.3f + 0.17f * i);
+            flatBar(V3(xc - 10.f, 0, zc - 3.f), V3(xc + 10.f, 0, zc - 3.f), 0.5f);
+            kicker(xc - 17.f, zc + 2.f, PI * 0.5f, 1.4f, 1.6f, 0.5f);
+            break;
+        }
+        case 1: {   // amphitheatre steps up to a platform, hubbas either side
+            float top = stairSet(xc, zc + 2.f, PI * 0.5f, 3.2f, 6, 0.17f, 0.5f, true, true);
+            (void)top;
+            Col gtop = hexc(0xa8a49c);
+            solidBox(xc + 4.5f, zc + 2.f, 0, 3.f, 3.2f, SH, SH + 1.02f, hexc(0x9a968f), MAT_GRANITE, SURF_CONCRETE, false, &gtop);
+            edgeRails(xc + 4.5f, zc + 2.f, 0, 3.f, 3.2f, SH + 1.02f, RK_LEDGE, false);
+            planter(xc + 6.f, zc + 3.6f, 0, 1.3f, 1.3f, 0.5f, true);
+            break;
+        }
+        case 2: {   // kicker line over a planter
+            kicker(xc - 12.f, zc, PI * 0.5f, 1.4f, 1.7f, 0.6f);
+            planter(xc - 5.f, zc, 0, 1.6f, 1.6f, 0.55f, false);
+            kicker(xc + 3.f, zc, PI * 0.5f, 1.4f, 1.7f, 0.6f);
+            ledge(xc + 11.f, zc - 2.f, 0, 3.0f, 0.4f, SH, 0.5f);
+            flatBar(V3(xc + 5.f, 0, zc + 3.5f), V3(xc + 14.f, 0, zc + 3.5f), 0.7f);
+            break;
+        }
+        default: {  // pyramid, pads and a gap
+            pyramid(xc, zc, 0, 2.6f, 2.6f, 0.65f);
+            for (int sg = -1; sg <= 1; sg += 2) ledge(xc + sg * 9.f, zc, 0, 2.8f, 0.6f, SH, 0.16f, hexc(0xb0aba2), MAT_CONCRETE);
+            gapJump(xc, zc + 4.2f, PI * 0.5f, 1.0f, 2.8f, 2.5f, 0.5f);
+            pipeRail(V3(xc + 6.f, 0, zc - 3.5f), V3(xc + 14.f, 0, zc - 3.5f), 0.5f);
+            break;
+        }
+    }
+    (void)r;
+}
+
+static void buildExtension() {
+    const float E = EXT;
+    V3 X(1, 0, 0), Z(0, 0, 1);
+    // ---------------- cross street, west: shops and lots out to the road closure
+    std::vector<LotSpec> nwLots = {{-386, -352, 0}, {-318, -282, 1}, {-252, -224, 5}};
+    lotRow(V3(-E, 0, -12), Z, 194, 29, 29, 3010, 12, 26, nwLots);              // north side, faces +z, up to the bridge anchorage
+    lotRow(V3(-206, 0, -57), Z * -1.f, 194, 16, 16, 3110, 12, 24, nwLots);     // Water Street side, faces -z
+    for (size_t i = 0; i < nwLots.size(); i++) {
+        float cx = (nwLots[i].a + nwLots[i].b) * 0.5f;
+        buildLot(V3(cx, 0, -12), V3(0, 0, -1), nwLots[i].b - nwLots[i].a, 45.f, nwLots[i].theme, 4000 + (uint32_t)i, false);
+    }
+    building(-174, -41, -170, -12, 14, 0, hexc(0x7a4a3a), 3201, false);       // slivers beside the anchorage
+    building(-174, -57, -170, -41, 14, 0, hexc(0x6a3a2e), 3202, false);
+    std::vector<LotSpec> swLots = {{-372, -338, 2}, {-302, -264, 4}};
+    lotRow(V3(-200, 0, 12), Z * -1.f, 200, 16, 30, 3310, 12, 22, swLots);      // south side, faces -z
+    for (size_t i = 0; i < swLots.size(); i++) {
+        float cx = (swLots[i].a + swLots[i].b) * 0.5f;
+        buildLot(V3(cx, 0, 12), V3(0, 0, 1), swLots[i].b - swLots[i].a, 30.f, swLots[i].theme, 4100 + (uint32_t)i, true);
+    }
+    // ---------------- cross street, east
+    std::vector<LotSpec> neLots = {{224, 254, 3}, {282, 318, 4}, {352, 388, 6}};
+    lotRow(V3(200, 0, -12), Z, 200, 29, 29, 3410, 12, 26, neLots);
+    lotRow(V3(E, 0, -57), Z * -1.f, 200, 16, 16, 3510, 12, 24, neLots);
+    for (size_t i = 0; i < neLots.size(); i++) {
+        float cx = (neLots[i].a + neLots[i].b) * 0.5f;
+        buildLot(V3(cx, 0, -12), V3(0, 0, -1), neLots[i].b - neLots[i].a, 45.f, neLots[i].theme, 4200 + (uint32_t)i, false);
+    }
+    std::vector<LotSpec> seLots = {{262, 300, 3}, {338, 374, 5}};
+    lotRow(V3(E, 0, 12), Z * -1.f, 200, 16, 30, 3610, 12, 22, seLots);
+    for (size_t i = 0; i < seLots.size(); i++) {
+        float cx = (seLots[i].a + seLots[i].b) * 0.5f;
+        buildLot(V3(cx, 0, 12), V3(0, 0, 1), seLots[i].b - seLots[i].a, 30.f, seLots[i].theme, 4300 + (uint32_t)i, true);
+    }
+    // ---------------- the avenue
+    std::vector<LotSpec> awLots = {{252, 286, 6}, {332, 366, 0}};
+    lotRow(V3(-14, 0, E), X, 200, 16, 30, 3710, 12, 26, awLots);              // west frontage, z from 400 down to 200
+    for (size_t i = 0; i < awLots.size(); i++) {
+        float cz = (awLots[i].a + awLots[i].b) * 0.5f;
+        buildLot(V3(-14, 0, cz), V3(-1, 0, 0), awLots[i].b - awLots[i].a, 30.f, awLots[i].theme, 4400 + (uint32_t)i, true);
+    }
+    std::vector<LotSpec> aeLots = {{228, 260, 1}, {300, 338, 2}};
+    lotRow(V3(16, 0, 200), X * -1.f, 200, 14, 30, 3810, 12, 24, aeLots);      // east frontage
+    for (size_t i = 0; i < aeLots.size(); i++) {
+        float cz = (aeLots[i].a + aeLots[i].b) * 0.5f;
+        buildLot(V3(16, 0, cz), V3(1, 0, 0), aeLots[i].b - aeLots[i].a, 30.f, aeLots[i].theme, 4500 + (uint32_t)i, true);
+    }
+    // ---------------- the Banks: the notch in front of the bridge anchorage, with the viaduct's columns
+    {
+        Col brick = hexc(0xa0503a);
+        kicker(-190, -20.5f, PI, 15.f, 3.5f, 2.2f, SH, brick, MAT_BRICKBANK, SURF_BRICK);
+        for (int sg = -1; sg <= 1; sg += 2) {
+            world.addBox(-190 + sg * 7.f, -18, 0, 1.1f, 1.1f, 0, 40.f, SURF_CONCRETE, true);
+            kicker(-190 + sg * 12.5f, -14.5f, sg * PI * 0.5f, 2.6f, 2.4f, 0.9f, SH, brick, MAT_BRICKBANK, SURF_BRICK);
+        }
+        ledge(-190, -14.2f, PI * 0.5f, 5.f, 0.4f, SH, 0.45f);
+        flatBar(V3(-200, 0, -16.2f), V3(-180, 0, -16.2f), 0.5f);
+        mural(V3(-205.99f, 0, -12.f), V3(0, 0, -1), V3(0, 1, 0), V3(1, 0, 0), 12.f, 5.f, 4710);
+        mural(V3(-173.97f, 0, -24.f), V3(0, 0, 1), V3(0, 1, 0), V3(-1, 0, 0), 12.f, 5.f, 4711);
+        streetLamp(-189.5f, -13.2f, SH, PI, true);
+        world.addGap("THE BANKS", 500, -190, -20.5f, PI, 12.f, 3.f, SH + 2.4f);
+        mapMarks.push_back({-190.f, -19.f, 0});
+    }
+    // ---------------- road closures
+    roadBlock(V3(-(E - 2), 0, 0), V3(-1, 0, 0), 12.05f, 7.f, 0.f, 51001);
+    roadBlock(V3(E - 2, 0, 0), V3(1, 0, 0), 12.05f, 7.f, 0.f, 51002);
+    roadBlock(V3(-(E - 2), 0, -72.5f), V3(-1, 0, 0), 15.5f, 6.f, 4.5f, 51003);
+    roadBlock(V3(E - 2, 0, -72.5f), V3(1, 0, 0), 15.5f, 6.f, -4.5f, 51004);
+    roadBlock(V3(1, 0, E - 2), V3(0, 0, 1), 15.05f, 9.f, -1.f, 51005);
+}
+
+// Street furniture, parked cars and background out to the horizon
 static void buildOutskirts() {
     Rng r(8080);
     Col cab = hexc(0xf2c318);
     static const uint32_t carCols[] = {0x1b1b1d, 0x7a1f22, 0x9ca3a8, 0x274a78, 0x2e4a2e, 0xd8d4c8, 0x5a3a2a};
-    auto carsAlong = [&](V3 a, V3 b, float yaw) {   // a row of parked cars with random gaps
+    auto carsAlong = [&](V3 a, V3 b, float yaw, float density) {   // a row of parked cars with random gaps
         V3 d = b - a;
         float L = len(d);
         for (float t = 0; t < L; t += 6.8f) {
             int type = r.chance(0.35f) ? 0 : r.irange(1, 3);
             Col c = type == 0 ? cab : hexc(carCols[r.irange(0, 6)]);
-            if (r.chance(0.3f)) continue;
+            if (r.chance(1.f - density)) continue;
             V3 p = a + d * (t / L);
+            if (!areaFree(p.x - 1.2f, p.z - 2.8f, p.x + 1.2f, p.z + 2.8f) && !areaFree(p.x - 2.8f, p.z - 1.2f, p.x + 2.8f, p.z + 1.2f)) continue;
             parkedCar(p.x, p.z, yaw, type, c);
         }
     };
-    // avenue north of the block
-    for (float z = 73; z < 196; z += 24) streetLamp(-9.7f, z, SH, PI / 2);
-    for (float z = 70; z < 196; z += 24) streetLamp(9.7f, z, SH, -PI / 2);
-    for (float z = 84; z < 196; z += 26) tree(-10.3f, z, SH);
-    for (float z = 97; z < 196; z += 26) tree(10.3f, z, SH);
-    carsAlong(V3(-7.7f, 0, 76), V3(-7.7f, 0, 196), 0);
-    carsAlong(V3(7.7f, 0, 62), V3(7.7f, 0, 196), 0);
-    hydrant(-9.9f, 130, SH, false); hydrant(9.9f, 108, SH, false);
-    // cross street west and east
+    const float N = EXT - 16.f, NC = EXT - 95.f;   // parked cars stop short of the U-turn zone
+    // ---- avenue
+    for (float z = 73; z < N; z += 24) streetLamp(-9.7f, z, SH, PI / 2);
+    for (float z = 70; z < N; z += 24) streetLamp(9.7f, z, SH, -PI / 2);
+    for (float z = 84; z < N; z += 26) tree(-10.3f, z, SH);
+    for (float z = 97; z < N; z += 26) tree(10.3f, z, SH);
+    carsAlong(V3(-7.7f, 0, 76), V3(-7.7f, 0, NC), 0, 0.6f);
+    carsAlong(V3(7.7f, 0, 62), V3(7.7f, 0, NC), 0, 0.6f);
+    for (float z = 108; z < N; z += 62) { hydrant(-9.9f, z, SH, false); hydrant(9.9f, z + 31, SH, false); }
+    // ---- cross street and Water Street, both directions
     for (int side = -1; side <= 1; side += 2) {
         float sx = (float)side;
-        for (float x = 80; x < 198; x += 24) streetLamp(sx * x, -7.6f, SH, 0);
-        for (float x = 92; x < 198; x += 24) streetLamp(sx * x, 7.6f, SH, PI);
-        for (float x = 74; x < 198; x += 26) { tree(sx * x, -8.1f, SH); tree(sx * (x + 13), 8.1f, SH); }
-        carsAlong(V3(sx * 72, 0, -5.7f), V3(sx * 196, 0, -5.7f), PI / 2);
-        carsAlong(V3(sx * 72, 0, 5.7f), V3(sx * 196, 0, 5.7f), PI / 2);
-        hydrant(sx * 115, -7.6f, SH, false);
-        // Water Street
-        for (float x = 76; x < 170; x += 24) streetLamp(sx * x, -59.3f, SH, PI);
-        carsAlong(V3(sx * 64, 0, -63.8f), V3(sx * 168, 0, -63.8f), PI / 2);
-        pigeonSpots.push_back(V3(sx * 120, SH, -9.5f));
+        for (float x = 80; x < N; x += 24) streetLamp(sx * x, -7.6f, SH, 0);
+        for (float x = 92; x < N; x += 24) streetLamp(sx * x, 7.6f, SH, PI);
+        for (float x = 74; x < N; x += 26) { tree(sx * x, -8.1f, SH); tree(sx * (x + 13), 8.1f, SH); }
+        carsAlong(V3(sx * 72, 0, -5.7f), V3(sx * NC, 0, -5.7f), PI / 2, 0.6f);
+        carsAlong(V3(sx * 72, 0, 5.7f), V3(sx * NC, 0, 5.7f), PI / 2, 0.6f);
+        for (float x = 115; x < N; x += 62) hydrant(sx * x, -7.6f, SH, false);
+        for (float x = 76; x < N; x += 24) streetLamp(sx * x, -59.3f, SH, PI);
+        for (float x = 88; x < N; x += 26) tree(sx * x, -59.6f, SH);
+        carsAlong(V3(sx * 64, 0, -63.8f), V3(sx * NC, 0, -63.8f), PI / 2, 0.55f);
+        for (float x = 120; x < N; x += 90) pigeonSpots.push_back(V3(sx * x, SH, -9.5f));
     }
-    // ...and on to the horizon: background blocks, lamps, trees and cars down every street
-    V3 X(1, 0, 0), Z(0, 0, 1);
-    farRow(V3(-210, 0, 12), Z * -1.f, 1190, 22, 201);      // cross street west, north side
-    farRow(V3(-1400, 0, -12), Z, 1190, 22, 202);           // cross street west, south side
-    farRow(V3(1400, 0, 12), Z * -1.f, 1200, 22, 203);      // cross street east, north side
-    farRow(V3(200, 0, -12), Z, 1200, 22, 204);             // cross street east, south side
-    farRow(V3(-14, 0, 1400), X, 1200, 30, 205);            // avenue north, west side
-    farRow(V3(16, 0, 200), X * -1.f, 1200, 30, 206);       // avenue north, east side
-    farRow(V3(-210, 0, -57), Z * -1.f, 1190, 22, 207);     // Water Street west
-    farRow(V3(1400, 0, -57), Z * -1.f, 1200, 22, 208);     // Water Street east
-    for (float d = 210; d < 1400; d += 32) {
+    // ---- promenade: lamps, trees, benches, skate spots all the way to the closures
+    {
+        float top = SH;
+        for (float x = -N; x <= N; x += 16) if (std::fabs(x) > 192.f) streetLamp(x, -75.2f, top, PI);
+        for (float x = -N + 8; x <= N; x += 16) if (std::fabs(x) > 184.f) tree(x, -75.6f, top, 0.85f);
+        for (int i = -21; i <= 21; i++) {
+            if (std::abs(i) <= 10) continue;
+            float x = i * 18.f;
+            if (std::fabs(x) > N) continue;
+            bench(x, -84.3f, PI, 2.2f);
+        }
+        float xs[] = {-350, -270, -190, -110, 110, 190, 270, 350};
+        for (int i = 0; i < 8; i++) promenadeSpot(xs[i], i, 5200 + (uint32_t)i);
+        for (float x = -N; x <= N; x += 90) pigeonSpots.push_back(V3(x + 14.f, SH, -80.f));
+    }
+    // ---- sidewalk spots everywhere (near the spawn block too)
+    {
+        const V3 X(1, 0, 0), Z(0, 0, 1);
+        const float E = EXT;
+        auto lotSkip = [](const std::vector<LotSpec>& L) { std::vector<std::pair<float, float>> s; for (auto& l : L) s.push_back({l.a, l.b}); return s; };
+        std::vector<std::pair<float, float>> none;
+        // cross street north (facade z = -12), west and east
+        scatterSpots(V3(0, 0, -12), X, Z, -68.f, -16.f, 6001, none);
+        scatterSpots(V3(0, 0, -12), X, Z, -E + 14.f, -206.f, 6002, lotSkip({{-386, -352, 0}, {-318, -282, 1}, {-252, -224, 5}}));
+        scatterSpots(V3(0, 0, -12), X, Z, 200.f, E - 14.f, 6003, lotSkip({{224, 254, 3}, {282, 318, 4}, {352, 388, 6}}));
+        // cross street south (facade z = 12), pointing to -z
+        scatterSpots(V3(0, 0, 12), X, Z * -1.f, -68.f, -16.f, 6004, none);
+        scatterSpots(V3(0, 0, 12), X, Z * -1.f, -E + 14.f, -204.f, 6005, lotSkip({{-372, -338, 2}, {-302, -264, 4}}));
+        scatterSpots(V3(0, 0, 12), X, Z * -1.f, 72.f, E - 14.f, 6006, lotSkip({{262, 300, 3}, {338, 374, 5}}));
+        // Water Street south sidewalk (facade z = -57), pointing to -z
+        scatterSpots(V3(0, 0, -57), X, Z * -1.f, -E + 14.f, -72.f, 6007, lotSkip({{-386, -352, 0}, {-318, -282, 1}, {-252, -224, 5}}));
+        scatterSpots(V3(0, 0, -57), X, Z * -1.f, 72.f, E - 14.f, 6008, lotSkip({{224, 254, 3}, {282, 318, 4}, {352, 388, 6}}));
+        // avenue frontages
+        scatterSpots(V3(-14, 0, 0), Z, X, 74.f, E - 14.f, 6009, lotSkip({{252, 286, 6}, {332, 366, 0}}));
+        scatterSpots(V3(16, 0, 0), Z, X * -1.f, 74.f, E - 14.f, 6010, lotSkip({{228, 260, 1}, {300, 338, 2}}));
+        scatterSpots(V3(-14, 0, 0), Z, X, -52.f, -16.f, 6011, none);
+    }
+    // ---- and on to the horizon beyond the closures: background blocks, lamps, trees and cars
+    V3 Xv(1, 0, 0), Zv(0, 0, 1);
+    const float FAR = 1400.f - EXT;
+    farRow(V3(-EXT, 0, 12), Zv * -1.f, FAR, 22, 201);
+    farRow(V3(-1400, 0, -12), Zv, FAR, 22, 202);
+    farRow(V3(1400, 0, 12), Zv * -1.f, FAR, 22, 203);
+    farRow(V3(EXT, 0, -12), Zv, FAR, 22, 204);
+    farRow(V3(-14, 0, 1400), Xv, FAR, 30, 205);
+    farRow(V3(16, 0, EXT), Xv * -1.f, FAR, 30, 206);
+    farRow(V3(-EXT, 0, -57), Zv * -1.f, FAR, 22, 207);
+    farRow(V3(1400, 0, -57), Zv * -1.f, FAR, 22, 208);
+    for (float d = EXT + 8; d < 1400; d += 32) {
         for (int sd = -1; sd <= 1; sd += 2) {
             streetLamp(sd * d, -7.6f, SH, 0, false);
             streetLamp(sd * (d + 16), 7.6f, SH, PI, false);
@@ -3273,23 +4898,24 @@ static void buildOutskirts() {
             farTree(-10.3f, d + 24, SH); farTree(10.3f, d + 8, SH);
         }
     }
-    for (float d = 204; d < 560; d += 6.8f) {   // parked cars thin out with distance
+    for (float d = EXT + 4; d < 760; d += 6.8f) {   // parked cars thin out with distance
         for (int sd = -1; sd <= 1; sd += 2) {
-            float keep = 0.75f - (d - 200) / 700.f;
+            float keep = 0.7f - (d - EXT) / 500.f;
             if (r.chance(keep)) carGeom(SM, frame(sd * d, 0, sd > 0 ? 5.7f : -5.7f, PI / 2), r.chance(0.35f) ? 0 : r.irange(1, 3), r.chance(0.35f) ? cab : hexc(carCols[r.irange(0, 6)]));
             if (r.chance(keep)) carGeom(SM, frame(sd > 0 ? 7.7f : -7.7f, 0, d, 0), r.chance(0.35f) ? 0 : r.irange(1, 3), r.chance(0.35f) ? cab : hexc(carCols[r.irange(0, 6)]));
         }
     }
-    // pedestrians out on the far sidewalks
-    npcPaths.push_back({{V3(-12.8f, SH, 70), V3(-12.8f, SH, 192)}, false});
-    npcPaths.push_back({{V3(11.2f, SH, 70), V3(11.2f, SH, 192)}, false});
-    npcPaths.push_back({{V3(-70, SH, -10.2f), V3(-190, SH, -10.2f)}, false});
-    npcPaths.push_back({{V3(-70, SH, 10.4f), V3(-190, SH, 10.4f)}, false});
-    npcPaths.push_back({{V3(70, SH, 10.2f), V3(190, SH, 10.2f)}, false});
-    npcPaths.push_back({{V3(60, SH, -10.0f), V3(190, SH, -10.0f)}, false});
-    npcPaths.push_back({{V3(-70, SH, -59.8f), V3(-165, SH, -59.8f)}, false});
-    npcPaths.push_back({{V3(-190, SH, -80.5f), V3(-70, SH, -80.5f)}, false});
-    npcPaths.push_back({{V3(70, SH, -80.5f), V3(190, SH, -80.5f)}, false});
+    // ---- pedestrians out on the long sidewalks
+    for (float x = 72; x < N - 30; x += 96) {
+        for (int sd = -1; sd <= 1; sd += 2) {
+            float sx = (float)sd;
+            npcPaths.push_back({{V3(sx * x, SH, -8.9f), V3(sx * (x + 90), SH, -8.9f)}, false});
+            npcPaths.push_back({{V3(sx * (x + 20), SH, 8.9f), V3(sx * (x + 110), SH, 8.9f)}, false});
+            npcPaths.push_back({{V3(sx * (x + 8), SH, -60.8f), V3(sx * (x + 98), SH, -60.8f)}, false});
+        }
+        npcPaths.push_back({{V3(-11.3f, SH, x + 6), V3(-11.3f, SH, x + 96)}, false});
+        npcPaths.push_back({{V3(12.9f, SH, x + 26), V3(12.9f, SH, x + 116)}, false});
+    }
 }
 
 static V3 SPAWN_POS(3.0f, 0.0f, 22.0f);
@@ -3304,13 +4930,63 @@ static void buildLevel() {
     buildSE();
     parkedCars();
     buildPromenade();
+    buildExtension();
     buildOutskirts();
     buildSkyline();
+    mapMarks.push_back({28.f, -34.5f, 7}); mapMarks.push_back({-33.f, 31.f, 7}); mapMarks.push_back({50.f, 25.f, 7});   // plaza, the cage, the construction site
     letterPos.insert(letterPos.begin(), V3(28, SH + 5.4f, -34.5f));   // 'S' high above the fountain spout
     // order the letters S K A T E
     std::vector<V3> lp = letterPos;   // [S, A, T, K, E]
     letterPos = {lp[0], lp[3], lp[1], lp[2], lp[4]};
     world.buildGrid();
+    if (getenv("CJ_DEBUG_REACH")) {   // flood-fill everything the skater can reach and write it out as an image
+        const int X0 = -460, X1 = 460, Z0 = -130, Z1 = 460, W = X1 - X0, H = Z1 - Z0;
+        std::vector<uint8_t> blocked((size_t)W * H, 0), seen((size_t)W * H, 0);
+        for (int z = 0; z < H; z++)
+            for (int x = 0; x < W; x++) {
+                float wx = X0 + x + 0.5f, wz = Z0 + z + 0.5f;
+                bool b = wz < RIVER_EDGE_Z || wx < world.minX || wx > world.maxX || wz > world.maxZ || wz < world.minZ;
+                for (int i : *world.cell(wx, wz)) {
+                    const Solid& s = world.solids[i];
+                    if (s.noWall || s.y0 > SH + 1.6f) continue;
+                    float lx, lz; s.toLocal(wx, wz, lx, lz);
+                    if (!s.inside(lx, lz, 0.35f)) continue;
+                    float hs = s.heightLocal(clampf(lx, -s.hx, s.hx), clampf(lz, -s.hz, s.hz));
+                    if (hs > SH + STEP_UP + 0.2f) { b = true; break; }
+                }
+                blocked[(size_t)z * W + x] = b;
+            }
+        std::vector<int> q;
+        int sx = (int)SPAWN_POS.x - X0, sz = (int)SPAWN_POS.z - Z0;
+        q.push_back(sz * W + sx); seen[sz * W + sx] = 1;
+        while (!q.empty()) {
+            int c = q.back(); q.pop_back();
+            int cx = c % W, cz = c / W;
+            const int dx[4] = {1, -1, 0, 0}, dz[4] = {0, 0, 1, -1};
+            for (int k = 0; k < 4; k++) {
+                int nx = cx + dx[k], nz = cz + dz[k];
+                if (nx < 0 || nz < 0 || nx >= W || nz >= H) continue;
+                int n = nz * W + nx;
+                if (seen[n] || blocked[n]) continue;
+                seen[n] = 1; q.push_back(n);
+            }
+        }
+        FILE* f = fopen("reach.ppm", "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", W, H);
+            long long nReach = 0;
+            for (int z = H - 1; z >= 0; z--)
+                for (int x = 0; x < W; x++) {
+                    size_t n = (size_t)z * W + x;
+                    uint8_t px[3] = {200, 200, 200};
+                    if (blocked[n]) { px[0] = px[1] = px[2] = 30; }
+                    if (seen[n]) { px[0] = 255; px[1] = 60; px[2] = 60; nReach++; }
+                    fwrite(px, 1, 3, f);
+                }
+            fclose(f);
+            fprintf(stderr, "reachable area: %lld m^2\n", nReach);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -4666,6 +6342,37 @@ static void walkPose(Pose& p, float phase, float speed) {
     p.headYaw = 0;
 }
 
+// A shopkeeper or customer standing (0), seated on a chair (1), leaning on a counter (2) or perched on a stool (3)
+static void shopPerson(const M4& M, uint32_t seed, int pose) {
+    Rng r(seed | 1u);
+    static const uint32_t skins[] = {0xf1c7a5, 0xd9a47a, 0xc68a5a, 0x9c6a42, 0x6e4a2e, 0x4a3020};
+    static const uint32_t shirts[] = {0x2f5d9e, 0xd8d4c8, 0x8e2a2a, 0x2e6b3a, 0xe0b030, 0x111111, 0x6a4a8a, 0xe07a30, 0x607080, 0xf0f0f0};
+    static const uint32_t pants[] = {0x1f2a44, 0x222222, 0x5a4a3a, 0x6a6a6a, 0x2a3a5a, 0xb0a080};
+    Outfit o;
+    o.skin = hexc(skins[r.irange(0, 5)]); o.shirt = hexc(shirts[r.irange(0, 9)]); o.pants = hexc(pants[r.irange(0, 5)]);
+    o.shoes = r.chance(0.5f) ? hexc(0x1a1a1a) : hexc(0xdedad0);
+    o.hat_ = r.chance(0.3f) ? 1 : 0; o.hat = r.chance(0.5f) ? hexc(0x1c2a4a) : hexc(0x8a1a1a);
+    o.hair = r.chance(0.5f) ? hexc(0x1a120c) : hexc(0x6a4a2a);
+    o.height = r.range(0.92f, 1.06f); o.bag = false; o.longSleeves = r.chance(0.5f); o.baggy = r.chance(0.3f);
+    Pose p;
+    walkPose(p, 0.f, 0.f);
+    p.headYaw = 0.f;
+    if (pose == 1 || pose == 3) {
+        float ph = pose == 1 ? 0.5f : 0.7f;
+        p.pelvis = V3(0.f, ph, 0.f);
+        p.lean = 0.04f;
+        p.footL = V3(-0.42f, pose == 1 ? 0.f : 0.12f, 0.13f); p.footR = V3(-0.42f, pose == 1 ? 0.f : 0.12f, -0.13f);
+        p.kneeHint = V3(-1.f, 0.7f, 0.f);
+        p.handL = V3(-0.3f, ph + 0.1f, 0.22f); p.handR = V3(-0.3f, ph + 0.1f, -0.22f);
+    } else if (pose == 2) {
+        p.lean = 0.16f;
+        p.handL = V3(-0.42f, 0.95f, 0.22f); p.handR = V3(-0.4f, 0.95f, -0.22f);
+    }
+    size_t v0 = SM.v.size();
+    drawHumanLow(SM, M, p, o);
+    for (size_t i = v0; i < SM.v.size(); i++) SM.v[i].c[3] = (uint8_t)(SM.v[i].c[3] + INT_FLAG);   // lit by the room, not the sun
+}
+
 static void drawNpcs(MeshBuilder& mb, V3 cam) {
     for (auto& n : npcs) {
         if (len(n.pos - cam) > 90.f) continue;
@@ -4752,9 +6459,18 @@ static void drawPigeons(MeshBuilder& mb, V3 cam) {
 }
 
 // ---------------------------------------------------------------- traffic
-struct Lane { float z; int dir; bool hasLight; };
-static const Lane LANES[4] = {{-2.1f, 1, true}, {2.1f, 1, true}, {-71.0f, -1, false}, {-66.4f, 1, false}};
-struct Car { int lane; float x, speed, target; int type; Col col; float honk = 0, brake = 0; };
+// Cars loop up and down each street: at the far end they swing out and U-turn into the opposite lane, well
+// short of the road closure. axis 0 runs along x (fixed = z), axis 1 along z (fixed = x).
+struct Lane { float fixed; int dir; bool hasLight; int axis; float turnAt; int partner; };
+static const float TURN_AT = EXT - 60.f;
+static const Lane LANES[6] = {
+    {-2.1f, -1, true, 0, TURN_AT, 1}, {2.1f, 1, true, 0, TURN_AT, 0},                // cross street: westbound, eastbound
+    {-71.0f, -1, false, 0, TURN_AT, 3}, {-66.4f, 1, false, 0, TURN_AT, 2},           // Water Street
+    {-2.1f, 1, true, 1, TURN_AT, 5}, {2.1f, -1, true, 1, 44.f, 4}};                  // the avenue: southbound (+z), northbound (-z)
+struct Car {
+    int lane; float x, speed, target; int type; Col col; float honk = 0, brake = 0;
+    int turn = 0; float turnD = 0, turnTh = 0, turnS0 = 0;   // U-turn: 1 swinging out, 2 going round
+};
 static std::vector<Car> cars;
 static float tlTimer = 0;
 static int ewPhase() {   // 0 green, 1 yellow, 2 red for east-west traffic
@@ -4769,69 +6485,112 @@ static int nsPhase() {
     if (t >= 29 && t < 31) return 1;
     return 2;
 }
+static float turnOut(const Lane& L) { return L.fixed + (L.fixed - LANES[L.partner].fixed) * 0.55f; }   // how far out a car swings before turning
+// where a car is in the world and which way its nose points
+static V3 carWorld(const Car& c, float& yaw) {
+    const Lane& L = LANES[c.lane];
+    float along = c.x, lat = L.fixed, ang = L.dir > 0 ? 0.f : PI;   // ang: heading in the (along, lateral) plane
+    if (c.turn == 1) {
+        float t = sat(c.turnD / 8.f), latOut = turnOut(L);
+        lat = lerpf(L.fixed, latOut, smooth01(t));
+        ang = std::atan2((latOut - L.fixed) * 6.f * t * (1.f - t) / 8.f, (float)L.dir);
+    } else if (c.turn == 2) {
+        const Lane& P = LANES[L.partner];
+        float latOut = turnOut(L), R = std::fabs(latOut - P.fixed) * 0.5f, latC = (latOut + P.fixed) * 0.5f, sg = latOut > P.fixed ? 1.f : -1.f;
+        along = c.turnS0 + L.dir * R * std::sin(c.turnTh);
+        lat = latC + sg * R * std::cos(c.turnTh);
+        ang = std::atan2(-sg * std::sin(c.turnTh), L.dir * std::cos(c.turnTh));
+    }
+    V3 pos, fwd;
+    if (L.axis == 0) { pos = V3(along, 0, lat); fwd = V3(std::cos(ang), 0, std::sin(ang)); }
+    else { pos = V3(lat, 0, along); fwd = V3(std::sin(ang), 0, std::cos(ang)); }
+    yaw = yawOf(fwd);
+    return pos;
+}
 static void initTraffic() {
     Rng r(555);
     Col cols[] = {hexc(0xf2c318), hexc(0xf2c318), hexc(0xf2c318), hexc(0x1b1b1d), hexc(0x7a1f22), hexc(0x9ca3a8), hexc(0x274a78), hexc(0xd8d4c8)};
-    for (int l = 0; l < 4; l++)
-        for (int k = 0; k < 7; k++) {
+    for (int l = 0; l < 6; l++) {
+        const Lane& L = LANES[l];
+        float lo = l < 4 ? -TURN_AT + 12.f : -30.f, hi = TURN_AT - 12.f;
+        int n = l < 4 ? 6 : 4;
+        for (int k = 0; k < n; k++) {
             Car c;
             c.lane = l;
-            c.x = -560.f + k * 170.f + r.range(-20, 20);
+            c.x = lo + (hi - lo) * (k + r.range(0.15f, 0.85f)) / n;
             c.speed = c.target = r.range(8.f, 11.f);
             c.col = cols[r.irange(0, 7)];
             c.type = c.col.r == 0xf2 ? 0 : r.irange(1, 3);
+            (void)L;
             cars.push_back(c);
         }
+    }
 }
 static void updateTraffic(float dt, Player& pl) {
     tlTimer += dt;
     for (auto& c : cars) {
         const Lane& L = LANES[c.lane];
-        float want = c.target;
-        // car ahead
-        for (auto& o : cars) {
-            if (&o == &c || o.lane != c.lane) continue;
-            float gap = (o.x - c.x) * L.dir;
-            if (gap > 0 && gap < 9.f) want = std::min(want, std::max(0.f, (gap - 5.5f) * 1.5f));
+        float want = c.turn ? std::min(c.target, 4.2f) : c.target;
+        if (!c.turn)
+            for (auto& o : cars) {   // car ahead
+                if (&o == &c || o.lane != c.lane || o.turn) continue;
+                float gap = (o.x - c.x) * L.dir;
+                if (gap > 0 && gap < 15.f) want = std::min(want, std::max(0.f, (gap - 6.3f) * 1.1f));
+            }
+        if (L.hasLight && !c.turn) {   // red light: stop line 14.5 m before the intersection
+            int ph = L.axis == 0 ? ewPhase() : nsPhase();
+            if (ph != 0) {
+                float gap = (-14.5f * L.dir - c.x) * L.dir;
+                if (gap > 0 && gap < 22.f && (ph == 2 || gap > 6.f)) want = std::min(want, std::max(0.f, (gap - 0.5f) * 0.9f));
+            }
         }
-        // red light (stop line west of the intersection for eastbound traffic)
-        if (L.hasLight && ewPhase() != 0) {
-            float stopX = -14.5f;
-            float gap = (stopX - c.x) * L.dir;
-            if (gap > 0 && gap < 22.f && (ewPhase() == 2 || gap > 6.f)) want = std::min(want, std::max(0.f, (gap - 0.5f) * 0.9f));
-        }
-        // the skater in the lane ahead
-        if (pl.state != ST_BAIL && pl.pos.y < 1.2f && std::fabs(pl.pos.z - L.z) < 1.9f) {
-            float gap = (pl.pos.x - c.x) * L.dir;
+        float pAlong = L.axis == 0 ? pl.pos.x : pl.pos.z, pLat = L.axis == 0 ? pl.pos.z : pl.pos.x;
+        if (!c.turn && pl.state != ST_BAIL && pl.pos.y < 1.2f && std::fabs(pLat - L.fixed) < 1.9f) {   // the skater in the lane ahead
+            float gap = (pAlong - c.x) * L.dir;
             if (gap > 0 && gap < 11.f) {
                 want = std::min(want, std::max(0.f, (gap - 3.4f) * 1.4f));
-                if (c.honk <= 0 && std::fabs(pl.pos.x - c.x) < 11.f) { sfx(SFX_HONK, 0.8f, c.type == 0 ? 1.1f : 0.9f); c.honk = 2.5f; }
+                if (c.honk <= 0 && std::fabs(pAlong - c.x) < 11.f) { sfx(SFX_HONK, 0.8f, c.type == 0 ? 1.1f : 0.9f); c.honk = 2.5f; }
             }
         }
         c.honk = std::max(0.f, c.honk - dt);
         float acc = want > c.speed ? 3.f : 9.f;
         c.brake = want < c.speed - 0.2f ? 1.f : 0.f;
         c.speed = approach(c.speed, want, acc * dt);
-        c.x += c.speed * L.dir * dt;
-        if (c.x * L.dir > 620.f) c.x = -620.f * L.dir;
-        // hit the skater?
-        if (pl.state != ST_BAIL && pl.pos.y < 1.6f) {
-            float dx = std::fabs(pl.pos.x - c.x), dz = std::fabs(pl.pos.z - L.z);
-            if (dx < 2.6f && dz < 1.2f && c.speed > 2.f) {
-                pl.vel += V3((float)L.dir * c.speed * 0.6f, 2.f, 0);
+        float step = c.speed * dt;
+        if (c.turn == 0) {
+            c.x += step * L.dir;
+            if (c.x * L.dir >= L.turnAt - 8.f) { c.turn = 1; c.turnD = 0; }
+        } else if (c.turn == 1) {
+            c.x += step * L.dir; c.turnD += step;
+            if (c.turnD >= 8.f) { c.turn = 2; c.turnTh = 0; c.turnS0 = c.x; }
+        } else {
+            const Lane& P = LANES[L.partner];
+            c.turnTh += step / (std::fabs(turnOut(L) - P.fixed) * 0.5f);
+            if (c.turnTh >= PI) { c.lane = L.partner; c.x = c.turnS0; c.turn = 0; c.speed = std::min(c.speed, 3.f); }
+        }
+        if (pl.state != ST_BAIL && pl.pos.y < 1.6f) {   // hit the skater?
+            float yaw;
+            V3 cp = carWorld(c, yaw);
+            V3 fw = fwdYaw(yaw);
+            float dx = std::fabs(pl.pos.x - cp.x), dz = std::fabs(pl.pos.z - cp.z);
+            float ex = L.axis == 0 ? 2.6f : 1.2f, ez = L.axis == 0 ? 1.2f : 2.6f;
+            if (dx < ex && dz < ez && c.speed > 2.f) {
+                pl.vel += fw * (c.speed * 0.6f) + V3(0, 2.f, 0);
                 pl.bail(c.type == 0 ? "HIT BY A CAB!" : "HIT BY A CAR!");
                 sfx(SFX_HONK, 1.f);
-            } else if (dx < 2.5f && dz < 1.1f) {
-                pl.pos.z = L.z + (pl.pos.z > L.z ? 1.25f : -1.25f);
+            } else if (dx < ex - 0.1f && dz < ez - 0.1f) {
+                if (L.axis == 0) pl.pos.z = cp.z + (pl.pos.z > cp.z ? 1.25f : -1.25f);
+                else pl.pos.x = cp.x + (pl.pos.x > cp.x ? 1.25f : -1.25f);
             }
         }
     }
 }
 static void drawTraffic(MeshBuilder& mb, V3 cam) {
     for (auto& c : cars) {
-        const Lane& L = LANES[c.lane];
-        if (std::fabs(c.x - cam.x) > 650) continue;
-        carGeom(mb, frame(c.x, 0, L.z, L.dir > 0 ? PI / 2 : -PI / 2), c.type, c.col, c.brake);
+        float yaw;
+        V3 p = carWorld(c, yaw);
+        if (std::fabs(p.x - cam.x) > 520 || std::fabs(p.z - cam.z) > 520) continue;
+        carGeom(mb, frame(p.x, 0, p.z, yaw), c.type, c.col, c.brake);
     }
 }
 static void drawSignals(MeshBuilder& mb) {
@@ -4851,8 +6610,8 @@ static void drawSignals(MeshBuilder& mb) {
 static void updateDynLights() {
     dynLights.clear();
     for (auto& c : cars) {
-        const Lane& L = LANES[c.lane];
-        V3 fwd((float)L.dir, 0, 0), base(c.x, 0, L.z);
+        float yaw;
+        V3 base = carWorld(c, yaw), fwd = fwdYaw(yaw);
         float half = c.type == 3 ? 2.6f : 2.45f;
         PointLight h;
         h.pos = base + fwd * (half + 0.3f) + V3(0, 0.75f, 0);
@@ -4878,6 +6637,25 @@ static void addPlayerFill(V3 camPos, V3 skater) {
     f.pos = lerp3(camPos, skater + V3(0, 1.2f, 0), 0.35f) + V3(0, 0.8f, 0);
     f.col = V3(0.62f, 0.7f, 0.9f) * 1.6f; f.radius = 9.f; f.group = LG_SIGNAL;
     dynLights.push_back(f);
+}
+// flashing amber beacons on the road closures: they chase along the barricade
+static void drawBeacons(MeshBuilder& mb, V3 cam) {
+    int step = (int)std::floor(tlTimer * 3.f);
+    for (auto& b : beacons) {
+        if (std::fabs(b.pos.x - cam.x) > 260 || std::fabs(b.pos.z - cam.z) > 260) continue;
+        bool on = (step + b.phase) % 4 == 0;
+        mb.box(mTranslate(b.pos), V3(0.11f, 0.15f, 0.11f), on ? hexc(0xffa020) : hexc(0x6a4408), on ? MAT_EMISSIVE : MAT_PAINTED);
+    }
+}
+static void addBeaconLights(V3 cam) {
+    int step = (int)std::floor(tlTimer * 3.f), n = 0;
+    for (auto& b : beacons) {
+        if ((step + b.phase) % 4 != 0 || len(b.pos - cam) > 70.f) continue;
+        PointLight l;
+        l.pos = b.pos + V3(0, 0.1f, 0); l.col = V3(1.f, 0.55f, 0.08f) * 16.f; l.radius = 10.f; l.group = LG_SIGNAL;
+        dynLights.push_back(l);
+        if (++n >= 6) break;
+    }
 }
 static void drawLetters(MeshBuilder& mb, const Player& pl, float time) {
     static const char L[5] = {'S', 'K', 'A', 'T', 'E'};
@@ -5516,7 +7294,7 @@ static const char* HELP_LINES[] = {
     "GRINDS: - 50-50  A BOARDSLIDE  W NOSEGRIND  S 5-0",
     "",
     "R RESET  V CAMERA  N TIME OF DAY  T 2-MIN SESSION",
-    "H HIDE HELP   ESC MENU   F11 FULLSCREEN",
+    "H HIDE HELP  TAB MAP  ESC MENU  F11 FULLSCREEN",
     "",
     "GAMEPAD: STICK/DPAD MOVE  A OLLIE  X FLIP  B GRAB",
     "  Y GRIND  LB/RB MANUAL  START MENU  BACK CAMERA",
@@ -5574,9 +7352,38 @@ static bool projectToScreen(const M4& vp, V3 p, float& sx, float& sy) {
     return true;
 }
 
+static bool showMap = true;
+// overview of the whole skateable world: streets, road closures, skate lots and where you are
+static void drawMiniMap(const Player& pl) {
+    float U = hud.U;
+    const float wx0 = -430.f, wx1 = 430.f, wz0 = -100.f, wz1 = 425.f;
+    float pw = 250 * U, sc = pw / (wx1 - wx0), ph = (wz1 - wz0) * sc;
+    float ox = hud.W - 20 * U - pw, oy = 100 * U;
+    auto R = [&](float x0, float z0, float x1, float z1, Col c, float a) {
+        float ax = ox + (x0 - wx0) * sc, ay = oy + (z0 - wz0) * sc, bx = ox + (x1 - wx0) * sc, by = oy + (z1 - wz0) * sc;
+        hud.rect(ax, ay, std::max(bx - ax, 1.f), std::max(by - ay, 1.f), c, a);
+    };
+    hud.rect(ox - 4 * U, oy - 4 * U, pw + 8 * U, ph + 8 * U, Col(8, 10, 16), 0.62f);
+    R(-425, -100, 425, -88, hexc(0x1d4a68), 0.9f);                       // river
+    R(-425, -88, 425, -74, hexc(0x8b6d4e), 0.9f);                        // promenade
+    R(-425, -74, 425, -62, hexc(0x6a6a70), 0.95f);                       // Water Street
+    R(-425, -7, 425, 7, hexc(0x6a6a70), 0.95f);                          // cross street
+    R(-9, -62, 9, 405, hexc(0x6a6a70), 0.95f);                           // the avenue
+    for (float e : {-EXT + 2.f, EXT - 2.f}) { R(e - 3, -88, e + 3, -57, hexc(0xff5a1a), 1); R(e - 3, -12, e + 3, 12, hexc(0xff5a1a), 1); }
+    R(-15, EXT - 5, 17, EXT + 1, hexc(0xff5a1a), 1);
+    static const uint32_t pal[8] = {0xe23b3b, 0xf5d142, 0x3b9de2, 0x2fbf8a, 0xd05ad8, 0xf08a24, 0xe8e4d8, 0xffffff};
+    for (const MapMark& m : mapMarks) R(m.x - 9, m.z - 9, m.x + 9, m.z + 9, hexc(pal[m.kind & 7]), 0.95f);
+    float px = ox + (pl.pos.x - wx0) * sc, py = oy + (pl.pos.z - wz0) * sc;
+    V3 f = fwdYaw(pl.yaw);
+    for (int i = 1; i <= 3; i++) hud.rect(px + f.x * i * 2.2f * U - U, py + f.z * i * 2.2f * U - U, 2 * U, 2 * U, Col(255, 255, 255), 0.9f);
+    hud.rect(px - 2.2f * U, py - 2.2f * U, 4.4f * U, 4.4f * U, hexc(0x40ff70), 1);
+    hud.text(ox + pw * 0.5f, oy - 14 * U, 1.5f * U, "MAP  (TAB)", Col(230, 230, 230), 0.8f, 1);
+}
+
 static void drawGameHud(const Player& pl, float time, float sessionLeft, bool session, int helpPage, float helpAlpha, const M4& vp, V3 cam, bool showFps, float fps) {
     bool showHelp = helpPage > 0;
     float U = hud.U;
+    if (showMap) drawMiniMap(pl);
     // score
     hud.text(24 * U, 20 * U, 2 * U, "SCORE", hexc(0xffd23a), 1);
     hud.text(24 * U, 38 * U, 5 * U, fmtNum(pl.score), Col(255, 255, 255), 1);
@@ -5659,7 +7466,7 @@ static void drawGameHud(const Player& pl, float time, float sessionLeft, bool se
     char sb[48];
     snprintf(sb, sizeof sb, "%d MPH", (int)(len(pl.vel) * 2.237f + 0.5f));
     hud.text(24 * U, hud.H - 30 * U, 2 * U, sb, Col(220, 220, 220), 0.8f);
-    if (!showHelp) hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, "H: CONTROLS / TRICKS   N: TIME OF DAY   V: CAMERA   ESC: MENU", Col(220, 220, 220), 0.75f, 2);
+    if (!showHelp) hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, "H: CONTROLS   TAB: MAP   N: TIME OF DAY   V: CAMERA   ESC: MENU", Col(220, 220, 220), 0.75f, 2);
     else hud.text(hud.W - 24 * U, hud.H - 30 * U, 1.5f * U, helpPage == 1 ? "H: TRICK LIST" : "H: HIDE", hexc(0xffd23a), 0.9f, 2);
     if (helpPage == 1 && helpAlpha > 0.01f) drawHelpPanel(20 * U, 110 * U, helpAlpha, 1.5f);
     if (helpPage == 2 && helpAlpha > 0.01f) drawTrickPanel(20 * U, 110 * U, helpAlpha);
@@ -5716,7 +7523,7 @@ struct Lighting {
     V3 sunDir = norm(V3(-0.62f, 0.5f, 0.6f)), sunCol, sunPos, sunDisc, moonDir, moonDisc;
     V3 skyUp, groundCol, fogCol, glow, cloudLight, atmoSun, atmoMoon;
     float atmoSunI = 0, atmoMoonI = 0;
-    float fogDensity = 0.003f, fogFall = 0.03f, fogSun = 0.5f, night = 0, wet = 0, litFrac = 0.15f, emit = 1, lamps = 0;
+    float fogDensity = 0.003f, fogFall = 0.03f, fogSun = 0.5f, night = 0, wet = 0, litFrac = 0.15f, emit = 1, lamps = 0, intGlow = 0.5f;
     float cloud = 0.4f, sunSize = 0.012f, exposure = 0.6f, bloom = 0.05f, stars = 0, rain = 0;
     V3 wb = V3(1, 1, 1), lift; float sat = 1, contrast = 1;
 };
@@ -5829,6 +7636,7 @@ static void applyTimeOfDay(int idx) {
     L.wet = t.wet; L.rain = t.rain; L.litFrac = t.litFrac; L.emit = t.emit; L.lamps = t.lamps;
     L.cloud = t.cloud; L.sunSize = t.sunSize; L.exposure = t.exposure; L.bloom = t.bloom; L.stars = t.stars;
     L.wb = t.wb; L.sat = t.sat; L.contrast = t.contrast; L.lift = t.lift;
+    L.intGlow = (0.22f + 0.3f * L.night) / std::max(L.exposure, 0.2f);   // shop interiors read as lit rooms at every hour
     if (getenv("CJ_DEBUG_LIGHT"))
         fprintf(stderr, "TOD %s: sunCol %.3f %.3f %.3f  skyUp %.3f %.3f %.3f  ground %.3f %.3f %.3f  fog %.3f %.3f %.3f  sunDir %.2f %.2f %.2f\n", t.name,
                 L.sunCol.x, L.sunCol.y, L.sunCol.z, L.skyUp.x, L.skyUp.y, L.skyUp.z, L.groundCol.x, L.groundCol.y, L.groundCol.z,
@@ -5896,7 +7704,8 @@ static const float CAM_NEAR = 0.1f, CAM_FAR = 1500.f;
 struct Renderer {
     GLuint pWorld = 0, pPre = 0, pShadow = 0, pSky = 0, pSkyLut = 0, pWater = 0, pPart = 0, pHud = 0;
     GLuint pSSAO = 0, pAOBlur = 0, pSSR = 0, pFog = 0, pFogApply = 0, pBloomDown = 0, pBloomUp = 0, pComposite = 0, pFinal = 0;
-    GpuMesh staticMesh, dynMesh, waterMesh;
+    StaticMesh staticMesh;
+    GpuMesh dynMesh, waterMesh;
     // cascaded shadow map
     GLuint shadowTex = 0, shadowFbo = 0, sampCmp = 0, sampRaw = 0;
     int shadowRes = 0;
@@ -5950,6 +7759,7 @@ static void setCommon(GLuint p, V3 cam, float time) {
     set1f(p, "uFogDensity", LIGHT.fogDensity); set1f(p, "uFogFall", LIGHT.fogFall); set1f(p, "uFogSun", LIGHT.fogSun);
     set1f(p, "uNight", LIGHT.night); set1f(p, "uWet", LIGHT.wet); set1f(p, "uLitFrac", LIGHT.litFrac);
     set1f(p, "uEmit", LIGHT.emit); set1f(p, "uCloud", LIGHT.cloud); set3(p, "uCloudLight", LIGHT.cloudLight);
+    set1f(p, "uIntGlow", LIGHT.intGlow);
     bindTexU(p, "uSkyEnv", TU_SKYENV, RD.skyEnv);
 }
 static void setShadowUniforms(GLuint p, V3 camFwd, int quality) {
@@ -6272,7 +8082,8 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
         glReadBuffer(GL_NONE);
         glClear(GL_DEPTH_BUFFER_BIT);
         setMat(RD.pShadow, "uLightVP", RD.cascVP[c]);
-        RD.staticMesh.draw();
+        Frustum fc; fc.set(RD.cascVP[c]);
+        RD.staticMesh.draw(&fc);
         RD.dynMesh.draw();
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -6287,7 +8098,8 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     setMat(RD.pPre, "uVP", F.vp);
     gl.Uniform4f(U_(RD.pPre, "uClip"), 0, 0, 0, 1);
     set1f(RD.pPre, "uDynamic", 0.f);
-    RD.staticMesh.draw();
+    Frustum fMain; fMain.set(F.vp);
+    RD.staticMesh.draw(&fMain);
     set1f(RD.pPre, "uDynamic", 1.f);
     RD.dynMesh.draw();
 
@@ -6340,7 +8152,8 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
         set1i(RD.pWorld, "uUseAO", 0);
         bindTexU(RD.pWorld, "uAO", TU_A, RD.whiteTex);
         set1i(RD.pWorld, "uInlineFog", 1);
-        RD.staticMesh.draw();
+        Frustum fRefl; fRefl.set(rvp);
+        RD.staticMesh.draw(&fRefl);
         RD.dynMesh.draw();
         glDisable(GL_CLIP_DISTANCE0);
     }
@@ -6362,7 +8175,7 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     set2f(RD.pWorld, "uInvRes", 1.f / RD.iw, 1.f / RD.ih);
     set1i(RD.pWorld, "uInlineFog", 0);
     set1i(RD.pWorld, "uDebug", getenv("CJ_DEBUG_VIEW") ? atoi(getenv("CJ_DEBUG_VIEW")) : 0);
-    RD.staticMesh.draw();
+    RD.staticMesh.draw(&fMain);
     RD.dynMesh.draw();
     setCommon(RD.pSky, F.camPos, F.time);
     setMat(RD.pSky, "uInvVP", invVP);
@@ -6783,7 +8596,7 @@ int main(int argc, char** argv) {
     initRenderer();
     applyTimeOfDay(SET.tod);
     buildLevel();
-    RD.staticMesh.upload(SM, false);
+    RD.staticMesh.build(SM);
     RD.waterMesh.upload(WM, false);
     size_t staticTris = SM.idx.size() / 3;
     SM.clear(); SM.v.shrink_to_fit(); SM.idx.shrink_to_fit();
@@ -6797,7 +8610,7 @@ int main(int argc, char** argv) {
     cam.yaw = startYaw;
     cam.focus = P.pos + V3(0, 1.05f, 0);
     cam.pos = cam.focus - fwdYaw(cam.yaw) * 5.f + V3(0, 1.2f, 0);
-    fprintf(stderr, "Concrete Jungle: %zu static triangles, %zu solids, %zu rails, %zu pedestrians\n", staticTris, world.solids.size(), world.rails.size(), npcs.size());
+    fprintf(stderr, "Concrete Jungle: %zu static triangles in %zu chunks, %zu solids, %zu rails, %zu pedestrians\n", staticTris, RD.staticMesh.chunks.size(), world.solids.size(), world.rails.size(), npcs.size());
 
     GameMode mode = forceTitle ? GM_TITLE : (startPlaying || shotMode ? GM_PLAY : (startTitle ? GM_TITLE : GM_PLAY));
     bool running = true, session = false, newBest = false;
@@ -6957,6 +8770,7 @@ int main(int argc, char** argv) {
                         case SDL_SCANCODE_R: P.reset(SPAWN_POS, SPAWN_YAW); cam.yaw = SPAWN_YAW; break;
                         case SDL_SCANCODE_T: startSession(); break;
                         case SDL_SCANCODE_F3: showFps = !showFps; saveGame(); break;
+                        case SDL_SCANCODE_TAB: showMap = !showMap; break;
                         case SDL_SCANCODE_SPACE: latched.olliePress = true; break;
                         case SDL_SCANCODE_J: case SDL_SCANCODE_Z: latched.flipPress = true; break;
                         case SDL_SCANCODE_K: case SDL_SCANCODE_X: latched.grabPress = true; break;
@@ -7066,6 +8880,11 @@ int main(int argc, char** argv) {
         } else if (mode == GM_PLAY || shotMode) {
             updateCamera(frameDt, P);
         }
+        if (const char* dc = getenv("CJ_DEBUG_CAM")) {   // free camera for screenshots: px,py,pz,lx,ly,lz[,fov]
+            float a[7] = {0, 10, 0, 0, 0, 10, 64};
+            sscanf(dc, "%f,%f,%f,%f,%f,%f,%f", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]);
+            cam.pos = V3(a[0], a[1], a[2]); cam.look = V3(a[3], a[4], a[5]); cam.fov = a[6];
+        }
         {   // water ambience from nearby fountains/hydrants
             float w = 0;
             for (auto& em : emitters) if (em.kind == EM_FOUNTAIN || em.kind == EM_HYDRANT) w = std::max(w, 1.f - len(em.pos - P.pos) / 22.f);
@@ -7099,10 +8918,12 @@ int main(int argc, char** argv) {
             drawPigeons(DM, cam.pos);
             drawTraffic(DM, cam.pos);
             drawSignals(DM);
+            drawBeacons(DM, cam.pos);
             drawLetters(DM, P, time);
             RD.dynMesh.upload(DM, true);
             updateDynLights();
             if (mode != GM_TITLE) addPlayerFill(cam.pos, P.state == ST_BAIL ? P.bodyPos : P.pos);
+            addBeaconLights(cam.pos);
 
             FrameInfo fi;
             fi.view = view; fi.proj = proj; fi.vp = proj * view;
@@ -7159,7 +8980,9 @@ int main(int argc, char** argv) {
                     fclose(f);
                 }
                 static const char* SN[] = {"RIDE", "AIR", "GRIND", "MANUAL", "BAIL"};
-                printf("shot frame %d pos(%.2f %.2f %.2f) state=%s score=%lld combo=%s\n", frame, P.pos.x, P.pos.y, P.pos.z, SN[P.state], P.score, P.combo.text(80).c_str());
+                if (getenv("CJ_DEBUG_TRAFFIC"))
+                    for (auto& c : cars) { float yw; V3 p = carWorld(c, yw); printf("car lane %d turn %d pos %.1f %.1f yaw %.2f speed %.1f\n", c.lane, c.turn, p.x, p.z, yw, c.speed); }
+                printf("shot frame %d pos(%.2f %.2f %.2f) state=%s score=%lld combo=%s chunks=%d/%zu\n", frame, P.pos.x, P.pos.y, P.pos.z, SN[P.state], P.score, P.combo.text(80).c_str(), RD.staticMesh.lastDrawn, RD.staticMesh.chunks.size());
                 running = false;
             }
         }
