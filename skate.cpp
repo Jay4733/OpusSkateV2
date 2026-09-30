@@ -4876,15 +4876,15 @@ static void buildOutskirts() {
     }
     // ---- and on to the horizon beyond the closures: background blocks, lamps, trees and cars
     V3 Xv(1, 0, 0), Zv(0, 0, 1);
-    const float FAR = 1400.f - EXT;
-    farRow(V3(-EXT, 0, 12), Zv * -1.f, FAR, 22, 201);
-    farRow(V3(-1400, 0, -12), Zv, FAR, 22, 202);
-    farRow(V3(1400, 0, 12), Zv * -1.f, FAR, 22, 203);
-    farRow(V3(EXT, 0, -12), Zv, FAR, 22, 204);
-    farRow(V3(-14, 0, 1400), Xv, FAR, 30, 205);
-    farRow(V3(16, 0, EXT), Xv * -1.f, FAR, 30, 206);
-    farRow(V3(-EXT, 0, -57), Zv * -1.f, FAR, 22, 207);
-    farRow(V3(1400, 0, -57), Zv * -1.f, FAR, 22, 208);
+    const float FAR_LEN = 1400.f - EXT;
+    farRow(V3(-EXT, 0, 12), Zv * -1.f, FAR_LEN, 22, 201);
+    farRow(V3(-1400, 0, -12), Zv, FAR_LEN, 22, 202);
+    farRow(V3(1400, 0, 12), Zv * -1.f, FAR_LEN, 22, 203);
+    farRow(V3(EXT, 0, -12), Zv, FAR_LEN, 22, 204);
+    farRow(V3(-14, 0, 1400), Xv, FAR_LEN, 30, 205);
+    farRow(V3(16, 0, EXT), Xv * -1.f, FAR_LEN, 30, 206);
+    farRow(V3(-EXT, 0, -57), Zv * -1.f, FAR_LEN, 22, 207);
+    farRow(V3(1400, 0, -57), Zv * -1.f, FAR_LEN, 22, 208);
     for (float d = EXT + 8; d < 1400; d += 32) {
         for (int sd = -1; sd <= 1; sd += 2) {
             streetLamp(sd * d, -7.6f, SH, 0, false);
