@@ -1,7 +1,11 @@
 # OpusSkate — Concrete Jungle
 
-A single-file C++ street skateboarding game set on an early-2000s New York City block: storefronts,
+A single-file C++ street skateboarding game set on an early-2000s New York City: storefronts,
 brownstone stoops, a plaza fountain, the basketball cage, a construction site and the East River.
+The avenue and cross streets run for 400 m in each direction before a **ROAD BLOCKED** construction
+blockade stops you; the city keeps going behind it. Skate spots are everywhere: ledges, rails, stairs,
+gaps, manual pads, banks, quarter pipes, planters, benches, dumpsters, flatbars and a few skate lots
+tucked between the buildings. Press **Tab** for a map.
 Everything is generated in code — geometry, materials, sky, sound effects and music. No asset files.
 
 ## Graphics
@@ -10,6 +14,12 @@ A modern HDR renderer built for high-end GPUs (it scales down to older hardware 
 
 - Physically based shading (GGX) with procedural bump detail on brick, pavers, asphalt, sidewalk and wood
 - Furnished rooms behind every window (interior mapping): apartments, offices and stocked shops
+- Every storefront is a real modelled interior seen through reflective glass: diner counters, grocery
+  aisles, salon chairs, record bins, laundromat machines, a skate shop, pawn shop and a bank with teller windows
+- Textured models: stitched denim, jersey knit with a printed tee, canvas caps, suede and rubber shoes,
+  strand-lit hair, pored skin, feathered pigeons, grip tape and deck graphics, and cars with metallic
+  flake paint, shut lines, road grime, licence plates and treaded tyres — all procedural, in object space,
+  so the cloth and paint stay on the model as it moves
 - Cascaded shadow maps with PCSS contact-hardening soft shadows
 - Screen-space ambient occlusion and screen-space reflections (glass, car paint, wet streets, puddles)
 - Atmospheric-scattering sky with moving clouds, stars and a moon; planar reflections on the river
@@ -38,6 +48,7 @@ up to 2×2 and is meant for cards like an RTX 4090/5090; High runs at native res
 | Esc | Start | Menu |
 | V | Back | Camera |
 | N / G | | Time of day / graphics preset |
+| Tab | | Map |
 | H, R, T, M, F11 | | Help, reset, 2-minute session, music, fullscreen |
 
 Settings and best scores are saved automatically (in your user app-data folder).

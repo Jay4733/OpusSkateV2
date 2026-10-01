@@ -337,24 +337,41 @@ enum Mat : uint8_t {
     MAT_EMISSIVE, MAT_WOOD, MAT_METAL, MAT_FOLIAGE, MAT_FENCE, MAT_SHOPGLASS, MAT_PAVERS, MAT_AWNING,
     MAT_SKIN, MAT_COURT, MAT_CONCRETE, MAT_GRANITE, MAT_CLOTH, MAT_PAINTED, MAT_WATER, MAT_ROOF, MAT_BRICKBANK,
     MAT_ROADPAINT, MAT_CARPAINT, MAT_CARGLASS, MAT_RUBBER, MAT_BARK, MAT_BARS,
-    MAT_SHELF, MAT_TILE   // stocked shelves and glossy tile floors (shop interiors)
+    MAT_SHELF, MAT_TILE,  // stocked shelves and glossy tile floors (shop interiors)
+    // textured model materials (characters, board, cars): evaluated in object space so they stay attached to moving models
+    MAT_DENIM, MAT_KNIT, MAT_LEATHER, MAT_HAIR, MAT_CANVAS, MAT_GRIP, MAT_DECK, MAT_URETHANE, MAT_FEATHER, MAT_TEE
 };
+static const uint8_t INT_FLAG = 64;    // added to a material: shop interior (room light, no sun, no shadows)
+static const uint8_t OBJ_FLAG = 128;   // added by MeshBuilder while an object frame is set: textures use object space
 
 struct Vtx {
     float p[3];
     float n[3];
-    uint8_t c[4];  // rgb + material id
+    uint8_t c[4];  // rgb + material id (+ INT_FLAG / OBJ_FLAG)
+    float t[3];    // texture-space position: the object-space position when an object frame was set, else the world position
+    int8_t tn[4];  // object-space normal (snorm8) for triplanar texturing
 };
 
 struct MeshBuilder {
     std::vector<Vtx> v;
     std::vector<uint32_t> idx;
-    void clear() { v.clear(); idx.clear(); }
+    M4 objInv = M4::ident();   // world -> object transform while an object frame is active
+    bool obj = false;
+    void clear() { v.clear(); idx.clear(); obj = false; }
+    // Everything added until endObj() is textured in the object space of 'worldFromObject' (a character limb, a car...),
+    // so procedural textures move with the model instead of sliding over it.
+    void beginObj(const M4& worldFromObject) { objInv = mInverse(worldFromObject); obj = true; }
+    void endObj() { obj = false; }
     uint32_t vert(V3 p, V3 n, Col c, uint8_t mat) {
         Vtx t;
         t.p[0] = p.x; t.p[1] = p.y; t.p[2] = p.z;
         t.n[0] = n.x; t.n[1] = n.y; t.n[2] = n.z;
         t.c[0] = c.r; t.c[1] = c.g; t.c[2] = c.b; t.c[3] = mat;
+        V3 q = p, qn = n;
+        if (obj) { q = xPoint(objInv, p); qn = norm(xDir(objInv, n)); t.c[3] = (uint8_t)(mat | OBJ_FLAG); }
+        t.t[0] = q.x; t.t[1] = q.y; t.t[2] = q.z;
+        t.tn[0] = (int8_t)std::lround(clampf(qn.x, -1.f, 1.f) * 127.f); t.tn[1] = (int8_t)std::lround(clampf(qn.y, -1.f, 1.f) * 127.f);
+        t.tn[2] = (int8_t)std::lround(clampf(qn.z, -1.f, 1.f) * 127.f); t.tn[3] = 0;
         v.push_back(t);
         return (uint32_t)v.size() - 1;
     }
@@ -525,6 +542,10 @@ struct GpuMesh {
             gl.VertexAttribPointer(2, 3, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)24);
             gl.EnableVertexAttribArray(3);
             gl.VertexAttribPointer(3, 1, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Vtx), (void*)27);
+            gl.EnableVertexAttribArray(4);
+            gl.VertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)28);
+            gl.EnableVertexAttribArray(5);
+            gl.VertexAttribPointer(5, 4, GL_BYTE, GL_TRUE, sizeof(Vtx), (void*)40);
         }
         gl.BindVertexArray(vao);
         gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -640,12 +661,14 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
 layout(location=2) in vec3 aCol;
 layout(location=3) in float aMat;
+layout(location=4) in vec3 aTex;
+layout(location=5) in vec4 aTexN;
 uniform mat4 uVP;
 uniform vec4 uClip;
-out vec3 vPos; out vec3 vNrm; out vec3 vCol; flat out int vMat;
+out vec3 vPos; out vec3 vNrm; out vec3 vCol; flat out int vMat; out vec3 vTex; out vec3 vNrmO;
 invariant gl_Position;
 void main(){
-  vPos = aPos; vNrm = aNrm; vCol = aCol; vMat = int(aMat + 0.5);
+  vPos = aPos; vNrm = aNrm; vCol = aCol; vMat = int(aMat + 0.5); vTex = aTex; vNrmO = aTexN.xyz;
   gl_ClipDistance[0] = dot(vec4(aPos,1.0), uClip);
   gl_Position = uVP * vec4(aPos, 1.0);
 }
@@ -881,7 +904,7 @@ void main(){
 )";
 
 static const char* WORLD_FS_MAIN = R"(
-in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat;
+in vec3 vPos; in vec3 vNrm; in vec3 vCol; flat in int vMat; in vec3 vTex; in vec3 vNrmO;
 uniform sampler2D uAO; uniform int uUseAO; uniform vec2 uInvRes; uniform int uInlineFog; uniform int uDebug; uniform float uIntGlow;
 layout(location=0) out vec4 oCol; layout(location=1) out vec4 oRefl; layout(location=2) out vec4 oSurf;
 
@@ -1027,18 +1050,85 @@ void glassPane(vec2 id, vec2 lc, vec2 cp, vec3 room, float seedBase, int kind, v
   f0 = kind == 1 ? 0.22 : 0.04;   // office curtain walls use reflective coated glass
 }
 
+uniform sampler2D uFont;
+// ---------------------------------------------------------------- textured model materials
+// Characters, the board and the cars are textured in their own object space (vTex / vNrmO), so cloth,
+// skin and paint stay attached to the model as it moves. Bump comes from screen-space derivatives of a height.
+float vn3(vec3 p){
+  vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash13(i), hash13(i + vec3(1,0,0)), f.x), mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x), mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm3(vec3 p){ float s = 0.0, a = 0.5; for(int i = 0; i < 3; i++){ s += a * vn3(p); p = p * 2.03 + 7.1; a *= 0.5; } return s; }
+vec3 triW(vec3 nO){ vec3 w = pow(abs(nO) + 0.02, vec3(4.0)); return w / (w.x + w.y + w.z); }
+float twillH(vec2 g){ float d = fract(g.x + g.y); return smoothstep(0.0, 0.5, d) * smoothstep(1.0, 0.5, d) * 0.7 + (hash12(floor(g)) - 0.5) * 0.3; }
+float knitH(vec2 g){ float c = fract(g.x); float r = fract(g.y + abs(c - 0.5) * 0.9); return smoothstep(0.0, 0.5, r) * smoothstep(1.0, 0.5, r); }
+float plainH(vec2 g){ return 0.5 + 0.5 * cos(6.2831 * g.x) * cos(6.2831 * g.y); }
+float clothH(int kind, vec3 tp, vec3 w, float f){
+  if(kind == 0) return w.x * twillH(tp.yz * f) + w.y * twillH(tp.xz * f) + w.z * twillH(tp.xy * f);
+  if(kind == 1) return w.x * knitH(tp.yz * f) + w.y * knitH(tp.xz * f) + w.z * knitH(tp.xy * f);
+  return w.x * plainH(tp.yz * f) + w.y * plainH(tp.xz * f) + w.z * plainH(tp.xy * f);
+}
+// dashed topstitch: c = distance from the stitch line, t = position along it
+float stitch(float c, float t, float spacing){ return smoothstep(0.0022, 0.0008, abs(c)) * step(0.5, fract(t / spacing)); }
+// pixel lettering from the HUD font atlas (code = ASCII, c = pixel inside the 5x7 glyph, y down)
+float glyph(int code, vec2 c){
+  if(c.x < 0.0 || c.x >= 5.0 || c.y < 0.0 || c.y >= 7.0) return 0.0;
+  int i = code - 32, col = i % 16, row = i / 16;
+  return texelFetch(uFont, ivec2(col * 8 + int(c.x), row * 8 + int(c.y)), 0).r;
+}
+// the print on the back of the skater's tee: x = distance from the spine towards the viewer's left, y up (metres)
+float teePrint(vec2 q){
+  const int top[4] = int[4](79, 80, 85, 83);
+  const int low[8] = int[8](83, 75, 65, 84, 69, 32, 67, 79);
+  float px1 = 0.0095, px2 = 0.0046;
+  vec2 a = vec2((0.109 - q.x) / px1, (0.315 - q.y) / px1);
+  float r = 0.0;
+  if(a.y >= 0.0 && a.y < 7.0 && a.x >= 0.0 && a.x < 23.0){ int ci = int(floor(a.x / 6.0)); r = max(r, glyph(top[ci], vec2(mod(a.x, 6.0), a.y))); }
+  vec2 b = vec2((0.108 - q.x) / px2, (0.226 - q.y) / px2);
+  if(b.y >= 0.0 && b.y < 7.0 && b.x >= 0.0 && b.x < 47.0){ int ci = int(floor(b.x / 6.0)); r = max(r, glyph(low[ci], vec2(mod(b.x, 6.0), b.y))); }
+  return r;
+}
+
 void main(){
   vec3 n = normalize(vNrm);
   if(!gl_FrontFacing) n = -n;
   int m = vMat;
-  bool interior = m >= 32;          // shop interiors: room light instead of sun and sky
-  if(interior) m -= 32;
+  bool interior = (m & 64) != 0;    // shop interiors: room light instead of sun and sky
+  bool objTex = (m & 128) != 0;     // textured in object space (characters, board, cars)
+  m &= 63;
+  vec3 tp = objTex ? vTex : vPos;                                  // texture-space position
+  vec3 tnrm = objTex ? normalize(vNrmO) : n;                       // and normal
+  if(objTex && !gl_FrontFacing) tnrm = -tnrm;
+  vec3 tw = triW(tnrm);
+  float fwT = length(fwidth(tp));                                 // pixel footprint in texture space (metres)
+  float fine = 1.0 - smoothstep(0.0012, 0.0035, fwT);              // weave / grain detail fades out with distance
+  float mid = 1.0 - smoothstep(0.004, 0.015, fwT);                 // stitching and seams
+  float hModel = 0.0, sheen = 0.0, hairK = 0.0; vec3 sheenCol = vec3(0.0), flakeN = vec3(0.0);
+  // noise fields shared by all model materials (evaluated once: the shader compiles far faster than with a copy per material)
+#ifndef NO_NOISE
+  float nA = 0.0, nB = 0.0, nC = 0.0, nD = 0.0, clothv = 0.0;
+  if(m >= 32 || m == 15 || m == 25 || m == 27){
+    nA = fbm3(tp * 4.0 + 4.0);
+    nB = fbm3(tp * 11.0);
+    nC = fbm3(tp * 30.0);
+    nD = vn3(tp * 240.0);
+    if(m == 32 || m == 33 || m == 41 || m == 36) clothv = clothH(m == 32 ? 0 : (m == 36 ? 2 : 1), tp, tw, m == 32 ? 210.0 : (m == 36 ? 260.0 : 330.0));
+  }
+#else
+  float nA = 0.0, nB = 0.0, nC = 0.0, nD = 0.0, clothv = 0.0;
+#endif
+
   if((m == 11 || m == 29) && fenceCut(vPos, n, m)) discard;
   bool horiz = abs(n.y) > 0.6;
   vec2 uv; vec3 T, B;
   if(horiz){ uv = vPos.xz; T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 0.0, 1.0); }
   else if(abs(n.x) > abs(n.z)){ uv = vec2(vPos.z, vPos.y); T = vec3(0.0, 0.0, 1.0); B = vec3(0.0, 1.0, 0.0); }
   else { uv = vec2(vPos.x, vPos.y); T = vec3(1.0, 0.0, 0.0); B = vec3(0.0, 1.0, 0.0); }
+  if(objTex){   // moving models carry their surface pattern with them
+    vec3 an = abs(tnrm);
+    if(an.y > 0.6) uv = tp.xz; else if(an.x > an.z) uv = tp.zy; else uv = tp.xy;
+  }
   vec3 V = normalize(uCamPos - vPos);
   vec3 alb = toLin(vCol);
   float rough = 0.6, metal = 0.0, ao = 1.0, wrap = 0.0, trans = 0.0, f0 = 0.04, isGlass = 0.0, puddleOK = 0.0, porous = 1.0;
@@ -1154,16 +1244,48 @@ void main(){
     float s = step(0.5, fract(uv.x / 0.45));
     alb = mix(alb, toLin(vec3(0.92, 0.9, 0.86)), s);
     wrap = 0.3; trans = 0.35; rough = 0.9;
-  } else if(m == 15){ wrap = 0.45; trans = 0.12; rough = 0.52; porous = 0.0; }
+  } else if(m == 15){                                                  // skin
+    float blush = smoothstep(0.35, 0.7, nA);
+    float freck = step(0.985, hash13(floor(tp * 60.0))) * smoothstep(0.3, 0.6, nB);
+    vec3 sk = alb * mix(vec3(1.0), vec3(1.05, 0.95, 0.93), blush * 0.35) * (1.0 - 0.09 * freck);
+    alb = sk * (0.96 + 0.08 * nD * fine);
+    wrap = 0.5; trans = 0.22; rough = 0.5; f0 = 0.03; porous = 0.0;
+    sheen = 0.14; sheenCol = vec3(0.55, 0.42, 0.36);
+    hModel = (nD - 0.5) * 0.0005 * fine + (nC - 0.5) * 0.0006;
+  }
   else if(m == 16){ alb *= 0.9 + 0.15 * fbm(uv * 1.5); rough = 0.62; puddleOK = 1.0; }
   else if(m == 17){ alb *= 0.82 + 0.28 * fbm(uv * 1.7); alb *= 0.94 + 0.1 * vnoise(uv * 14.0); rough = 0.88; puddleOK = 0.5; }
   else if(m == 18){ float gn = vnoise(uv * 60.0 + vPos.y * 9.0); alb *= 0.84 + 0.32 * mix(0.5, gn, detail); rough = 0.36; }
   else if(m == 19){ alb *= 0.9 + 0.12 * vnoise(uv * 25.0); wrap = 0.25; rough = 0.95; }
   else if(m == 20){ rough = 0.38; alb *= 0.95 + 0.06 * vnoise(uv * 8.0); }
   else if(m == 22){ alb *= 0.72 + 0.4 * fbm(uv * 0.8); rough = 0.95; puddleOK = 1.0; }
-  else if(m == 25){ rough = 0.16; f0 = 0.05; porous = 0.0; }        // car paint (clear coat)
+  else if(m == 25){                                                  // car paint: flakes under a clear coat, shut lines, road grime
+    vec3 cell = floor(tp * 150.0);
+    float fl = hash13(cell);
+    vec3 fN = normalize(vec3(hash13(cell + 1.7), hash13(cell + 5.3), hash13(cell + 9.1)) - 0.5);
+    flakeN = fN * step(0.6, fl) * 0.2 * fine;
+    float peel = nB;
+    float dirt = smoothstep(0.6, 0.05, tp.y) * (0.3 + 0.7 * nA);
+    alb = alb * (0.92 + 0.1 * peel);
+    alb = mix(alb, alb * 0.45 + toLin(vec3(0.16, 0.13, 0.1)) * 0.3, dirt * 0.6);
+    float side = step(0.6, abs(tnrm.x)) * step(0.3, tp.y) * step(tp.y, 1.05);
+    float doors = side * max(smoothstep(0.006, 0.0015, abs(tp.z - 0.78)), max(smoothstep(0.006, 0.0015, abs(tp.z + 0.32)), smoothstep(0.006, 0.0015, abs(tp.z + 1.4))));
+    float hood = step(0.7, tnrm.y) * max(smoothstep(0.006, 0.0015, abs(tp.z - 0.95)), smoothstep(0.006, 0.0015, abs(tp.z + 1.85)));
+    float seamL = clamp(doors + hood, 0.0, 1.0);
+    alb *= 1.0 - 0.75 * seamL;
+    rough = mix(0.14, 0.5, dirt); f0 = 0.05; porous = 0.0;
+    hModel = (peel - 0.5) * 0.0012 - seamL * 0.002;
+  }
   else if(m == 26){ rough = 0.05; f0 = 0.06; alb *= 0.3; porous = 0.0; }
-  else if(m == 27){ rough = 0.8; alb *= 0.9 + 0.2 * vnoise(uv * 30.0); } // rubber, grip tape
+  else if(m == 27){                                                  // rubber: tyres and soles
+    rough = 0.82; alb *= 0.9 + 0.2 * nD;
+    if(objTex){
+      float tread = step(abs(tnrm.y), 0.45) * smoothstep(0.35, 0.5, abs(sin(tp.y * 75.0)));
+      float side = step(0.7, abs(tnrm.y)) * smoothstep(0.42, 0.5, abs(sin(length(tp.xz) * 210.0)));
+      alb *= 1.0 - 0.3 * tread - 0.08 * side;
+      hModel = -(tread * 0.0025) - side * 0.0004;
+    }
+  }
   else if(m == 28){ alb *= 0.7 + 0.5 * vnoise(vec2(uv.x * 18.0, uv.y * 2.5)); rough = 0.9; }  // bark
   else if(m == 30){                                                  // shelves stocked with goods
     vec2 g = uv / vec2(0.13, 0.3) + vec2(seedBase * 3.1, 0.0);
@@ -1188,6 +1310,94 @@ void main(){
     alb = mix(toLin(vec3(0.32)), alb, grout);
     rough = 0.3; f0 = 0.05; ao = mix(0.7, 1.0, grout);
   }
+#ifndef NO_MATS
+  else if(m == 32){                                                  // denim
+    float wash = nB;
+    float fade = smoothstep(0.35, 0.8, nA);
+    vec3 base = alb * (0.78 + 0.4 * wash);
+    base = mix(base, base * vec3(1.35, 1.3, 1.2), fade * 0.45);
+    float th = clothv;
+    base *= mix(1.0, 0.82 + 0.36 * th, fine);
+    float sideF = step(0.55, abs(tnrm.x));
+    float seam = smoothstep(0.004, 0.0015, abs(tp.z)) * sideF;
+    float st = stitch(abs(tp.z) - 0.011, tp.y, 0.012) * sideF;
+    base = mix(base, base * 0.6, seam);
+    base = mix(base, toLin(vec3(0.78, 0.6, 0.3)), st * 0.85 * mid);
+    float jm = exp(-tp.y * 16.0) + exp(-(0.44 - tp.y) * 16.0);          // creases gather at hip, knee and ankle
+    float wr = sin(tp.y * 95.0 + 5.0 * nA) * 0.5 + 0.5;
+    base *= 1.0 - 0.22 * jm * wr;
+    alb = base; rough = 0.88; wrap = 0.2; sheen = 0.25; sheenCol = alb * 1.2 + 0.05;
+    hModel = th * 0.0007 * fine + (wash - 0.5) * 0.0018 + seam * 0.0012 + jm * wr * 0.004;
+  } else if(m == 33 || m == 41){                                     // cotton jersey (41: with the back print)
+    float mott = nB;
+    vec3 base = alb * (0.86 + 0.3 * mott);
+    float kn = clothv;
+    base *= mix(1.0, 0.88 + 0.24 * kn, fine);
+    float seam = smoothstep(0.0035, 0.001, abs(tp.z)) * step(0.55, abs(tnrm.x));
+    base *= 1.0 - 0.25 * seam;
+    float folds = smoothstep(0.55, 0.85, nA);
+    base *= 1.0 - 0.16 * folds;
+    float pr = 0.0;
+    if(m == 41) pr = teePrint(tp.xy) * step(tnrm.z, -0.25);
+    base = mix(base, toLin(vec3(0.93, 0.92, 0.88)) * (0.95 + 0.08 * mott), pr);
+    alb = base; rough = mix(0.92, 0.6, pr); wrap = 0.25; sheen = 0.35 * (1.0 - pr); sheenCol = alb * 1.3 + 0.04;
+    hModel = kn * 0.0006 * fine + (mott - 0.5) * 0.0015 + folds * 0.003 - seam * 0.0008 + pr * 0.0007;
+  } else if(m == 34){                                                // skate shoe upper: canvas and suede with a rubber toe cap
+    float pb = nD, mott = nC;
+    vec3 base = alb * (0.88 + 0.22 * mott) * mix(1.0, 0.9 + 0.2 * pb, fine);
+    float toe = smoothstep(0.055, 0.066, tp.z) * step(tp.y, 0.048);
+    float toeSeam = smoothstep(0.004, 0.001, abs(tp.z - 0.06)) * step(tp.y, 0.05);
+    float band = step(0.0, tp.y) * step(tp.y, 0.012) * step(0.5, abs(tnrm.x));
+    base = mix(base, toLin(vec3(0.86, 0.84, 0.78)), toe * 0.92);
+    base = mix(base, toLin(vec3(0.86, 0.84, 0.78)), band * 0.85);
+    base *= 1.0 - 0.6 * toeSeam;
+    float heel = smoothstep(-0.1, -0.12, tp.z);
+    base *= 1.0 - 0.3 * heel;
+    float dirt = smoothstep(-0.004, -0.032, tp.y) * (0.45 + nC);
+    base = mix(base, base * 0.45 + toLin(vec3(0.2, 0.16, 0.12)) * 0.3, clamp(dirt, 0.0, 1.0) * 0.7);
+    alb = base; rough = mix(0.8, 0.5, toe); wrap = 0.1;
+    hModel = (pb - 0.5) * 0.0008 * fine + toe * 0.0012 - toeSeam * 0.0015;
+  } else if(m == 35){                                                // hair: strands with an anisotropic highlight
+    float ang = atan(tp.z, tp.x);
+    float strand = vnoise(vec2(ang * 22.0, tp.y * 6.0)) * 0.6 + vnoise(vec2(ang * 70.0, tp.y * 12.0)) * 0.4;
+    alb = alb * (0.55 + 0.9 * strand);
+    rough = 0.42; wrap = 0.2; hairK = 0.7;
+    hModel = (strand - 0.5) * 0.004;
+  } else if(m == 36){                                                // twill cap, canvas bag, laces
+    float mott = nB;
+    vec3 base = alb * (0.88 + 0.22 * mott);
+    float cv = clothv;
+    base *= mix(1.0, 0.85 + 0.3 * cv, fine);
+    float panel = smoothstep(0.004, 0.001, abs(sin(atan(tp.z, tp.x) * 3.0))) * step(0.03, tp.y);
+    base *= 1.0 - 0.3 * panel;
+    alb = base; rough = 0.9; wrap = 0.2; sheen = 0.2; sheenCol = alb * 1.2 + 0.03;
+    hModel = cv * 0.0006 * fine + (mott - 0.5) * 0.0012 - panel * 0.0012;
+  } else if(m == 37){                                                // grip tape
+    float g = hash13(floor(tp * 700.0));
+    alb = alb * (0.7 + 0.6 * g);
+    rough = 0.96; hModel = (g - 0.5) * 0.0012 * fine;
+  } else if(m == 38){                                                // deck underside graphics
+    float design = hash13(floor(alb * 255.0 + 0.5));
+    vec2 q = tp.xz;
+    vec3 c2 = vec3(alb.b, alb.r, alb.g) * 0.8 + 0.05;
+    float mask;
+    if(design < 0.33) mask = smoothstep(0.0, 0.01, sin(q.y * 26.0 + q.x * 12.0));
+    else if(design < 0.66) mask = step(length(q * vec2(1.6, 0.5)), 0.11) + step(0.0, sin(q.y * 40.0)) * 0.35;
+    else mask = step(0.5, fract(q.y * 6.0 + step(0.0, q.x)));
+    alb = mix(alb, c2, clamp(mask, 0.0, 1.0));
+    rough = 0.35; f0 = 0.05;
+  } else if(m == 39){                                                // urethane wheels
+    alb *= 0.95 + 0.05 * nD;
+    rough = 0.3; f0 = 0.05; wrap = 0.1; sheen = 0.1; sheenCol = vec3(0.3);
+  } else if(m == 40){                                                // feathers
+    float cellR = hash13(floor(tp * 140.0));
+    float sc = nD;
+    float bar = smoothstep(0.45, 0.6, nC);
+    alb = alb * (0.78 + 0.45 * cellR) * (1.0 - 0.3 * bar);
+    rough = 0.55; wrap = 0.3; sheen = 0.25; sheenCol = alb * 1.3 + vec3(0.03, 0.05, 0.04);
+    hModel = (sc - 0.5) * 0.0012;
+  }
+#endif
 
   // ---- bump mapping: procedural height, finite differences along the surface axes
   vec3 N = n;
@@ -1199,6 +1409,19 @@ void main(){
     vec3 g = (T * (hx - h0) + B * (hy - h0)) / E;
     N = normalize(n - g * bumpFade);
   }
+#ifndef NO_DERIV
+  {   // model materials: bump from screen-space derivatives of the object-space height
+    float dhx = dFdx(hModel), dhy = dFdy(hModel);
+    if(m >= 32 || m == 15 || m == 25 || m == 27){
+      vec3 sx = dFdx(vPos), sy = dFdy(vPos);
+      vec3 r1 = cross(sy, N), r2 = cross(N, sx);
+      float det = dot(sx, r1);
+      vec3 sg = sign(det) * (dhx * r1 + dhy * r2);
+      N = normalize(abs(det) * N - sg);
+    }
+    if(flakeN != vec3(0.0)) N = normalize(N + flakeN);
+  }
+#endif
   if(!horiz) ao *= mix(0.82, 1.0, smoothstep(0.0, 1.2, vPos.y + 0.1));
 
   // ---- rain: darker, glossier surfaces and standing water with ripples
@@ -1234,11 +1457,17 @@ void main(){
   vec3 Fs = F0 + (1.0 - F0) * schlick5(dot(V, Hh));
   vec3 spec = a2 / (PI * dd * dd) * gv * (NdotL / (NdotL * (1.0 - kk) + kk)) * Fs / max(4.0 * NdotV * NdotL, 1e-4);
   vec3 col = (diffC * dif + spec * PI * NdotL) * uSunCol * sh;
+  if(hairK > 0.0){   // Kajiya-Kay style highlight, strands running down the surface
+    vec3 Th = normalize(vec3(0.0, -1.0, 0.0) - n * dot(vec3(0.0, -1.0, 0.0), n) + 1e-4);
+    float tdh = dot(Th, Hh);
+    col += uSunCol * sh * pow(sqrt(max(1.0 - tdh * tdh, 0.0)), 50.0) * hairK * 0.35 * clamp(ndlG + 0.3, 0.0, 1.0);
+  }
   if(trans > 0.0) col += diffC * uSunCol * trans * pow(max(dot(-V, uSunDir), 0.0), 4.0) * mix(0.3, 1.0, sh);
   float ssao = uUseAO == 1 ? texture(uAO, gl_FragCoord.xy * uInvRes).r : 1.0;
   float occ = ao * ssao;
   float ambK = interior ? 0.14 : 1.0;
   col += diffC * mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ * ambK;
+  if(sheen > 0.0) col += sheenCol * sheen * pow(clamp(1.0 - NdotV, 0.0, 1.0), 3.0) * (mix(uGroundCol, uSkyUp, N.y * 0.5 + 0.5) * occ * ambK + uSunCol * sh * 0.5);
   if(interior) col += diffC * uIntGlow * occ * (0.7 + 0.3 * N.y) * vec3(1.0, 0.93, 0.82);
   vec3 R = reflect(-V, N);
   vec3 env = skyEnv(R, rough * 7.0) * ambK;
@@ -1291,7 +1520,7 @@ void main(){ vPos = aPos; vMat = int(aMat+0.5); gl_Position = uLightVP * vec4(aP
 static const char* SHADOW_FS = R"(#version 330 core
 in vec3 vPos; flat in int vMat;
 void main(){
-  if(vMat >= 32) discard;    // shop interiors sit inside closed walls
+  if((vMat & 64) != 0) discard;    // shop interiors sit inside closed walls
   if(vMat == 11){            // chain-link casts a diamond shadow
     vec2 q = vec2(vPos.x + vPos.z, vPos.y) * 14.0;
     vec2 r = vec2(q.x + q.y, q.x - q.y);
@@ -2427,6 +2656,7 @@ static void carSection(MeshBuilder& mb, const M4& F, const float (*pts)[2], int 
 static void carGeom(MeshBuilder& mb, const M4& F, int type, Col body, float brake = 0) {
     float L = type == 3 ? 2.6f : 2.45f, Wd = 0.95f;
     Col glass = hexc(0x1a232c), trim = hexc(0x1c1c1e), tire = hexc(0x161616), chrome = hexc(0xb8bcc2);
+    mb.beginObj(F);   // paint flakes, shut lines and road grime are textured in the car's own space
     if (type != 3) {
         float lower[8][2] = {{L - 0.05f, 0.3f}, {L + 0.02f, 0.62f}, {L - 0.3f, 0.83f}, {0.85f, 0.95f},
                              {-L + 0.38f, 0.96f}, {-L, 0.84f}, {-L - 0.02f, 0.58f}, {-L + 0.05f, 0.3f}};
@@ -2454,19 +2684,46 @@ static void carGeom(MeshBuilder& mb, const M4& F, int type, Col body, float brak
         }
     }
     // bumpers, grille, lights
+    mb.endObj();
     mb.box(F * mTranslate(V3(0, 0.4f, L + 0.02f)), V3(Wd + 0.02f, 0.1f, 0.07f), trim, MAT_RUBBER);
     mb.box(F * mTranslate(V3(0, 0.4f, -L - 0.02f)), V3(Wd + 0.02f, 0.1f, 0.07f), trim, MAT_RUBBER);
+    mb.beginObj(F);
     mb.box(F * mTranslate(V3(0, 0.63f, L + 0.015f)), V3(0.42f, 0.09f, 0.02f), type == 2 ? chrome : trim, MAT_METAL);
     for (int sg = -1; sg <= 1; sg += 2) {
         mb.box(F * mTranslate(V3(sg * 0.66f, 0.66f, L + 0.02f)), V3(0.19f, 0.07f, 0.02f), hexc(0xfff4d8), MAT_EMISSIVE);
         mb.box(F * mTranslate(V3(sg * 0.68f, 0.74f, -L - 0.03f)), V3(0.17f, 0.07f, 0.02f), brake > 0.5f ? hexc(0xff2a1a) : hexc(0x9a1410), MAT_EMISSIVE);
+    }
+    // licence plates and door handles
+    {
+        uint32_t h = (uint32_t)body.r * 73856093u ^ (uint32_t)body.g * 19349663u ^ (uint32_t)body.b * 83492791u ^ (uint32_t)(type + 1) * 2654435761u;
+        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+        std::string plate;
+        for (int k = 0; k < 3; k++) { plate += (char)('A' + h % 26); h = h / 26 + 12345u * (k + 1); }
+        plate += ' ';
+        for (int k = 0; k < 3; k++) { plate += (char)('0' + h % 10); h = h / 10 + 777u * (k + 1); }
+        Col plateCol = hexc(0xe6e2d2), ink = hexc(0x1c2a48);
+        float px = 0.0072f, tw = textWidth3D(plate, px);
+        for (int e = 0; e < 2; e++) {
+            float zs = e == 0 ? 1.f : -1.f;
+            V3 pc = xPoint(F, V3(0, 0.4f, zs * (L + 0.093f)));
+            V3 right = xDir(F, V3(zs, 0, 0)), up = xDir(F, V3(0, 1, 0));
+            mb.box(F * mTranslate(V3(0, 0.4f, zs * (L + 0.093f))), V3(0.17f, 0.085f, 0.005f), plateCol, MAT_PLAIN);
+            mb.text3D(plate, pc - right * (tw * 0.5f) - up * (3.5f * px) + xDir(F, V3(0, 0, zs)) * 0.0056f, right, up, px, ink, MAT_PLAIN);
+        }
+        for (int sg = -1; sg <= 1; sg += 2) {
+            mb.box(F * mTranslate(V3(sg * (Wd + 0.012f), 0.87f, type == 3 ? L - 1.55f : 0.45f)), V3(0.012f, 0.012f, 0.07f), chrome, MAT_METAL);
+            if (type != 3) mb.box(F * mTranslate(V3(sg * (Wd + 0.012f), 0.87f, -0.62f)), V3(0.012f, 0.012f, 0.07f), chrome, MAT_METAL);
+        }
     }
     // wheels with dark wheel wells and hub caps
     float wz = type == 3 ? L * 0.66f : L * 0.62f;
     for (int i = 0; i < 4; i++) {
         float sg = (i & 1) ? 1.f : -1.f, sz = (i & 2) ? wz : -wz;
         V3 c(sg * (Wd + 0.03f), 0.33f, sz);
-        mb.cylinder(F * mTranslate(c) * mRotZ(sg * PI / 2), 0.33f, 0.24f, 16, tire, MAT_RUBBER, true);
+        M4 WF = F * mTranslate(c) * mRotZ(sg * PI / 2);
+        mb.beginObj(WF);   // tread and sidewall rings follow the wheel
+        mb.cylinder(WF, 0.33f, 0.24f, 16, tire, MAT_RUBBER, true);
+        mb.beginObj(F);
         mb.cylinder(F * mTranslate(c + V3(sg * 0.012f, 0, 0)) * mRotZ(-sg * PI / 2), 0.19f, 0.012f, 12, chrome, MAT_METAL, true);
         V3 wc = xPoint(F, V3(sg * (Wd + 0.004f), 0.33f, sz));
         for (int k = 0; k < 8; k++) {
@@ -2481,6 +2738,7 @@ static void carGeom(MeshBuilder& mb, const M4& F, int type, Col body, float brak
             for (int sg = -1; sg <= 1; sg += 2)
                 mb.box(F * mTranslate(V3(sg * (Wd + 0.006f), 0.74f + (k & 1) * 0.04f, -1.9f + k * 0.2f)), V3(0.004f, 0.02f, 0.1f), hexc(0x111111), MAT_PLAIN);
     }
+    mb.endObj();
 }
 
 static void parkedCar(float x, float z, float yaw, int type, Col body) {
@@ -2510,7 +2768,6 @@ static const float SH = 0.15f;   // sidewalk height
 // surfaces carry the interior flag (material + 32): the shader lights them with room light instead of
 // sun and sky, and they cast no shadows.
 // ----------------------------------------------------------------------------
-static const uint8_t INT_FLAG = 32;
 static void shopPerson(const M4& M, uint32_t seed, int pose);   // defined once the character code exists
 
 enum ShopKind { SK_GROCERY = 0, SK_DINER, SK_CAFE, SK_SALON, SK_RETAIL, SK_LAUNDRO, SK_SKATE, SK_RECORDS, SK_PAWN, SK_BANK };
@@ -5784,7 +6041,7 @@ struct Outfit {
     Col hat = hexc(0x1b1b1b), hair = hexc(0x2a1a10), bagCol = hexc(0x3a2a1a);
     int hat_ = 2;          // 0 none, 1 cap forward, 2 cap backwards, 3 beanie
     float height = 1.f;
-    bool bag = false, longSleeves = false, baggy = true;
+    bool bag = false, longSleeves = false, baggy = true, print = false;   // print: logo tee
 };
 struct Pose {
     V3 pelvis = V3(0.03f, 0.88f, 0);
@@ -5811,7 +6068,18 @@ static V3 ikJoint(V3 a, V3 target, float l1, float l2, V3 hint, V3& end) {
     return a + dn * x + hp * h;
 }
 
-// Blocky low-detail figure for distant pedestrians
+// Frame for texturing a limb in its own space: origin at a, y running a -> b, x across (as close to 'side' as possible).
+static M4 limbFrame(V3 a, V3 b, V3 side) {
+    V3 ay = b - a;
+    float L = len(ay);
+    ay = L > 1e-5f ? ay / L : V3(0, -1, 0);
+    V3 ax = side - ay * dot(side, ay);
+    if (len(ax) < 1e-4f) ax = std::fabs(ay.y) < 0.9f ? cross(ay, V3(0, 1, 0)) : cross(ay, V3(1, 0, 0));
+    ax = norm(ax);
+    return mBasis(ax, ay, cross(ax, ay), a);
+}
+
+// Blocky low-detail figure for distant pedestrians. Every part is textured in its own object space.
 static void drawHumanLow(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit& o) {
     float s = o.height;
     auto W = [&](V3 v) { return xPoint(M, v); };
@@ -5831,36 +6099,45 @@ static void drawHumanLow(MeshBuilder& mb, const M4& M, const Pose& p, const Outf
         V3 end;
         V3 hint = p.kneeHint + left * (0.25f * sg);
         V3 knee = ikJoint(hip, ankle, 0.44f * s, 0.44f * s, hint, end);
-        mb.limb(W(hip), W(knee), legW * s, legW * s, WD(left), o.pants, MAT_CLOTH);
-        mb.limb(W(knee), W(end), (legW - 0.02f) * s, (legW - 0.02f) * s, WD(left), o.pants, MAT_CLOTH);
+        mb.beginObj(limbFrame(W(hip), W(knee), WD(left)));
+        mb.limb(W(hip), W(knee), legW * s, legW * s, WD(left), o.pants, MAT_DENIM);
+        mb.beginObj(limbFrame(W(knee), W(end), WD(left)));
+        mb.limb(W(knee), W(end), (legW - 0.02f) * s, (legW - 0.02f) * s, WD(left), o.pants, MAT_DENIM);
         float fy = k == 0 ? p.footYawL : p.footYawR;
         V3 fdir(-std::cos(fy), 0, std::sin(fy));
         V3 fside = cross(V3(0, 1, 0), fdir);
         V3 fc = end + V3(0, -0.04f * s, 0) + fdir * (0.07f * s);
-        mb.box(mBasis(WD(fside), WD(V3(0, 1, 0)), WD(fdir), W(fc)), V3(0.065f * s, 0.05f * s, 0.155f * s), o.shoes, MAT_CLOTH);
+        M4 SB = mBasis(WD(fside), WD(V3(0, 1, 0)), WD(fdir), W(fc));
+        mb.beginObj(SB * mTranslate(V3(0, -0.035f * s, 0)));
+        mb.box(SB, V3(0.065f * s, 0.05f * s, 0.155f * s), o.shoes, MAT_LEATHER);
+        mb.endObj();
     }
     // hips + torso
-    mb.box(mBasis(WD(left), WD(V3(0, 1, 0)), WD(xDir(Rp, V3(-1, 0, 0))), W(pel)), V3(0.19f * s, 0.1f * s, 0.13f * s), o.pants, MAT_CLOTH);
+    M4 PF = mBasis(WD(left), WD(V3(0, 1, 0)), WD(xDir(Rp, V3(-1, 0, 0))), W(pel));
+    mb.beginObj(PF);
+    mb.box(PF, V3(0.19f * s, 0.1f * s, 0.13f * s), o.pants, MAT_DENIM);
     V3 chestC = pel + tUp * (0.3f * s);
-    mb.box(mBasis(WD(tLeft), WD(tUp), WD(tFwd), W(chestC)), V3(0.2f * s, 0.26f * s, 0.125f * s), o.shirt, MAT_CLOTH);
+    mb.beginObj(mBasis(WD(tLeft), WD(tUp), WD(tFwd), W(pel)));
+    mb.box(mBasis(WD(tLeft), WD(tUp), WD(tFwd), W(chestC)), V3(0.2f * s, 0.26f * s, 0.125f * s), o.shirt, o.print ? MAT_TEE : MAT_KNIT);
     V3 neck = pel + tUp * (0.56f * s);
     // head
     M4 Rh = Rt * mRotY(p.headYaw) * mRotZ(p.headPitch);
     V3 hUp = xDir(Rh, V3(0, 1, 0)), hLeft = xDir(Rh, V3(0, 0, 1)), hFwd = xDir(Rh, V3(-1, 0, 0));
     V3 headC = neck + hUp * (0.14f * s);
-    mb.limb(W(neck - tUp * 0.02f), W(neck + hUp * 0.06f * s), 0.08f * s, 0.08f * s, WD(tLeft), o.skin, MAT_SKIN);
     M4 HB = mBasis(WD(hLeft), WD(hUp), WD(hFwd), W(headC));
+    mb.beginObj(HB);
+    mb.limb(W(neck - tUp * 0.02f), W(neck + hUp * 0.06f * s), 0.08f * s, 0.08f * s, WD(tLeft), o.skin, MAT_SKIN);
     mb.box(HB, V3(0.1f * s, 0.12f * s, 0.11f * s), o.skin, MAT_SKIN);
     mb.box(HB * mTranslate(V3(0.035f * s, 0.025f * s, 0.112f * s)), V3(0.018f * s, 0.012f * s, 0.004f * s), hexc(0x151515), MAT_PLAIN);
     mb.box(HB * mTranslate(V3(-0.035f * s, 0.025f * s, 0.112f * s)), V3(0.018f * s, 0.012f * s, 0.004f * s), hexc(0x151515), MAT_PLAIN);
     if (o.hat_ == 0) {
-        mb.box(HB * mTranslate(V3(0, 0.1f * s, -0.01f * s)), V3(0.105f * s, 0.035f * s, 0.115f * s), o.hair, MAT_CLOTH);
+        mb.box(HB * mTranslate(V3(0, 0.1f * s, -0.01f * s)), V3(0.105f * s, 0.035f * s, 0.115f * s), o.hair, MAT_HAIR);
     } else if (o.hat_ == 3) {
-        mb.box(HB * mTranslate(V3(0, 0.1f * s, -0.005f * s)), V3(0.11f * s, 0.06f * s, 0.12f * s), o.hat, MAT_CLOTH);
+        mb.box(HB * mTranslate(V3(0, 0.1f * s, -0.005f * s)), V3(0.11f * s, 0.06f * s, 0.12f * s), o.hat, MAT_CANVAS);
     } else {
-        mb.box(HB * mTranslate(V3(0, 0.105f * s, 0)), V3(0.108f * s, 0.04f * s, 0.118f * s), o.hat, MAT_CLOTH);
+        mb.box(HB * mTranslate(V3(0, 0.105f * s, 0)), V3(0.108f * s, 0.04f * s, 0.118f * s), o.hat, MAT_CANVAS);
         float bz = o.hat_ == 1 ? 0.16f : -0.16f;
-        mb.box(HB * mTranslate(V3(0, 0.08f * s, bz * s)), V3(0.085f * s, 0.01f * s, 0.07f * s), o.hat, MAT_CLOTH);
+        mb.box(HB * mTranslate(V3(0, 0.08f * s, bz * s)), V3(0.085f * s, 0.01f * s, 0.07f * s), o.hat, MAT_CANVAS);
     }
     // arms
     for (int k = 0; k < 2; k++) {
@@ -5870,19 +6147,26 @@ static void drawHumanLow(MeshBuilder& mb, const M4& M, const Pose& p, const Outf
         V3 hint = k == 0 ? p.elbowHintL : p.elbowHintR;
         V3 end;
         V3 elbow = ikJoint(sh, hand, 0.29f * s, 0.27f * s, hint, end);
-        mb.limb(W(sh), W(elbow), 0.12f * s, 0.12f * s, WD(tFwd), o.shirt, MAT_CLOTH);
-        mb.limb(W(elbow), W(end), 0.085f * s, 0.085f * s, WD(tFwd), o.longSleeves ? o.shirt : o.skin, o.longSleeves ? MAT_CLOTH : MAT_SKIN);
+        mb.beginObj(limbFrame(W(sh), W(elbow), WD(tLeft)));
+        mb.limb(W(sh), W(elbow), 0.12f * s, 0.12f * s, WD(tFwd), o.shirt, MAT_KNIT);
+        mb.beginObj(limbFrame(W(elbow), W(end), WD(tLeft)));
+        mb.limb(W(elbow), W(end), 0.085f * s, 0.085f * s, WD(tFwd), o.longSleeves ? o.shirt : o.skin, o.longSleeves ? MAT_KNIT : MAT_SKIN);
         V3 hd = norm(end - elbow);
+        mb.beginObj(limbFrame(W(end), W(end + hd * (0.09f * s)), WD(tLeft)));
         mb.limb(W(end), W(end + hd * (0.09f * s)), 0.08f * s, 0.05f * s, WD(tFwd), o.skin, MAT_SKIN);
     }
     if (o.bag) {
         V3 bc = pel + left * (-0.26f * s) + V3(0, -0.1f * s, 0);
-        mb.box(mBasis(WD(left), WD(V3(0, 1, 0)), WD(xDir(Rp, V3(-1, 0, 0))), W(bc)), V3(0.05f * s, 0.16f * s, 0.2f * s), o.bagCol, MAT_CLOTH);
+        M4 BG = mBasis(WD(left), WD(V3(0, 1, 0)), WD(xDir(Rp, V3(-1, 0, 0))), W(bc));
+        mb.beginObj(BG);
+        mb.box(BG, V3(0.05f * s, 0.16f * s, 0.2f * s), o.bagCol, MAT_CANVAS);
     }
+    mb.endObj();
 }
 
 // Draw a figure. M maps character space to world. Pose values are in character space (metres, unscaled).
 // Smooth capsule limbs, a shaped torso and a head with a face; 'lod' picks the blocky version.
+// Each body part is textured in its own object space (denim, jersey, skin, hair, canvas...) so the cloth stays on the model.
 static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit& o, bool lod = false) {
     if (lod) { drawHumanLow(mb, M, p, o); return; }
     float s = o.height;
@@ -5894,6 +6178,8 @@ static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit&
     M4 Rt = mRotY(p.pelvisYaw + p.twist) * mRotZ(p.lean) * mRotX(p.side);
     V3 tUp = xDir(Rt, V3(0, 1, 0)), tLeft = xDir(Rt, V3(0, 0, 1)), tFwd = xDir(Rt, V3(-1, 0, 0));
     Col sole = hexc(0xefeee8), lace = shade(o.shoes, 0.8f);
+    bool darkShoe = (int)o.shoes.r + o.shoes.g + o.shoes.b < 330;
+    Col laceBar = darkShoe ? hexc(0xd8d4c8) : hexc(0x34322e);
     // legs: thigh + shin capsules, chunky skate shoes
     float thighR = (o.baggy ? 0.095f : 0.078f) * s, kneeR = (o.baggy ? 0.085f : 0.06f) * s, ankleR = (o.baggy ? 0.083f : 0.05f) * s;
     for (int k = 0; k < 2; k++) {
@@ -5904,51 +6190,66 @@ static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit&
         V3 end;
         V3 hint = p.kneeHint + left * (0.25f * sg);
         V3 knee = ikJoint(hip, ankle, 0.44f * s, 0.44f * s, hint, end);
-        mb.capsule(W(hip), W(knee), thighR, kneeR, WD(left), o.pants, MAT_CLOTH, 1.f, 0.6f);
-        mb.capsule(W(knee), W(end), kneeR * 0.97f, ankleR, WD(left), o.pants, MAT_CLOTH, 1.f, 0.6f);
+        mb.beginObj(limbFrame(W(hip), W(knee), WD(left)));
+        mb.capsule(W(hip), W(knee), thighR, kneeR, WD(left), o.pants, MAT_DENIM, 1.f, 0.6f);
+        mb.beginObj(limbFrame(W(knee), W(end), WD(left)));
+        mb.capsule(W(knee), W(end), kneeR * 0.97f, ankleR, WD(left), o.pants, MAT_DENIM, 1.f, 0.6f);
+        V3 shinUp = norm(knee - end);   // turned-up cuff just above the shoe
+        mb.capsule(W(end + shinUp * (0.075f * s)), W(end + shinUp * (0.005f * s)), ankleR * 1.07f, ankleR * 1.09f, WD(left), shade(o.pants, 1.12f), MAT_DENIM, 1.f, 0.15f, 10);
         float fy = k == 0 ? p.footYawL : p.footYawR;
         V3 fdir(-std::cos(fy), 0, std::sin(fy));
         V3 fside = cross(V3(0, 1, 0), fdir);
         V3 fc = end + V3(0, -0.035f * s, 0) + fdir * (0.065f * s);
         M4 SB = mBasis(WD(fside), WD(V3(0, 1, 0)), WD(fdir), W(fc));
         // rounded upper, a sole that follows the same outline (no square corners), a tongue over the laces
-        mb.sphere(SB * mTranslate(V3(0, 0.014f * s, 0)), V3(0.06f * s, 0.05f * s, 0.138f * s), 12, 7, o.shoes, MAT_CLOTH);
+        mb.beginObj(SB);
+        mb.sphere(SB * mTranslate(V3(0, 0.014f * s, 0)), V3(0.06f * s, 0.05f * s, 0.138f * s), 12, 7, o.shoes, MAT_LEATHER);
+        mb.sphere(SB * mTranslate(V3(0, 0.05f * s, 0.03f * s)), V3(0.036f * s, 0.016f * s, 0.06f * s), 8, 4, lace, MAT_CANVAS);
+        for (int i = 0; i < 3; i++)
+            mb.box(SB * mTranslate(V3(0, 0.0645f * s, (0.0f + 0.027f * i) * s)), V3(0.03f * s, 0.0035f * s, 0.0045f * s), laceBar, MAT_CANVAS);
+        mb.endObj();
         mb.capsule(W(fc - fdir * (0.085f * s) + V3(0, -0.018f * s, 0)), W(fc + fdir * (0.085f * s) + V3(0, -0.018f * s, 0)),
                    0.06f * s, 0.056f * s, WD(fside), sole, MAT_RUBBER, 0.3f, 1.f, 12);
-        mb.sphere(SB * mTranslate(V3(0, 0.05f * s, 0.03f * s)), V3(0.036f * s, 0.016f * s, 0.06f * s), 8, 4, lace, MAT_CLOTH);
     }
     // hips + torso
-    mb.sphere(mBasis(WD(left), WD(V3(0, 1, 0)), WD(pfwd), W(pel + V3(0, 0.01f * s, 0))), V3(0.185f * s, 0.12f * s, 0.125f * s), 10, 6, o.pants, MAT_CLOTH);
+    M4 PF = mBasis(WD(left), WD(V3(0, 1, 0)), WD(pfwd), W(pel));
+    mb.beginObj(PF);
+    mb.sphere(mBasis(WD(left), WD(V3(0, 1, 0)), WD(pfwd), W(pel + V3(0, 0.01f * s, 0))), V3(0.185f * s, 0.12f * s, 0.125f * s), 10, 6, o.pants, MAT_DENIM);
     V3 waist = pel + tUp * (0.1f * s), chestTop = pel + tUp * (0.46f * s);
-    mb.capsule(W(waist), W(chestTop), 0.165f * s, 0.2f * s, WD(tLeft), o.shirt, MAT_CLOTH, 0.62f, 0.45f, 12);
-    mb.capsule(W(pel + tUp * (0.04f * s)), W(waist), 0.172f * s, 0.168f * s, WD(tLeft), shade(o.shirt, 0.93f), MAT_CLOTH, 0.66f, 0.3f, 12);   // shirt hem
+    M4 TF = mBasis(WD(tLeft), WD(tUp), WD(tFwd), W(pel));   // torso space: x to the wearer's left, y up, z forward
+    mb.beginObj(TF);
+    mb.capsule(W(waist), W(chestTop), 0.165f * s, 0.2f * s, WD(tLeft), o.shirt, o.print ? MAT_TEE : MAT_KNIT, 0.62f, 0.45f, 12);
+    mb.capsule(W(pel + tUp * (0.04f * s)), W(waist), 0.172f * s, 0.168f * s, WD(tLeft), shade(o.shirt, 0.93f), MAT_KNIT, 0.66f, 0.3f, 12);   // shirt hem
     V3 neck = pel + tUp * (0.56f * s);
+    mb.capsule(W(chestTop - tUp * (0.01f * s)), W(chestTop + tUp * (0.035f * s)), 0.078f * s, 0.066f * s, WD(tLeft), shade(o.shirt, 0.82f), MAT_KNIT, 0.9f, 0.25f, 10);   // ribbed collar
     // head
     M4 Rh = Rt * mRotY(p.headYaw) * mRotZ(p.headPitch);
     V3 hUp = xDir(Rh, V3(0, 1, 0)), hLeft = xDir(Rh, V3(0, 0, 1)), hFwd = xDir(Rh, V3(-1, 0, 0));
     V3 headC = neck + hUp * (0.14f * s);
     mb.capsule(W(neck - tUp * (0.07f * s)), W(neck + hUp * (0.06f * s)), 0.052f * s, 0.048f * s, WD(tLeft), o.skin, MAT_SKIN, 1.f, 0.5f, 8);
     M4 HB = mBasis(WD(hLeft), WD(hUp), WD(hFwd), W(headC));
+    mb.beginObj(HB);
     auto part = [&](V3 c, V3 r, Col col, uint8_t mat, int seg = 8, int rings = 5) { mb.sphere(HB * mTranslate(c * s), r * s, seg, rings, col, mat); };
     part(V3(0, 0, 0), V3(0.094f, 0.115f, 0.104f), o.skin, MAT_SKIN, 12, 8);
     part(V3(0, -0.06f, 0.035f), V3(0.075f, 0.05f, 0.07f), o.skin, MAT_SKIN);                  // jaw
     part(V3(0, -0.005f, 0.103f), V3(0.016f, 0.026f, 0.022f), shade(o.skin, 0.95f), MAT_SKIN, 6, 4);   // nose
     for (int e = -1; e <= 1; e += 2) {
-        part(V3(e * 0.036f, 0.022f, 0.093f), V3(0.014f, 0.01f, 0.008f), hexc(0x141210), MAT_PLAIN, 6, 3);        // eyes
-        part(V3(e * 0.038f, 0.047f, 0.096f), V3(0.02f, 0.005f, 0.006f), o.hair, MAT_CLOTH, 6, 3);                  // brows
+        part(V3(e * 0.036f, 0.013f, 0.09f), V3(0.0135f, 0.0075f, 0.009f), hexc(0xe0dcd2), MAT_PLAIN, 8, 4);      // whites of the eyes
+        part(V3(e * 0.037f, 0.013f, 0.096f), V3(0.0075f, 0.0075f, 0.0065f), hexc(0x1a120c), MAT_PLAIN, 6, 3);   // irises
+        part(V3(e * 0.038f, 0.047f, 0.096f), V3(0.02f, 0.005f, 0.006f), o.hair, MAT_HAIR, 6, 3);                  // brows
         part(V3(e * 0.095f, 0.0f, -0.005f), V3(0.016f, 0.03f, 0.022f), shade(o.skin, 0.92f), MAT_SKIN, 6, 4);    // ears
     }
     part(V3(0, -0.052f, 0.094f), V3(0.024f, 0.005f, 0.006f), shade(o.skin, 0.6f), MAT_SKIN, 6, 3);                 // mouth
     if (o.hat_ == 0) {
-        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.1f, 0.112f), o.hair, MAT_CLOTH, 12, 7);
+        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.1f, 0.112f), o.hair, MAT_HAIR, 12, 7);
     } else if (o.hat_ == 3) {
-        part(V3(0, 0.05f, -0.01f), V3(0.108f, 0.098f, 0.117f), o.hat, MAT_CLOTH, 12, 7);
-        mb.capsule(W(headC + hUp * (0.02f * s)), W(headC + hUp * (0.05f * s)), 0.108f * s, 0.108f * s, WD(hLeft), shade(o.hat, 0.85f), MAT_CLOTH, 1.08f, 0.1f, 12);
+        part(V3(0, 0.05f, -0.01f), V3(0.108f, 0.098f, 0.117f), o.hat, MAT_CANVAS, 12, 7);
+        mb.capsule(W(headC + hUp * (0.02f * s)), W(headC + hUp * (0.05f * s)), 0.108f * s, 0.108f * s, WD(hLeft), shade(o.hat, 0.85f), MAT_CANVAS, 1.08f, 0.1f, 12);
     } else {
-        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.09f, 0.112f), o.hair, MAT_CLOTH, 10, 6);
-        part(V3(0, 0.062f, -0.004f), V3(0.107f, 0.075f, 0.116f), o.hat, MAT_CLOTH, 12, 7);
+        part(V3(0, 0.035f, -0.014f), V3(0.103f, 0.09f, 0.112f), o.hair, MAT_HAIR, 10, 6);
+        part(V3(0, 0.062f, -0.004f), V3(0.107f, 0.075f, 0.116f), o.hat, MAT_CANVAS, 12, 7);
         float bz = o.hat_ == 1 ? 0.14f : -0.14f;
-        part(V3(0, 0.07f, bz), V3(0.08f, 0.011f, 0.075f), shade(o.hat, 0.9f), MAT_CLOTH, 10, 3);
+        part(V3(0, 0.07f, bz), V3(0.08f, 0.011f, 0.075f), shade(o.hat, 0.9f), MAT_CANVAS, 10, 3);
     }
     // arms: sleeve, forearm, hand
     for (int k = 0; k < 2; k++) {
@@ -5959,23 +6260,29 @@ static void drawHuman(MeshBuilder& mb, const M4& M, const Pose& p, const Outfit&
         V3 end;
         V3 elbow = ikJoint(sh, hand, 0.29f * s, 0.27f * s, hint, end);
         Col fore = o.longSleeves ? o.shirt : o.skin;
-        uint8_t foreMat = o.longSleeves ? MAT_CLOTH : MAT_SKIN;
-        if (o.longSleeves) mb.capsule(W(sh), W(elbow), 0.06f * s, 0.05f * s, WD(tFwd), o.shirt, MAT_CLOTH, 1.f, 0.8f, 8);
+        uint8_t foreMat = o.longSleeves ? MAT_KNIT : MAT_SKIN;
+        mb.beginObj(limbFrame(W(sh), W(elbow), WD(tLeft)));
+        if (o.longSleeves) mb.capsule(W(sh), W(elbow), 0.06f * s, 0.05f * s, WD(tFwd), o.shirt, MAT_KNIT, 1.f, 0.8f, 8);
         else {
             V3 mid = lerp3(sh, elbow, 0.55f);
-            mb.capsule(W(sh), W(mid), 0.066f * s, 0.06f * s, WD(tFwd), o.shirt, MAT_CLOTH, 1.f, 0.8f, 8);
+            mb.capsule(W(sh), W(mid), 0.066f * s, 0.06f * s, WD(tFwd), o.shirt, MAT_KNIT, 1.f, 0.8f, 8);
             mb.capsule(W(mid - norm(elbow - sh) * (0.02f * s)), W(elbow), 0.045f * s, 0.042f * s, WD(tFwd), o.skin, MAT_SKIN, 1.f, 0.8f, 8);
         }
+        mb.beginObj(limbFrame(W(elbow), W(end), WD(tLeft)));
         mb.capsule(W(elbow), W(end), 0.043f * s, 0.034f * s, WD(tFwd), fore, foreMat, 1.f, 0.8f, 8);
         V3 hd = norm(end - elbow);
         V3 hs = norm(cross(hd, tUp));
-        mb.sphere(mBasis(WD(hs), WD(cross(hd, hs)), WD(hd), W(end + hd * (0.05f * s))), V3(0.03f * s, 0.042f * s, 0.055f * s), 8, 5, o.skin, MAT_SKIN);
+        M4 HD = mBasis(WD(hs), WD(cross(hd, hs)), WD(hd), W(end + hd * (0.05f * s)));
+        mb.beginObj(HD);
+        mb.sphere(HD, V3(0.03f * s, 0.042f * s, 0.055f * s), 8, 5, o.skin, MAT_SKIN);
     }
     if (o.bag) {
         V3 bc = pel + left * (-0.26f * s) + V3(0, -0.1f * s, 0);
-        mb.capsule(W(bc - V3(0, 0.12f * s, 0)), W(bc + V3(0, 0.12f * s, 0)), 0.09f * s, 0.09f * s, WD(pfwd), o.bagCol, MAT_CLOTH, 0.5f, 0.5f, 8);
-        mb.capsule(W(bc + V3(0, 0.12f * s, 0)), W(neck + tLeft * (-0.12f * s)), 0.012f * s, 0.012f * s, WD(pfwd), shade(o.bagCol, 0.7f), MAT_CLOTH, 1.f, 1.f, 5);
+        mb.beginObj(mBasis(WD(left), WD(V3(0, 1, 0)), WD(pfwd), W(bc)));
+        mb.capsule(W(bc - V3(0, 0.12f * s, 0)), W(bc + V3(0, 0.12f * s, 0)), 0.09f * s, 0.09f * s, WD(pfwd), o.bagCol, MAT_CANVAS, 0.5f, 0.5f, 8);
+        mb.capsule(W(bc + V3(0, 0.12f * s, 0)), W(neck + tLeft * (-0.12f * s)), 0.012f * s, 0.012f * s, WD(pfwd), shade(o.bagCol, 0.7f), MAT_CANVAS, 1.f, 1.f, 5);
     }
+    mb.endObj();
 }
 
 // Skateboard in board space: deck top centre at origin, nose +Z
@@ -5990,16 +6297,16 @@ static void drawBoard(MeshBuilder& mb, const M4& B) {
     auto halfW = [&](float z) { float a = std::fabs(z) - MID; return a <= 0 ? HW : HW * std::sqrt(std::max(0.f, 1.f - (a / HW) * (a / HW))); };
     auto kick = [&](float z) { float a = std::fabs(z) - 0.25f; return a > 0 ? a * 0.58f : 0.f; };
     V3 up = xDir(B, V3(0, 1, 0));
+    mb.beginObj(B);   // grip tape, deck graphic and wheels are textured in board space
     for (size_t i = 0; i + 1 < zs.size(); i++) {
         float z0 = zs[i], z1 = zs[i + 1], w0 = halfW(z0), w1 = halfW(z1), y0 = kick(z0), y1 = kick(z1);
         V3 t00 = xPoint(B, V3(-w0, y0, z0)), t01 = xPoint(B, V3(w0, y0, z0)), t10 = xPoint(B, V3(-w1, y1, z1)), t11 = xPoint(B, V3(w1, y1, z1));
         V3 b00 = xPoint(B, V3(-w0, y0 - T, z0)), b01 = xPoint(B, V3(w0, y0 - T, z0)), b10 = xPoint(B, V3(-w1, y1 - T, z1)), b11 = xPoint(B, V3(w1, y1 - T, z1));
-        mb.quadOut(t00, t01, t11, t10, up, grip, MAT_RUBBER);
-        mb.quadOut(b00, b01, b11, b10, up * -1.f, graphic, MAT_PAINTED);
+        mb.quadOut(t00, t01, t11, t10, up, grip, MAT_GRIP);
+        mb.quadOut(b00, b01, b11, b10, up * -1.f, graphic, MAT_DECK);
         mb.quadOut(t01, t11, b11, b01, xDir(B, V3(1, 0, 0)), ply, MAT_PLAIN);
         mb.quadOut(t00, t10, b10, b00, xDir(B, V3(-1, 0, 0)), ply, MAT_PLAIN);
     }
-    mb.box(B * mTranslate(V3(0, -T - 0.0006f, 0)), V3(0.03f, 0.0005f, 0.22f), hexc(0xf0e8d0), MAT_PAINTED, 8);   // graphic stripe
     for (int sg = -1; sg <= 1; sg += 2) {
         float tz = sg * 0.22f;
         mb.box(B * mTranslate(V3(0, -T - 0.006f, tz)), V3(0.032f, 0.006f, 0.045f), truck, MAT_METAL);           // baseplate
@@ -6009,13 +6316,14 @@ static void drawBoard(MeshBuilder& mb, const M4& B) {
         mb.box(B * mTranslate(V3(0, -T - 0.018f, tz - sg * 0.012f)), V3(0.012f, 0.008f, 0.008f), hexc(0xe04a2a), MAT_RUBBER); // bushing
         for (int sx = -1; sx <= 1; sx += 2) {
             M4 Wm = B * mTranslate(V3(sx * 0.066f, -0.066f, tz)) * mRotZ(-sx * PI / 2);
-            mb.cylinder(Wm, 0.027f, 0.034f, 14, wheel, MAT_RUBBER, true);
+            mb.cylinder(Wm, 0.027f, 0.034f, 14, wheel, MAT_URETHANE, true);
             mb.cylinder(Wm * mTranslate(V3(0, 0.0345f, 0)), 0.011f, 0.001f, 8, hexc(0x333333), MAT_METAL, true);    // bearing
         }
     }
+    mb.endObj();
 }
 
-static Outfit PLAYER_OUTFIT;
+static Outfit PLAYER_OUTFIT = [] { Outfit o; o.print = true; return o; }();
 
 // Build the skater's pose + board transform for the current state and draw them.
 static void drawSkater(MeshBuilder& mb, const Player& pl, const Input& in) {
@@ -6243,6 +6551,7 @@ static void initNpcs() {
             o.bagCol = r.chance(0.5f) ? hexc(0x3a2a1a) : hexc(0x1a1a1a);
             o.longSleeves = r.chance(0.5f);
             o.baggy = r.chance(0.3f);
+            o.print = r.chance(0.22f);
             npcs.push_back(n);
         }
     }
@@ -6435,26 +6744,36 @@ static void updatePigeons(float dt, const Player& pl) {
     if (flock) sfx(SFX_PIGEONS, 0.7f);
 }
 static void drawPigeons(MeshBuilder& mb, V3 cam) {
-    Col body = hexc(0x7d8088), head = hexc(0x4f5a5e), neck = hexc(0x4a6a60), wing = hexc(0x8f939a), tail = hexc(0x3f464a), beak = hexc(0x2a2624), legs = hexc(0xb05a50);
+    Col body = hexc(0x7d8088), head = hexc(0x4f5a5e), neck = hexc(0x4a6a60), wing = hexc(0x8f939a), tail = hexc(0x3f464a), beak = hexc(0x2a2624), legs = hexc(0xb05a50), eye = hexc(0xe0781c);
     for (auto& p : pigeons) {
         if (p.state == 2 || len(p.pos - cam) > 70.f) continue;
         M4 F = mTranslate(p.pos) * mRotY(p.yaw);
         float bob = p.state == 0 ? std::max(0.f, std::sin(p.peck * 5.f)) * 0.05f : 0;
-        mb.sphere(F * mTranslate(V3(0, 0.11f, -0.01f)) * mRotX(0.25f), V3(0.058f, 0.058f, 0.11f), 8, 5, body, MAT_CLOTH);
-        mb.sphere(F * mTranslate(V3(0, 0.15f - bob * 0.5f, 0.07f + bob * 0.3f)), V3(0.036f, 0.04f, 0.036f), 7, 4, neck, MAT_PAINTED);
-        mb.sphere(F * mTranslate(V3(0, 0.185f - bob, 0.1f + bob * 0.5f)), V3(0.028f, 0.028f, 0.032f), 7, 4, head, MAT_CLOTH);
+        mb.beginObj(F);   // feathers are textured in the bird's own space
+        mb.sphere(F * mTranslate(V3(0, 0.11f, -0.01f)) * mRotX(0.25f), V3(0.058f, 0.058f, 0.11f), 8, 5, body, MAT_FEATHER);
+        mb.sphere(F * mTranslate(V3(0, 0.15f - bob * 0.5f, 0.07f + bob * 0.3f)), V3(0.036f, 0.04f, 0.036f), 7, 4, neck, MAT_FEATHER);
+        mb.sphere(F * mTranslate(V3(0, 0.185f - bob, 0.1f + bob * 0.5f)), V3(0.028f, 0.028f, 0.032f), 7, 4, head, MAT_FEATHER);
         mb.box(F * mTranslate(V3(0, 0.18f - bob, 0.135f + bob * 0.5f)), V3(0.006f, 0.006f, 0.012f), beak, MAT_PLAIN);
-        mb.box(F * mTranslate(V3(0, 0.12f, -0.14f)) * mRotX(-0.2f), V3(0.035f, 0.008f, 0.05f), tail, MAT_CLOTH);
+        for (int s = -1; s <= 1; s += 2)
+            mb.sphere(F * mTranslate(V3(s * 0.021f, 0.19f - bob, 0.108f + bob * 0.5f)), V3(0.0055f, 0.0055f, 0.004f), 5, 3, eye, MAT_PLAIN);
+        mb.sphere(F * mTranslate(V3(0, 0.115f, -0.15f)) * mRotX(-0.22f), V3(0.036f, 0.006f, 0.062f), 8, 4, tail, MAT_FEATHER);
         if (p.state == 1) {
             float a = std::sin(p.flap) * 0.9f;
-            for (int s = -1; s <= 1; s += 2)
-                mb.sphere(F * mTranslate(V3(s * 0.05f, 0.13f, 0)) * mRotZ(s * a) * mTranslate(V3(s * 0.13f, 0, 0)), V3(0.13f, 0.01f, 0.065f), 7, 3, wing, MAT_CLOTH);
+            for (int s = -1; s <= 1; s += 2) {
+                M4 WF = F * mTranslate(V3(s * 0.05f, 0.13f, 0)) * mRotZ(s * a) * mTranslate(V3(s * 0.13f, 0, 0));
+                mb.beginObj(WF);
+                mb.sphere(WF, V3(0.13f, 0.01f, 0.065f), 7, 3, wing, MAT_FEATHER);
+            }
         } else {
             for (int s = -1; s <= 1; s += 2) {
-                mb.sphere(F * mTranslate(V3(s * 0.045f, 0.12f, -0.03f)) * mRotX(0.2f), V3(0.018f, 0.04f, 0.095f), 7, 4, wing, MAT_CLOTH);
+                M4 WF = F * mTranslate(V3(s * 0.045f, 0.12f, -0.03f)) * mRotX(0.2f);
+                mb.beginObj(WF);
+                mb.sphere(WF, V3(0.018f, 0.04f, 0.095f), 7, 4, wing, MAT_FEATHER);
+                mb.endObj();
                 mb.limb(xPoint(F, V3(s * 0.02f, 0.0f, 0)), xPoint(F, V3(s * 0.02f, 0.07f, 0)), 0.008f, 0.008f, V3(1, 0, 0), legs, MAT_PLAIN);
             }
         }
+        mb.endObj();
     }
 }
 
@@ -7904,12 +8223,20 @@ static void ensureShadowMap(int res) {
 static std::string vsSrc(const char* body) { return std::string("#version 330 core\n") + body; }
 static std::string fsSrc(std::initializer_list<const char*> parts) {
     std::string s = "#version 330 core\n#define MAX_LIGHTS " + std::to_string(MAX_LIGHTS) + "\n";
+    if (const char* d = getenv("CJ_SHADER_DEFS")) { std::string ds = d; size_t p = 0; while (p < ds.size()) { size_t c = ds.find(',', p); s += "#define " + ds.substr(p, c == std::string::npos ? std::string::npos : c - p) + "\n"; if (c == std::string::npos) break; p = c + 1; } }
     for (const char* p : parts) s += p;
     return s;
 }
 
 static void initRenderer() {
-    RD.pWorld = makeProgram(vsSrc(WORLD_VS), fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, WORLD_FS_MAIN}));
+    static std::string worldFsOverride;   // developer hooks: dump the world shader, or load an edited copy without rebuilding
+    if (const char* f = getenv("CJ_DUMP_WORLD_FS")) { FILE* o = fopen(f, "w"); if (o) { fputs(WORLD_FS_MAIN, o); fclose(o); } }
+    const char* worldFs = WORLD_FS_MAIN;
+    if (const char* f = getenv("CJ_WORLD_FS")) {
+        FILE* in = fopen(f, "rb");
+        if (in) { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof buf, in)) > 0) worldFsOverride.append(buf, n); fclose(in); worldFs = worldFsOverride.c_str(); }
+    }
+    RD.pWorld = makeProgram(vsSrc(WORLD_VS), fsSrc({GLSL_COMMON, SHADOW_GLSL, LIGHTS_GLSL, worldFs}));
     RD.pPre = makeProgram(vsSrc(WORLD_VS), fsSrc({GLSL_COMMON, PREPASS_FS}));
     RD.pShadow = makeProgram(SHADOW_VS, SHADOW_FS);
     RD.pSky = makeProgram(SKY_VS, fsSrc({GLSL_COMMON, SKY_FS_MAIN}));
@@ -8151,6 +8478,7 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
         gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 1, 0, -WATER_LEVEL + 0.05f);
         set1i(RD.pWorld, "uUseAO", 0);
         bindTexU(RD.pWorld, "uAO", TU_A, RD.whiteTex);
+        bindTexU(RD.pWorld, "uFont", TU_E, RD.fontTex);
         set1i(RD.pWorld, "uInlineFog", 1);
         Frustum fRefl; fRefl.set(rvp);
         RD.staticMesh.draw(&fRefl);
@@ -8172,6 +8500,7 @@ static void renderFrame(const FrameInfo& F, V3 poolCenter) {
     gl.Uniform4f(U_(RD.pWorld, "uClip"), 0, 0, 0, 1);
     set1i(RD.pWorld, "uUseAO", Q.ssao > 0 ? 1 : 0);
     bindTexU(RD.pWorld, "uAO", TU_A, Q.ssao > 0 ? RD.ao[1] : RD.whiteTex);
+    bindTexU(RD.pWorld, "uFont", TU_E, RD.fontTex);
     set2f(RD.pWorld, "uInvRes", 1.f / RD.iw, 1.f / RD.ih);
     set1i(RD.pWorld, "uInlineFog", 0);
     set1i(RD.pWorld, "uDebug", getenv("CJ_DEBUG_VIEW") ? atoi(getenv("CJ_DEBUG_VIEW")) : 0);
@@ -8880,10 +9209,19 @@ int main(int argc, char** argv) {
         } else if (mode == GM_PLAY || shotMode) {
             updateCamera(frameDt, P);
         }
-        if (const char* dc = getenv("CJ_DEBUG_CAM")) {   // free camera for screenshots: px,py,pz,lx,ly,lz[,fov]
+        if (const char* dc = getenv("CJ_DEBUG_CAM")) {   // free camera for screenshots: px,py,pz,lx,ly,lz[,fov] | npc | pigeon | car
             float a[7] = {0, 10, 0, 0, 0, 10, 64};
-            sscanf(dc, "%f,%f,%f,%f,%f,%f,%f", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]);
-            cam.pos = V3(a[0], a[1], a[2]); cam.look = V3(a[3], a[4], a[5]); cam.fov = a[6];
+            if (!strcmp(dc, "npc") || !strcmp(dc, "pigeon") || !strcmp(dc, "car")) {   // frame the nearest pedestrian / pigeon / car
+                V3 best, off(1.3f, 1.35f, 1.7f), tgt(0, 1.0f, 0);
+                float bd = 1e9f;
+                if (!strcmp(dc, "npc")) { for (auto& n : npcs) if (len(n.pos - P.pos) < bd) { bd = len(n.pos - P.pos); best = n.pos; } }
+                else if (!strcmp(dc, "pigeon")) { off = V3(0.5f, 0.35f, 0.6f); tgt = V3(0, 0.12f, 0); for (auto& g : pigeons) if (g.state == 0 && len(g.pos - P.pos) < bd) { bd = len(g.pos - P.pos); best = g.pos; } }
+                else { off = V3(3.2f, 1.2f, 4.2f); tgt = V3(0, 0.8f, 0); for (auto& c : cars) { float y; V3 cp = carWorld(c, y); if (len(cp - P.pos) < bd) { bd = len(cp - P.pos); best = cp; } } }
+                cam.pos = best + off; cam.look = best + tgt; cam.fov = 40;
+            } else {
+                sscanf(dc, "%f,%f,%f,%f,%f,%f,%f", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]);
+                cam.pos = V3(a[0], a[1], a[2]); cam.look = V3(a[3], a[4], a[5]); cam.fov = a[6];
+            }
         }
         {   // water ambience from nearby fountains/hydrants
             float w = 0;
